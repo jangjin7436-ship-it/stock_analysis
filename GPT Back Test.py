@@ -7,6 +7,8 @@ import plotly.graph_objects as go
 from concurrent.futures import ThreadPoolExecutor
 import time
 
+st.set_page_config(page_title="AI 전략 스윙 백테스터", layout="wide")
+
 # =========================================================
 # 0. 데이터 로딩 (캐시)
 # =========================================================
@@ -104,6 +106,14 @@ def calculate_indicators_for_backtest(df: pd.DataFrame) -> pd.DataFrame:
     
     # 2주(10영업일) 관점용 단기 모멘텀 (최근 5일 수익률)
     df['Ret5'] = df['Close_Calc'].pct_change(5)
+
+    # 거래량 비율 (20일 평균 대비 Volume Ratio)
+    if 'Volume' in df.columns:
+        df['Volume'] = df['Volume'].fillna(0)
+        df['Vol_MA20'] = df['Volume'].rolling(20).mean()
+        df['Volume_Ratio'] = df['Volume'] / df['Vol_MA20']
+    else:
+        df['Volume_Ratio'] = np.nan
     
     return df.dropna()
 
@@ -234,7 +244,7 @@ def prepare_stock_data(ticker_info, start_date: str):
         return df[[
             'Close_Calc', 'MA5', 'MA20', 'MA60',
             'RSI', 'MACD', 'Signal_Line', 'MACD_Hist', 'Prev_MACD_Hist',
-            'STD20', 'Ret5', 'AI_Score', 'Ticker', 'Name'
+            'STD20', 'Ret5', 'Volume_Ratio', 'AI_Score', 'Ticker', 'Name'
         ]]
     except Exception:
         return None
@@ -464,6 +474,13 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
                     else:
                         vol_ratio = np.nan
 
+                    # 거래량 비율 (Volume_Ratio) 가져오기
+                    volume_ratio = row.get('Volume_Ratio', np.nan)
+                    try:
+                        volume_ratio = float(volume_ratio)
+                    except (TypeError, ValueError):
+                        volume_ratio = np.nan
+
                     candidates.append({
                         'ticker': ticker,
                         'name': row['Name'],
@@ -471,8 +488,22 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
                         'price_krw': price_krw,
                         'score': score,
                         'vol_ratio': vol_ratio,
+                        'volume_ratio': volume_ratio,
                         'reason': reason
                     })
+
+            # AI 점수 100점 종목이 5개 초과인 경우: 거래량 비율 상위 5개만 후보로 사용
+            if len(candidates) > 0:
+                ai100_list = [c for c in candidates if c.get('score', 0) >= 100.0]
+                if len(ai100_list) > 5:
+                    # Volume Ratio가 없는 경우 0으로 처리
+                    for c in ai100_list:
+                        vr = c.get('volume_ratio', np.nan)
+                        if not (isinstance(vr, (int, float)) and np.isfinite(vr)):
+                            c['volume_ratio'] = 0.0
+                    ai100_sorted = sorted(ai100_list, key=lambda x: x['volume_ratio'], reverse=True)
+                    top5_tickers = {c['ticker'] for c in ai100_sorted[:5]}
+                    candidates = [c for c in candidates if c['ticker'] in top5_tickers]
 
             # 점수 내림차순, 동점 시 티커 사전순
             candidates.sort(key=lambda x: (x['score'], x['ticker']), reverse=True)
