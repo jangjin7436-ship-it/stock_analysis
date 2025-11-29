@@ -730,14 +730,21 @@ with tab2:
                         
                     with c2:
                         fmt_curr = f"{item['curr']:,.0f}" if item['currency'] == "₩" else f"{item['curr']:,.2f}"
-                        fmt_avg = f"{item['avg']:,.0f}" if item['currency'] == "₩" else f"{item['avg']:,.2f}"
+                        fmt_avg  = f"{item['avg']:,.0f}"  if item['currency'] == "₩" else f"{item['avg']:,.2f}"
                         fmt_profit = f"{item['profit_amt']:,.0f}" if item['currency'] == "₩" else f"{item['profit_amt']:,.2f}"
-                        fmt_eval = f"{item['eval_amt']:,.0f}" if item['currency'] == "₩" else f"{item['eval_amt']:,.2f}"
-                        
+                        fmt_eval   = f"{item['eval_amt']:,.0f}"   if item['currency'] == "₩" else f"{item['eval_amt']:,.2f}"
+
+                        # ✅ 달러 기호가 수식으로 인식되지 않도록 HTML 엔티티로 변환
+                        #    - 원: sym = "₩" 또는 "$"
+                        #    - 표시용: safe_sym = "₩" 또는 "&#36;" (둘 다 화면에는 ₩ / $로 보임)
+                        safe_sym = sym if sym != "$" else "&#36;"
+
+                        # metric은 markdown이 아니라서 굳이 바꿀 필요 없음
                         st.metric("총 순수익 (수수료 제)", f"{item['profit_pct']:.2f}%", delta=f"{sym}{fmt_profit}")
-                        
-                        st.markdown(f"**세후 총 평가금:** {sym}{fmt_eval}")
-                        st.markdown(f"<small style='color: gray'>평단: {sym}{fmt_avg} / 현재: {sym}{fmt_curr}</small>", unsafe_allow_html=True)
+
+                        # 아래 두 줄만 safe_sym 사용 + HTML 허용
+                        st.markdown(f"**세후 총 평가금:** {safe_sym}{fmt_eval}", unsafe_allow_html=True)
+                        st.markdown(f"<small style='color: gray'>평단: {safe_sym}{fmt_avg} / 현재: {safe_sym}{fmt_curr}</small>", unsafe_allow_html=True)
                         
                     with c3:
                         st.markdown(f"**AI 점수: {item['score']}점**")
