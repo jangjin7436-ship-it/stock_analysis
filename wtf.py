@@ -7,38 +7,55 @@ import plotly.graph_objects as go
 from concurrent.futures import ThreadPoolExecutor
 import time
 
+@st.cache_data(show_spinner=False)
+def load_price_data(code: str, start_date: str):
+    """
+    yfinance에서 개별 종목 데이터를 받아오는 함수 (캐시됨)
+    같은 code, start_date로 다시 호출하면 네트워크를 다시 안 타고
+    이전에 받아온 데이터를 그대로 사용해서 결과가 항상 같게 됨.
+    """
+    df = yf.download(code, start=start_date, progress=False, auto_adjust=True)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    return df
+
+
+@st.cache_data(show_spinner=False)
+def load_fx_series(start_date: str):
+    """
+    KRW=X 환율 시계열 다운로드 (캐시됨)
+    Dynamic 모드에서도 같은 start_date면 항상 같은 환율 시계열 사용.
+    """
+    ex_df = yf.download("KRW=X", start=start_date, progress=False)
+    if isinstance(ex_df.columns, pd.MultiIndex):
+        ex_df.columns = ex_df.columns.get_level_values(0)
+    return ex_df['Close']
+
+
 def prepare_stock_data(ticker_info, start_date):
     """
-    [수정됨] 데이터 로드 실패 시 재시도(Retry) 로직 추가
+    개별 종목의 데이터를 미리 준비하는 함수
+    → 네트워크는 load_price_data에서 캐시되므로
+      여러 번 백테스트를 해도 같은 데이터가 쓰인다.
     """
     code, name = ticker_info
-    max_retries = 3
-    
-    for attempt in range(max_retries):
-        try:
-            # 데이터 다운로드
-            df = yf.download(code, start=start_date, progress=False, auto_adjust=True)
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-            
-            # 데이터가 비어있으면 예외 발생시켜서 재시도 유도
-            if df.empty or len(df) < 60: 
-                raise ValueError("Data Empty")
-            
-            # 지표 계산
-            df = calculate_indicators_for_backtest(df)
-            df['AI_Score'] = df.apply(get_ai_score_row, axis=1)
-            df['Ticker'] = code
-            df['Name'] = name
-            
-            return df[['Close_Calc', 'AI_Score', 'Ticker', 'Name']]
-            
-        except Exception:
-            # 실패 시 잠시 대기 후 재시도
-            time.sleep(0.5)
-            continue
-            
-    return None # 3번 다 실패하면 어쩔 수 없이 None 반환
+    try:
+        # ★ 캐시된 다운로드 사용
+        df_raw = load_price_data(code, start_date)
+        if df_raw is None or df_raw.empty or len(df_raw) < 60:
+            return None
+
+        df = calculate_indicators_for_backtest(df_raw)
+        df['AI_Score'] = df.apply(get_ai_score_row, axis=1)
+        df['Ticker'] = code
+        df['Name'] = name
+        
+        return df[['Close_Calc', 'AI_Score', 'Ticker', 'Name']]
+    except Exception as e:
+        # 여기서 조용히 None만 던져버리면 “어떤 종목이 빠졌는지”가
+        # 매번 달라져서 결과가 바뀌므로, 로그라도 남기는 것을 추천
+        # st.write(f"{code} 데이터 오류: {e}")
+        return None
 
 TICKER_MAP = {
     "INTC": "인텔", "005290.KS": "동진쎄미켐", "SOXL": "반도체 3X(Bull)", 
@@ -223,62 +240,6 @@ def get_ai_score_row(row):
         return max(0.0, min(100.0, score))
     except:
         return 0.0
-      
-def get_ai_score_row(row):
-    """
-    한 행(하루치 데이터)에 대해 AI 점수(0~100)를 계산
-    """
-    try:
-        curr = row['Close_Calc']
-        ma5, ma20, ma60 = row['MA5'], row['MA20'], row['MA60']
-        rsi = row['RSI']
-        macd, sig = row['MACD'], row['Signal_Line']
-        std20 = row['STD20']
-        
-        score = 50.0
-
-        # 1. 추세
-        if curr > ma60:
-            score += 10
-            div = (curr - ma60) / ma60
-            score += (div * 33) if 0 < div < 0.15 else 2
-        else:
-            score -= 20
-        
-        if ma5 > ma20 > ma60: score += 10
-        elif ma20 > ma60: score += 5
-
-        # 2. 눌림목
-        dist = (curr - ma20) / ma20
-        abs_dist = abs(dist)
-        if curr > ma60 and abs_dist <= 0.03:
-            score += 20 * (1 - (abs_dist / 0.03))
-        elif curr > ma60 and 0.03 < dist <= 0.08:
-            score += 5
-        elif dist > 0.10: # 과열
-            score -= 15
-            
-        # 3. RSI
-        if 40 <= rsi <= 60: score += 10 + ((rsi-40)*0.1)
-        elif rsi < 30: score += 15
-        elif rsi > 70: score -= 15
-        elif 60 < rsi <= 70: score += 8
-        
-        # 4. MACD
-        if macd > sig:
-            score += 5
-            if row['MACD_Hist'] > 0 and row['MACD_Hist'] > row['Prev_MACD_Hist']:
-                score += 2
-        else:
-            score -= 5
-            
-        # 5. 변동성 페널티
-        vol_ratio = std20 / curr if curr > 0 else 0
-        if vol_ratio > 0.05: score -= (vol_ratio * 100)
-        
-        return max(0.0, min(100.0, score))
-    except:
-        return 0.0
 
 # =========================================================
 # 2. 개별 종목 백테스트 엔진
@@ -309,14 +270,10 @@ def prepare_stock_data(ticker_info, start_date):
 def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode, max_hold_days, exchange_data, use_compound, selection_mode):
     # 1. 전 종목 데이터 병렬 준비 (안정성 강화)
     all_dfs = []
-    
-    # max_workers를 조금 줄여서(10 -> 5) 서버 부하를 줄이고 안정성을 높임
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = {executor.submit(prepare_stock_data, t, start_date): t for t in targets}
-        for future in futures:
-            res = future.result()
-            if res is not None: 
-                all_dfs.append(res)
+    for t in targets:  # ★ 단일 스레드, 순서 고정
+        res = prepare_stock_data(t, start_date)
+        if res is not None:
+            all_dfs.append(res)
     
     # [디버깅용] 몇 개 종목이 로드되었는지 확인 (로그나 print로 찍어보셔도 좋습니다)
     # st.write(f"Loaded Tickers: {len(all_dfs)} / {len(targets)}") 
@@ -609,15 +566,10 @@ with tab4:
     # --------------------------------------------------------------------------------
     if start_btn:
         # 환율 준비
-        exchange_data_payload = 1430.0
         if exchange_arg_val == "DYNAMIC":
             with st.spinner("💱 환율 데이터 수집 중..."):
-                try:
-                    ex_df = yf.download("KRW=X", start=str(bt_start_date), progress=False)
-                    if isinstance(ex_df.columns, pd.MultiIndex):
-                        ex_df.columns = ex_df.columns.get_level_values(0)
-                    exchange_data_payload = ex_df['Close']
-                except: pass
+                # ★ 캐시된 환율 시계열 사용 (실패 시에는 에러를 보여주고 멈추는 게 재현성에 더 좋음)
+                exchange_data_payload = load_fx_series(str(bt_start_date))
         else:
             exchange_data_payload = float(exchange_arg_val)
 
