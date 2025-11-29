@@ -131,9 +131,9 @@ def get_ai_score_row(row):
 # =========================================================
 # 2. 개별 종목 백테스트 엔진
 # =========================================================
-def run_single_stock_backtest(ticker, name, start_date="2023-01-01", initial_capital=1000000, strategy_mode="Basic"):
+def run_single_stock_backtest(ticker, name, start_date="2023-01-01", initial_capital=1000000, strategy_mode="Basic", max_holding_days=0):
     """
-    strategy_mode: "Basic" (기본 65/45) 또는 "SuperLocking" (슈퍼 락킹)
+    max_holding_days: 0이면 기간 제한 없음. 0보다 크면 해당 일수 경과 시 강제 매도 (Time Cut)
     """
     try:
         # 데이터 수집
@@ -153,11 +153,14 @@ def run_single_stock_backtest(ticker, name, start_date="2023-01-01", initial_cap
         avg_price = 0
         trades = []
         
-        # 슈퍼 락킹 모드 전용 변수
-        locking_mode = False  # 모드 발동 여부
-        max_price_in_mode = 0 # 모드 진입 후 최고가
+        # 추가된 변수: 매수일
+        buy_date = None
         
-        # 수수료 설정
+        # 슈퍼 락킹 모드 변수
+        locking_mode = False
+        max_price_in_mode = 0
+        
+        # 수수료
         fee_buy = 0.00015 if ".KS" in ticker else 0.001
         fee_sell = 0.003 if ".KS" in ticker else 0.001
 
@@ -165,81 +168,101 @@ def run_single_stock_backtest(ticker, name, start_date="2023-01-01", initial_cap
             price = row['Close_Calc']
             score = row['AI_Score']
             
+            # -----------------------------------------------------------
+            # [공통] 타임 컷 (Time Cut) 체크
+            # 주식을 보유 중이고, 최대 보유 기간 설정이 되어 있다면 검사
+            # -----------------------------------------------------------
+            if shares > 0 and max_holding_days > 0 and buy_date is not None:
+                # 경과일 계산 (현재 날짜 - 매수 날짜)
+                days_held = (date - buy_date).days
+                
+                if days_held >= max_holding_days:
+                    # 강제 매도 실행
+                    return_amt = shares * price * (1 - fee_sell)
+                    balance += return_amt
+                    profit_pct = (price - avg_price) / avg_price * 100
+                    trades.append({
+                        'date': date, 'type': 'sell', 'price': price, 'score': score, 
+                        'profit': profit_pct, 'reason': f'⏱️ TimeCut({days_held}일)'
+                    })
+                    shares = 0
+                    buy_date = None
+                    locking_mode = False
+                    continue # 이번 턴 종료 (이미 팔았으므로 아래 로직 건너뜀)
+
             # -----------------------------------------------
             # [전략 1] 기본 AI 전략 (Basic)
             # -----------------------------------------------
             if strategy_mode == "Basic":
-                # 매수: 65점 이상 & 미보유
+                # 매수
                 if score >= 65 and shares == 0:
                     can_buy = int(balance / (price * (1 + fee_buy)))
                     if can_buy > 0:
                         shares = can_buy
                         balance -= shares * price * (1 + fee_buy)
                         avg_price = price
+                        buy_date = date # 매수일 기록
                         trades.append({'date': date, 'type': 'buy', 'price': price, 'score': score, 'reason': 'AI 65↑'})
 
-                # 매도: 45점 이하 & 보유 중
+                # 매도
                 elif score <= 45 and shares > 0:
                     return_amt = shares * price * (1 - fee_sell)
                     balance += return_amt
                     profit_pct = (price - avg_price) / avg_price * 100
                     trades.append({'date': date, 'type': 'sell', 'price': price, 'score': score, 'profit': profit_pct, 'reason': 'AI 45↓'})
                     shares = 0
-                    avg_price = 0
+                    buy_date = None
 
             # -----------------------------------------------
             # [전략 2] 슈퍼 락킹 전략 (SuperLocking)
             # -----------------------------------------------
             elif strategy_mode == "SuperLocking":
-                # A. 매수: 80점 이상 (강력 매수) & 미보유
+                # 매수 (80점 이상)
                 if score >= 80 and shares == 0:
                     can_buy = int(balance / (price * (1 + fee_buy)))
                     if can_buy > 0:
                         shares = can_buy
                         balance -= shares * price * (1 + fee_buy)
                         avg_price = price
+                        buy_date = date # 매수일 기록
                         
                         # 모드 초기화
                         locking_mode = False
                         max_price_in_mode = 0
                         trades.append({'date': date, 'type': 'buy', 'price': price, 'score': score, 'reason': 'Strong Buy(80↑)'})
                 
-                # B. 보유 중 관리
+                # 보유 관리
                 elif shares > 0:
                     curr_return = (price - avg_price) / avg_price
                     
-                    # 1. 락킹 모드 발동 체크 (평단 대비 +3% 이상)
                     if not locking_mode and curr_return >= 0.03:
                         locking_mode = True
-                        max_price_in_mode = price # 발동 시점 가격을 일단 최고가로 설정
+                        max_price_in_mode = price 
                     
-                    # 2. 모드 상태별 로직
                     if locking_mode:
-                        # 모드 ON: 고점 갱신 확인
-                        if price > max_price_in_mode:
-                            max_price_in_mode = price
+                        if price > max_price_in_mode: max_price_in_mode = price
                         
-                        # 모드 ON: 고점 대비 -2% 하락 시 매도 (익절)
-                        threshold_price = max_price_in_mode * 0.98
-                        if price <= threshold_price:
+                        # 익절 (-2%)
+                        if price <= max_price_in_mode * 0.98:
                             return_amt = shares * price * (1 - fee_sell)
                             balance += return_amt
                             profit_pct = (price - avg_price) / avg_price * 100
                             trades.append({'date': date, 'type': 'sell', 'price': price, 'score': score, 'profit': profit_pct, 'reason': '💎 Locking Trailing'})
                             shares = 0
+                            buy_date = None
                             locking_mode = False
                             
                     else:
-                        # 모드 OFF (아직 +3% 못감): AI 점수 45 이하면 방어적 매도 (손절/본전)
-                        # *주의: 3% 가기 전에 폭락하면 팔아야 하므로 최소한의 안전장치
+                        # 손절 방어 (45점 이하)
                         if score <= 45:
                             return_amt = shares * price * (1 - fee_sell)
                             balance += return_amt
                             profit_pct = (price - avg_price) / avg_price * 100
                             trades.append({'date': date, 'type': 'sell', 'price': price, 'score': score, 'profit': profit_pct, 'reason': 'Defense(45↓)'})
                             shares = 0
+                            buy_date = None
 
-        # 최종 평가금 계산
+        # 최종 평가금
         final_price = df['Close_Calc'].iloc[-1]
         final_equity = balance + (shares * final_price)
         total_return = (final_equity - initial_capital) / initial_capital * 100
@@ -267,18 +290,30 @@ with tab4:
     st.markdown("### 🧪 포트폴리오 유니버스 백테스트")
     st.caption("과거 데이터 기반 전략 시뮬레이션")
     
-    # 설정 UI
-    col_set1, col_set2, col_set3 = st.columns([1, 1, 2])
+    # 설정 UI (3단 컬럼)
+    col_set1, col_set2, col_set3 = st.columns([1, 1, 1.5])
+    
     with col_set1:
         bt_start_date = st.date_input("시작일", value=pd.to_datetime("2024-01-01"))
+        
+        # 🌟 타임 컷 설정 추가
+        max_hold_days = st.slider(
+            "⏱️ 최대 보유 기간 (Time Cut)", 
+            min_value=0, 
+            max_value=60, 
+            value=0, 
+            step=1,
+            help="0일은 제한 없음. 예: 7일 선택 시, 매수 후 7일째 되는 날 무조건 매도합니다."
+        )
+        time_msg = "제한 없음 (Unlimited)" if max_hold_days == 0 else f"{max_hold_days}일 후 강제 청산"
+        st.caption(f"설정: :red[{time_msg}]")
+
     with col_set2:
-        # 🌟 전략 선택 라디오 버튼
         selected_strategy = st.radio(
             "⚔️ 전략 선택", 
             ["기본 (Basic)", "슈퍼 락킹 (SuperLocking)"],
             captions=["매수 65↑ / 매도 45↓", "매수 80↑ / +3%후 고점대비 -2% 매도"]
         )
-        # 문자열 매핑
         strat_code = "Basic" if "기본" in selected_strategy else "SuperLocking"
         
     with col_set3:
@@ -294,7 +329,6 @@ with tab4:
         targets = list(TICKER_MAP.items())
         total_stocks = len(targets)
         
-        # 병렬 처리 실행 (전략 모드 전달)
         with ThreadPoolExecutor(max_workers=10) as executor:
             futures = {
                 executor.submit(
@@ -303,10 +337,12 @@ with tab4:
                     name, 
                     str(bt_start_date), 
                     1000000, 
-                    strat_code  # 🌟 선택된 전략 전달
+                    strat_code,
+                    max_hold_days  # 🌟 추가된 파라미터 전달
                 ): code for code, name in targets
             }
             
+            # ... (이후 결과 처리 로직은 기존과 동일하므로 생략) ...
             completed = 0
             for future in futures:
                 res = future.result()
@@ -318,17 +354,17 @@ with tab4:
         bar.empty()
         progress_text.empty()
         
+        # 결과 출력 부분 (기존 코드 그대로 사용)
         if results:
             df_res = pd.DataFrame(results)
             avg_return = df_res['total_return'].mean()
             win_rate_avg = df_res['win_rate'].mean()
             total_profit_sum = df_res['final_equity'].sum() - (1000000 * len(df_res))
             
-            st.success(f"✅ {selected_strategy} 백테스트 완료!")
+            st.success(f"✅ {selected_strategy} (TimeCut: {max_hold_days}일) 완료!")
             
-            # 결과 표시 (기존과 동일)
             m1, m2, m3, m4 = st.columns(4)
-            m1.metric("평균 수익률", f"{avg_return:.2f}%", delta_color="normal")
+            m1.metric("평균 수익률", f"{avg_return:.2f}%")
             m2.metric("평균 승률", f"{win_rate_avg:.1f}%")
             m3.metric("총 종목 수", f"{len(df_res)}개")
             m4.metric("총 수익금", f"{total_profit_sum:,.0f}원")
@@ -338,22 +374,15 @@ with tab4:
             c_best, c_worst = st.columns(2)
             with c_best:
                 st.subheader("🏆 수익률 Top 5")
-                top5 = df_res.sort_values('total_return', ascending=False).head(5)
-                for _, r in top5.iterrows():
-                    st.write(f"**{r['name']}**: +{r['total_return']:.1f}% ({r['trade_count']}회)")
+                st.dataframe(df_res.sort_values('total_return', ascending=False).head(5)[['name', 'total_return', 'trade_count']], hide_index=True)
             
             with c_worst:
                 st.subheader("💀 수익률 Worst 5")
-                worst5 = df_res.sort_values('total_return', ascending=True).head(5)
-                for _, r in worst5.iterrows():
-                    st.write(f"**{r['name']}**: {r['total_return']:.1f}% ({r['trade_count']}회)")
-            
+                st.dataframe(df_res.sort_values('total_return', ascending=True).head(5)[['name', 'total_return', 'trade_count']], hide_index=True)
+
             st.markdown("#### 📄 상세 내역")
             st.dataframe(df_res[['name', 'total_return', 'win_rate', 'trade_count', 'final_equity']], use_container_width=True)
             
-            # 히스토그램
-            fig = px.histogram(df_res, x="total_return", nbins=20, title=f"[{selected_strategy}] 수익률 분포")
+            fig = px.histogram(df_res, x="total_return", nbins=20, title="수익률 분포")
             fig.add_vline(x=avg_return, line_dash="dash", line_color="red")
             st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.error("결과 없음")
