@@ -577,12 +577,15 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
 
 
 # =========================================================
-# 5. UI (Tab4: 전체 백테스트 시뮬레이션)
+# 5. UI (단일 탭: 전체 백테스트 시뮬레이션)
 # =========================================================
 
 st.title("📊 AI 스윙 전략 포트폴리오 백테스터")
 
-with tab4:
+# 여기서 탭을 직접 생성하고 첫 번째 탭을 tab 변수로 받음
+tab = st.tabs(["📊 전체 백테스트 시뮬레이션"])[0]
+
+with tab:
     st.markdown("### 🧪 포트폴리오 유니버스 백테스트")
     st.caption("AI 전략 시뮬레이터 Final Ver. (일봉 종가 기준 / 2주 스윙)")
 
@@ -732,12 +735,12 @@ with tab4:
         
         tab_g1, tab_g2 = st.tabs(["💰 자산 커브 (Equity)", "💧 낙폭 (Drawdown)"])
         
-        # 공통 레이아웃 설정 (투명 배경 + 반투명 그리드)
+        # 공통 레이아웃 설정
         common_layout = dict(
-            paper_bgcolor='rgba(0,0,0,0)',  # 전체 배경 투명
-            plot_bgcolor='rgba(0,0,0,0)',   # 차트 영역 투명
-            font=dict(color=None),          # 폰트색: None으로 두면 Streamlit 테마 자동 추적
-            xaxis=dict(showgrid=True, gridcolor='rgba(128,128,128,0.2)'), # 그리드: 연한 회색
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(0,0,0,0)',
+            font=dict(color=None),
+            xaxis=dict(showgrid=True, gridcolor='rgba(128,128,128,0.2)'),
             yaxis=dict(showgrid=True, gridcolor='rgba(128,128,128,0.2)'),
             hovermode="x unified"
         )
