@@ -226,65 +226,83 @@ def get_precise_data(tickers_list):
 def calculate_indicators(df, realtime_price=None):
     """
     2주 스윙 백테스트에서 쓰는 지표 계산 로직 그대로 사용
-    - Close/Adj Close 정리
+    - Close/Adj Close 정리 (대소문자/형태 상관 없이 탐색)
     - 실시간가(realtime_price)가 들어오면 마지막 캔들 가격만 교체
     - MA5/20/60, RSI, MACD, MACD_Hist, Prev_MACD_Hist, STD20, Ret5 모두 계산
     """
     if df is None or len(df) < 60:
         return None
 
+    # 혹시 Series가 들어오면 DataFrame으로 변환
+    if isinstance(df, pd.Series):
+        df = df.to_frame()
+
     df = df.copy()
 
-    # 컬럼 정리 (yfinance/FDR 모두 대응)
-    cols_lower = {c.lower(): c for c in df.columns}
-    if 'close' in cols_lower:
-        close_col = cols_lower['close']
-    elif 'adj close' in cols_lower:
-        close_col = cols_lower['adj close']
-    else:
+    # --- 1) Close / Adj Close 컬럼 찾기 (모든 타입 안전 처리) ---
+    close_col = None
+    adj_close_col = None
+
+    for c in df.columns:
+        name = str(c).lower()
+        if name == "close":
+            close_col = c
+        elif name in ("adj close", "adjclose", "adj_close"):
+            adj_close_col = c
+
+    if close_col is None and adj_close_col is not None:
+        close_col = adj_close_col
+
+    if close_col is None:
+        # Close 계열 컬럼을 못 찾으면 지표 계산 불가
         return None
 
     close = df[close_col]
     if isinstance(close, pd.DataFrame):
+        # yfinance 멀티컬럼 방지: 첫 컬럼만 사용
         close = close.iloc[:, 0]
 
-    # 실시간 가격 주입 (가능하면 마지막 캔들 교체)
-    if realtime_price is not None and realtime_price > 0:
+    close = close.astype(float)
+
+    # --- 2) 실시간 가격 주입 (가능하면 마지막 캔들 교체) ---
+    if realtime_price is not None:
         try:
-            close = close.copy()
-            close.iloc[-1] = float(realtime_price)
+            rp = float(realtime_price)
+            if rp > 0:
+                close = close.copy()
+                close.iloc[-1] = rp
         except Exception:
             pass
 
-    df['Close_Calc'] = close.astype(float)
+    df["Close_Calc"] = close
 
-    # 이동평균
-    df['MA5'] = df['Close_Calc'].rolling(5).mean()
-    df['MA20'] = df['Close_Calc'].rolling(20).mean()
-    df['MA60'] = df['Close_Calc'].rolling(60).mean()
+    # --- 3) 이동평균 ---
+    df["MA5"] = df["Close_Calc"].rolling(5).mean()
+    df["MA20"] = df["Close_Calc"].rolling(20).mean()
+    df["MA60"] = df["Close_Calc"].rolling(60).mean()
 
-    # RSI (14)
-    delta = df['Close_Calc'].diff()
+    # --- 4) RSI (14) ---
+    delta = df["Close_Calc"].diff()
     gain = delta.where(delta > 0, 0.0)
     loss = -delta.where(delta < 0, 0.0)
-    avg_gain = gain.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
+    avg_gain = gain.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
     rs = avg_gain / avg_loss
-    df['RSI'] = 100 - (100 / (1 + rs))
+    df["RSI"] = 100 - (100 / (1 + rs))
 
-    # MACD (12-26-9)
-    exp12 = df['Close_Calc'].ewm(span=12, adjust=False).mean()
-    exp26 = df['Close_Calc'].ewm(span=26, adjust=False).mean()
-    df['MACD'] = exp12 - exp26
-    df['Signal_Line'] = df['MACD'].ewm(span=9, adjust=False).mean()
-    df['MACD_Hist'] = df['MACD'] - df['Signal_Line']
-    df['Prev_MACD_Hist'] = df['MACD_Hist'].shift(1)
+    # --- 5) MACD (12-26-9) ---
+    exp12 = df["Close_Calc"].ewm(span=12, adjust=False).mean()
+    exp26 = df["Close_Calc"].ewm(span=26, adjust=False).mean()
+    df["MACD"] = exp12 - exp26
+    df["Signal_Line"] = df["MACD"].ewm(span=9, adjust=False).mean()
+    df["MACD_Hist"] = df["MACD"] - df["Signal_Line"]
+    df["Prev_MACD_Hist"] = df["MACD_Hist"].shift(1)
 
-    # 20일 변동성
-    df['STD20'] = df['Close_Calc'].rolling(20).std()
+    # --- 6) 20일 변동성 ---
+    df["STD20"] = df["Close_Calc"].rolling(20).std()
 
-    # 최근 5일 수익률 (2주 스윙용 단기 모멘텀)
-    df['Ret5'] = df['Close_Calc'].pct_change(5)
+    # --- 7) 최근 5일 수익률 (단기 모멘텀) ---
+    df["Ret5"] = df["Close_Calc"].pct_change(5)
 
     return df.dropna()
 
