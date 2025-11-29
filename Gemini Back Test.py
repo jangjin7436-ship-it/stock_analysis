@@ -226,8 +226,6 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
         # -----------------------------------------------------
         # [핵심 추가 1] 시장 국면 판단 (Market Breadth)
         # -----------------------------------------------------
-        # 현재 추적 중인 모든 종목 중 "MA60 위에 있는 종목 비율" 계산
-        # 이 비율이 낮으면 하락장으로 판단하고 방어 모드 발동
         count_above_ma60 = sum(1 for x in daily_stocks if x['Close_Calc'] > x['MA60'])
         total_active = len(daily_stocks)
         market_breadth = count_above_ma60 / total_active if total_active > 0 else 0.5
@@ -267,7 +265,6 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
             final_sell_price_raw = raw_close
 
             # ATR 기반 동적 청산
-            # 하락장이면 손절 라인을 더 타이트하게(1.5배) 잡음
             stop_mult = 1.5 if is_bear_market else 2.0
             profit_mult = 3.0
             
@@ -277,7 +274,6 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
             current_max_raw = info.get('max_price_raw', buy_price_raw)
             if raw_high > current_max_raw:
                 portfolio[ticker]['max_price_raw'] = raw_high
-                # 고점 대비 하락폭도 하락장에선 더 민감하게
                 trail_gap = atr * (2.0 if is_bear_market else 2.5)
                 new_stop = raw_high - trail_gap
                 if new_stop > stop_price_raw:
@@ -303,7 +299,6 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
                     should_sell = True; sell_reason = f"⏱️ 만기청산({held_days}일)"
                 elif score < 30:
                     should_sell = True; sell_reason = "점수급락(30↓)"
-                # [추가] 하락장이고 수익이 미미하면 현금 확보를 위해 조기 매도
                 elif is_bear_market and held_days > 5 and raw_close < buy_price_raw:
                     should_sell = True; sell_reason = "시장악화방어"
 
@@ -321,9 +316,8 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
         for t in sell_list: del portfolio[t]
 
         # -----------------------------------------------------
-        # B. 신규 매수 (Buy Logic) - 변동성 역가중 방식 (Volatility Sizing)
+        # B. 신규 매수 (Buy Logic) - 변동성 역가중 방식
         # -----------------------------------------------------
-        # 하락장이 심하면 아예 신규 매수 금지 (현금 관망)
         if len(portfolio) < current_max_slots and not (is_bear_market and selection_mode == 'TOP1'):
             candidates = []
             for row in daily_stocks:
@@ -345,26 +339,16 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
             for target in buy_targets:
                 if balance <= 0: break
                 
-                # [핵심 추가 2] 변동성 조절 (Volatility Sizing)
-                # 단순히 N빵(1/N) 하지 않고, ATR이 크면 적게, 작으면 많이 삼.
-                # 목표: 종목당 리스크를 전체 자산의 2%로 고정
-                
                 rate = 1.0 if ".KS" in target['ticker'] else current_rate
                 price_krw = target['price_raw'] * rate
                 atr_krw = target['atr'] * rate
                 
-                # 리스크 허용액 (총 자산의 2% ~ 5% 유동적)
                 risk_per_trade = (balance + sum(p['shares']*p['avg_price'] for p in portfolio.values())) * 0.02
-                
-                # ATR 2배를 손절폭으로 가정했을 때의 적정 주식 수
-                # Volatility Sizing 공식: 주식수 = 리스크허용액 / (2 * ATR)
                 vol_adjusted_shares = int(risk_per_trade / (atr_krw * 2)) if atr_krw > 0 else 0
                 
-                # 단, 최대 투자금은 (잔고 / 남은슬롯)을 넘지 않도록 캡(Cap) 씌움 (자금 고갈 방지)
-                equal_weight_budget = balance / (current_max_slots - len(portfolio) + 1) # +1은 안전마진
+                equal_weight_budget = balance / (current_max_slots - len(portfolio) + 1)
                 max_shares_by_budget = int(equal_weight_budget / price_krw)
                 
-                # 최종 매수 수량: 변동성 기준과 예산 기준 중 작은 것 선택 (보수적 접근)
                 shares = min(vol_adjusted_shares, max_shares_by_budget)
                 
                 if shares > 0:
@@ -385,11 +369,11 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
                             'balance': balance
                         })
 
-        # C. 자산 평가
+        # C. 자산 평가 (여기가 수정된 부분입니다)
         current_equity = balance
         for ticker, info in portfolio.items():
             stock_row = next((x for x in daily_stocks if x['Ticker'] == ticker), None)
-            if stock_row:
+            if stock_row is not None:  # <--- [수정] Series 직접 평가 방지
                 rate = 1.0 if ".KS" in ticker else current_rate
                 current_equity += info['shares'] * stock_row['Close_Calc'] * rate
             else:
@@ -404,13 +388,18 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
         last_rate = get_rate(last_date)
         for ticker, info in portfolio.items():
             stock_row = next((x for x in last_daily if x['Ticker'] == ticker), None)
-            curr_price = stock_row['Close_Calc'] * (1.0 if ".KS" in ticker else last_rate) if stock_row else info['avg_price']
+            # [수정] 아래 줄의 삼항 연산자 조건도 명확히 수정
+            curr_price = stock_row['Close_Calc'] * (1.0 if ".KS" in ticker else last_rate) if stock_row is not None else info['avg_price']
+            
+            fee_sell = 0.003 if ".KS" in ticker else 0.001
             market_val = info['shares'] * curr_price
+            net_val = market_val * (1 - fee_sell)
+
             held_stocks_list.append({
                 '티커': ticker, '종목명': info['name'], '보유주수': info['shares'],
                 '매수단가(KRW)': info['avg_price'], '현재가(KRW)': curr_price,
                 '평가손익(%)': ((curr_price - info['avg_price']) / info['avg_price']) * 100,
-                '평가금액': market_val
+                '평가금액': net_val
             })
             
     return pd.DataFrame(trades_log), pd.DataFrame(equity_curve), pd.DataFrame(held_stocks_list), balance
