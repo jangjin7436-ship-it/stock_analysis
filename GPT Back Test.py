@@ -209,14 +209,35 @@ def get_ai_score_row(row):
 # =========================================================
 
 def prepare_stock_data(ticker_info, start_date):
-    """개별 종목 데이터 준비"""
+    """
+    개별 종목 데이터 준비 (Buffer 기간 추가 수정)
+    """
     code, name = ticker_info
     try:
-        df_raw = load_price_data(code, start_date)
-        if df_raw is None or df_raw.empty or len(df_raw) < 120:  # MA120 계산을 위해 데이터 확보 필요
+        # [수정] 지표 계산(MA120 등)을 위해 시작일보다 240일(약 8개월) 전부터 데이터를 가져옴
+        # 이렇게 해야 start_date 당일부터 바로 MA120 값을 사용할 수 있음
+        target_date = pd.to_datetime(start_date)
+        buffer_days = 240  # 넉넉하게 잡음 (휴장일 고려)
+        fetch_start_date = target_date - pd.Timedelta(days=buffer_days)
+        
+        # 데이터를 미리 가져옴
+        df_raw = load_price_data(code, fetch_start_date.strftime('%Y-%m-%d'))
+        
+        if df_raw is None or df_raw.empty:
             return None
 
+        # 지표 계산 (전체 기간에 대해 수행)
         df = calculate_indicators_for_backtest(df_raw)
+        
+        # 지표 계산 후 NaN 제거 (앞부분 Buffer 기간의 앞쪽 NaN들)
+        df = df.dropna()
+
+        # [수정] 실제 백테스트는 사용자가 요청한 start_date부터 시작하도록 자름
+        df = df[df.index >= target_date]
+
+        if df.empty:
+            return None
+
         df['AI_Score'] = df.apply(get_ai_score_row, axis=1)
         df['Ticker'] = code
         df['Name'] = name
