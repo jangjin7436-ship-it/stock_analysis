@@ -131,150 +131,241 @@ def get_ai_score_row(row):
 # =========================================================
 # 2. 개별 종목 백테스트 엔진
 # =========================================================
-def run_single_stock_backtest(ticker, name, start_date="2023-01-01", initial_capital=1000000, strategy_mode="Basic", max_holding_days=0, exchange_data=1430.0, use_compound=True):
+def prepare_stock_data(ticker_info, start_date):
     """
-    use_compound: True면 복리(전액 재투자), False면 단리(초기 자본금만큼만 투자)
+    개별 종목의 데이터를 미리 준비하는 함수 (병렬 처리용)
     """
+    code, name = ticker_info
     try:
-        # 1. 데이터 수집
-        df = yf.download(ticker, start=start_date, progress=False, auto_adjust=True)
+        # 데이터 다운로드
+        df = yf.download(code, start=start_date, progress=False, auto_adjust=True)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
-            
+        
         if len(df) < 60: return None
-
-        # 2. 지표 계산
+        
+        # 지표 및 점수 계산
         df = calculate_indicators_for_backtest(df)
         df['AI_Score'] = df.apply(get_ai_score_row, axis=1)
-
-        # 3. 환율 처리
-        is_kr = ".KS" in ticker or ".KQ" in ticker
-        if is_kr:
-            df['Exchange_Rate'] = 1.0
-        else:
-            if isinstance(exchange_data, (float, int)):
-                df['Exchange_Rate'] = float(exchange_data)
-            else:
-                df['Exchange_Rate'] = exchange_data.reindex(df.index, method='ffill').fillna(method='bfill').fillna(1430.0)
-
-        # 4. 시뮬레이션 변수
-        balance = initial_capital
-        shares = 0
-        avg_price = 0
-        trades = []
-        buy_date = None
+        df['Ticker'] = code
+        df['Name'] = name
         
-        locking_mode = False
-        max_price_in_mode = 0
-        
-        fee_buy = 0.00015 if is_kr else 0.001
-        fee_sell = 0.003 if is_kr else 0.001
-
-        for date, row in df.iterrows():
-            rate = row['Exchange_Rate']
-            raw_price = row['Close_Calc']
-            price_krw = raw_price * rate
-            score = row['AI_Score']
-            
-            # --- 공통: 매수 가능 금액 계산 (복리 vs 단리) ---
-            # 복리: 현재 가진 현금 전액 투자
-            # 단리: 초기 자본금까지만 투자 (수익금은 Save), 단 손실나서 원금이 줄면 남은 돈만 투자
-            invest_budget = balance
-            if not use_compound:
-                invest_budget = min(balance, initial_capital)
-
-            # --- 타임 컷 ---
-            if shares > 0 and max_holding_days > 0 and buy_date is not None:
-                days_held = (date - buy_date).days
-                if days_held >= max_holding_days:
-                    return_amt = shares * price_krw * (1 - fee_sell)
-                    balance += return_amt
-                    profit_pct = (price_krw - avg_price) / avg_price * 100
-                    trades.append({'date': date, 'type': 'sell', 'price': raw_price, 'score': score, 'profit': profit_pct, 'reason': f'⏱️ TimeCut({days_held}일)', 'rate': rate})
-                    shares = 0
-                    buy_date = None
-                    locking_mode = False
-                    continue
-
-            # --- [전략 1] 기본 (Basic) ---
-            if strategy_mode == "Basic":
-                if score >= 65 and shares == 0:
-                    # 설정한 예산(invest_budget) 내에서 매수
-                    can_buy = int(invest_budget / (price_krw * (1 + fee_buy)))
-                    if can_buy > 0:
-                        shares = can_buy
-                        balance -= shares * price_krw * (1 + fee_buy)
-                        avg_price = price_krw
-                        buy_date = date
-                        trades.append({'date': date, 'type': 'buy', 'price': raw_price, 'score': score, 'reason': 'AI 65↑', 'rate': rate})
-
-                elif score <= 45 and shares > 0:
-                    return_amt = shares * price_krw * (1 - fee_sell)
-                    balance += return_amt
-                    profit_pct = (price_krw - avg_price) / avg_price * 100
-                    trades.append({'date': date, 'type': 'sell', 'price': raw_price, 'score': score, 'profit': profit_pct, 'reason': 'AI 45↓', 'rate': rate})
-                    shares = 0
-                    buy_date = None
-
-            # --- [전략 2] 슈퍼 락킹 (SuperLocking) ---
-            elif strategy_mode == "SuperLocking":
-                if score >= 80 and shares == 0:
-                    can_buy = int(invest_budget / (price_krw * (1 + fee_buy)))
-                    if can_buy > 0:
-                        shares = can_buy
-                        balance -= shares * price_krw * (1 + fee_buy)
-                        avg_price = price_krw
-                        buy_date = date
-                        locking_mode = False
-                        max_price_in_mode = 0
-                        trades.append({'date': date, 'type': 'buy', 'price': raw_price, 'score': score, 'reason': 'Strong Buy(80↑)', 'rate': rate})
-                
-                elif shares > 0:
-                    curr_return = (price_krw - avg_price) / avg_price
-                    if not locking_mode and curr_return >= 0.03:
-                        locking_mode = True
-                        max_price_in_mode = price_krw
-                    
-                    should_sell = False
-                    sell_reason = ""
-                    
-                    if locking_mode:
-                        if price_krw > max_price_in_mode: max_price_in_mode = price_krw
-                        if price_krw <= max_price_in_mode * 0.98:
-                            should_sell = True
-                            sell_reason = '💎 Locking Trailing'
-                    else:
-                        if score <= 45:
-                            should_sell = True
-                            sell_reason = 'Defense(45↓)'
-                            
-                    if should_sell:
-                        return_amt = shares * price_krw * (1 - fee_sell)
-                        balance += return_amt
-                        profit_pct = (price_krw - avg_price) / avg_price * 100
-                        trades.append({'date': date, 'type': 'sell', 'price': raw_price, 'score': score, 'profit': profit_pct, 'reason': sell_reason, 'rate': rate})
-                        shares = 0
-                        buy_date = None
-                        locking_mode = False
-
-        # 최종 평가
-        final_row = df.iloc[-1]
-        final_price_krw = final_row['Close_Calc'] * final_row['Exchange_Rate']
-        final_equity = balance + (shares * final_price_krw)
-        total_return = (final_equity - initial_capital) / initial_capital * 100
-        
-        return {
-            "ticker": ticker,
-            "name": name,
-            "total_return": total_return,
-            "final_equity": final_equity,
-            "trade_count": len(trades) // 2,
-            "trades": trades,
-            "win_rate": np.mean([t['profit'] > 0 for t in trades if 'profit' in t]) * 100 if trades else 0
-        }
-    except Exception as e:
+        return df[['Close_Calc', 'AI_Score', 'Ticker', 'Name']]
+    except:
         return None
 
+def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode, max_hold_days, exchange_data, use_compound, selection_mode):
+    """
+    전체 종목을 날짜별로 순회하며 포트폴리오를 운용하는 시뮬레이션
+    selection_mode: 'ALL' (조건 맞으면 분산 매수) / 'TOP1' (점수 1등 몰빵)
+    """
+    # 1. 전 종목 데이터 병렬 준비
+    all_dfs = []
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {executor.submit(prepare_stock_data, t, start_date): t for t in targets}
+        for future in futures:
+            res = future.result()
+            if res is not None: all_dfs.append(res)
+            
+    if not all_dfs: return None, []
+
+    # 2. 데이터를 날짜 기준으로 통합 (Market Data)
+    # market_data[날짜] = 해당 날짜의 종목별 데이터 리스트
+    market_data = {}
+    for df in all_dfs:
+        for date, row in df.iterrows():
+            if date not in market_data: market_data[date] = []
+            market_data[date].append(row)
+            
+    sorted_dates = sorted(market_data.keys())
+    
+    # 3. 환율 데이터 준비 (날짜별 매핑)
+    exchange_map = {}
+    if isinstance(exchange_data, (float, int)):
+        get_rate = lambda d: float(exchange_data)
+    else:
+        # Series를 딕셔너리로 변환 (검색 속도 최적화)
+        rate_dict = exchange_data.to_dict()
+        def get_rate(d):
+            # 해당 날짜 환율 없으면 가장 가까운 과거 데이터 사용
+            ts = pd.Timestamp(d)
+            return rate_dict.get(ts, 1430.0) # 기본값
+
+    # 4. 시뮬레이션 상태 변수
+    balance = initial_capital
+    portfolio = {} # {ticker: {shares, buy_price, buy_date, max_price, mode_active}}
+    trades_log = []
+    equity_curve = []
+    
+    # 설정: 최대 보유 종목 수
+    # TOP1 모드면 1개, ALL 모드면 최대 10개(또는 20개)로 제한하여 분산 투자
+    max_slots = 1 if selection_mode == 'TOP1' else 10 
+
+    # --- 날짜별 루프 (Time Loop) ---
+    for date in sorted_dates:
+        daily_stocks = market_data[date]
+        current_rate = get_rate(date) # 오늘 환율
+        
+        # A. 보유 종목 관리 (매도 체크)
+        sell_list = []
+        
+        for ticker, info in portfolio.items():
+            # 오늘 데이터 찾기
+            stock_row = next((x for x in daily_stocks if x['Ticker'] == ticker), None)
+            if stock_row is None: continue # 휴장일이면 패스
+            
+            curr_price_raw = stock_row['Close_Calc']
+            curr_price_krw = curr_price_raw * (1.0 if ".KS" in ticker else current_rate)
+            score = stock_row['AI_Score']
+            
+            # 수수료
+            fee_sell = 0.003 if ".KS" in ticker else 0.001
+            
+            should_sell = False
+            sell_reason = ""
+            
+            # 수익률 계산
+            profit_pct = (curr_price_krw - info['avg_price']) / info['avg_price'] * 100
+            profit_ratio = (curr_price_krw - info['avg_price']) / info['avg_price']
+
+            # 1) 타임 컷
+            if max_hold_days > 0:
+                held_days = (date - info['buy_date']).days
+                if held_days >= max_hold_days:
+                    should_sell = True
+                    sell_reason = f"⏱️ TimeCut({held_days}일)"
+
+            # 2) 전략별 매도 로직
+            if not should_sell:
+                if strategy_mode == "Basic":
+                    if score <= 45:
+                        should_sell = True
+                        sell_reason = "AI 45↓"
+                        
+                elif strategy_mode == "SuperLocking":
+                    # 락킹 모드 진입 체크
+                    if not info['mode_active'] and profit_ratio >= 0.03:
+                        portfolio[ticker]['mode_active'] = True
+                        portfolio[ticker]['max_price'] = curr_price_krw
+                    
+                    if info['mode_active']:
+                        # 고점 갱신
+                        if curr_price_krw > portfolio[ticker]['max_price']:
+                            portfolio[ticker]['max_price'] = curr_price_krw
+                        
+                        # 트레일링 스탑 (-2%)
+                        if curr_price_krw <= portfolio[ticker]['max_price'] * 0.98:
+                            should_sell = True
+                            sell_reason = "💎 Locking Trailing"
+                    else:
+                        # 방어 로직
+                        if score <= 45:
+                            should_sell = True
+                            sell_reason = "Defense(45↓)"
+
+            # 매도 실행
+            if should_sell:
+                return_amt = info['shares'] * curr_price_krw * (1 - fee_sell)
+                balance += return_amt
+                
+                trades_log.append({
+                    'ticker': ticker, 'name': info['name'], 'date': date, 'type': 'sell',
+                    'price': curr_price_raw, 'score': score, 'profit': profit_pct, 
+                    'reason': sell_reason, 'balance': balance
+                })
+                sell_list.append(ticker)
+
+        # 포트폴리오에서 삭제
+        for t in sell_list: del portfolio[t]
+
+        # B. 신규 매수 (Buy Logic)
+        # 빈 슬롯이 있어야 매수 가능
+        if len(portfolio) < max_slots:
+            candidates = []
+            
+            for row in daily_stocks:
+                ticker = row['Ticker']
+                if ticker in portfolio: continue # 이미 보유중
+                
+                score = row['AI_Score']
+                price_raw = row['Close_Calc']
+                price_krw = price_raw * (1.0 if ".KS" in ticker else current_rate)
+                
+                # 전략별 진입 조건
+                entry_signal = False
+                reason = ""
+                if strategy_mode == "Basic" and score >= 65:
+                    entry_signal = True
+                    reason = "AI 65↑"
+                elif strategy_mode == "SuperLocking" and score >= 80:
+                    entry_signal = True
+                    reason = "Strong Buy(80↑)"
+                
+                if entry_signal:
+                    candidates.append({
+                        'ticker': ticker, 'name': row['Name'], 'price_raw': price_raw,
+                        'price_krw': price_krw, 'score': score, 'reason': reason
+                    })
+            
+            # 🔥 핵심: 정렬 및 선택 (ALL vs TOP1)
+            # 점수 높은 순으로 정렬
+            candidates.sort(key=lambda x: x['score'], reverse=True)
+            
+            # 매수할 종목 수 결정
+            open_slots = max_slots - len(portfolio)
+            buy_targets = candidates[:open_slots] # 슬롯만큼만 매수
+            
+            if buy_targets:
+                # 1종목당 투자할 금액 계산
+                # 복리: 현재 잔고 / 남은 슬롯
+                # 단리: 초기 자본 / 최대 슬롯 (단, 잔고 부족시 잔고만큼)
+                if use_compound:
+                    per_stock_budget = balance / open_slots
+                else:
+                    per_stock_budget = min(balance, initial_capital / max_slots)
+                
+                for target in buy_targets:
+                    # 실제 매수 가능 금액 (잔고 확인)
+                    budget = min(balance, per_stock_budget)
+                    
+                    fee_buy = 0.00015 if ".KS" in target['ticker'] else 0.001
+                    shares = int(budget / (target['price_krw'] * (1 + fee_buy)))
+                    
+                    if shares > 0:
+                        cost = shares * target['price_krw'] * (1 + fee_buy)
+                        balance -= cost
+                        
+                        portfolio[target['ticker']] = {
+                            'name': target['name'],
+                            'shares': shares,
+                            'avg_price': target['price_krw'],
+                            'buy_date': date,
+                            'mode_active': False, # 슈퍼락킹용
+                            'max_price': 0       # 슈퍼락킹용
+                        }
+                        
+                        trades_log.append({
+                            'ticker': target['ticker'], 'name': target['name'], 'date': date, 
+                            'type': 'buy', 'price': target['price_raw'], 'score': target['score'], 
+                            'profit': 0, 'reason': target['reason'], 'balance': balance
+                        })
+
+        # C. 자산 평가 (Equity Curve)
+        current_equity = balance
+        for ticker, info in portfolio.items():
+            # 오늘 종가 찾기 (없으면 매수가로 대충 계산)
+            stock_row = next((x for x in daily_stocks if x['Ticker'] == ticker), None)
+            if stock_row:
+                p_raw = stock_row['Close_Calc']
+                p_krw = p_raw * (1.0 if ".KS" in ticker else current_rate)
+                current_equity += info['shares'] * p_krw
+            else:
+                current_equity += info['shares'] * info['avg_price']
+                
+        equity_curve.append({'date': date, 'equity': current_equity})
+
+    # 결과 정리
+    return pd.DataFrame(trades_log), pd.DataFrame(equity_curve)
 # =========================================================
 # 3. UI 통합 (탭 추가)
 # =========================================================
