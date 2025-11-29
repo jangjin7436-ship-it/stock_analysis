@@ -359,7 +359,7 @@ tab4 = st.tabs(["📊 전체 백테스트 시뮬레이션"])[0] # 기존 tabs �
 
 with tab4:
     st.markdown("### 🧪 포트폴리오 유니버스 백테스트")
-    st.caption("전체 시장을 대상으로 날짜별 시뮬레이션을 수행합니다. (환율/복리/집중투자 반영)")
+    st.caption("전체 시장을 대상으로 날짜별 시뮬레이션을 수행합니다. (환율/복리/집중투자/타점분석 반영)")
     
     # --------------------------------------------------------------------------------
     # 1. 설정 UI (3단 컬럼 구성)
@@ -373,7 +373,7 @@ with tab4:
     with r1_c2:
         initial_cap_input = st.number_input("💰 초기 자본금 (원)", value=10000000, step=1000000, format="%d")
         
-        # 🌟 투자 스타일 선택 (All vs Top1)
+        # 투자 스타일
         sel_mode = st.selectbox(
             "🎯 종목 선정 방식", 
             ["조건 만족 전부 매수 (분산)", "점수 1등만 매수 (집중)"],
@@ -382,15 +382,24 @@ with tab4:
         selection_code = "TOP1" if "집중" in sel_mode else "ALL"
 
     with r1_c3:
-        # ⚔️ 전략 선택
-        selected_strategy = st.radio("⚔️ 매매 전략", ["기본 (65/45)", "슈퍼 락킹 (80/Trailing)"])
-        strat_code = "Basic" if "기본" in selected_strategy else "SuperLocking"
+        # 💱 환율 설정 (수정됨: 고정 환율 입력창 부활)
+        ex_method = st.radio("💱 환율 방식", ["실시간 변동 (Dynamic)", "고정 환율 (Fixed)"])
         
-        # 옵션 체크박스
+        if "고정" in ex_method:
+            fixed_exchange_rate = st.number_input("적용 환율 (원/$)", value=1430.0, step=10.0, format="%.1f")
+            exchange_arg_val = fixed_exchange_rate
+        else:
+            st.caption("📅 과거 매매 시점의 실제 환율을 적용합니다.")
+            exchange_arg_val = "DYNAMIC"
+
+    # 2열 옵션 (전략 및 복리)
+    r2_c1, r2_c2 = st.columns(2)
+    with r2_c1:
+        selected_strategy = st.radio("⚔️ 매매 전략", ["기본 (65/45)", "슈퍼 락킹 (80/Trailing)"], horizontal=True)
+        strat_code = "Basic" if "기본" in selected_strategy else "SuperLocking"
+    with r2_c2:
         comp_mode = st.checkbox("복리 투자 (수익 재투자)", value=True)
-        ex_mode = st.checkbox("실시간 환율 적용 (Dynamic)", value=True)
     
-    # 실행 버튼
     st.write("")
     start_btn = st.button("🚀 시뮬레이션 시작", type="primary", use_container_width=True)
 
@@ -398,24 +407,26 @@ with tab4:
     # 2. 시뮬레이션 로직 실행
     # --------------------------------------------------------------------------------
     if start_btn:
-        progress_text = st.empty()
-        
         # A. 환율 데이터 준비
         exchange_data_payload = 1430.0 # 기본값
-        if ex_mode:
+        
+        if exchange_arg_val == "DYNAMIC":
             with st.spinner("💱 과거 환율 데이터(KRW=X) 수집 중..."):
                 try:
                     ex_df = yf.download("KRW=X", start=str(bt_start_date), progress=False)
                     if isinstance(ex_df.columns, pd.MultiIndex):
                         ex_df.columns = ex_df.columns.get_level_values(0)
                     exchange_data_payload = ex_df['Close']
-                    st.success("환율 데이터 적용 완료")
+                    st.success("실시간 환율 데이터 적용 완료")
                 except: 
-                    st.warning("환율 데이터 수집 실패. 고정 환율(1,430원)을 사용합니다.")
+                    st.warning("환율 데이터 수집 실패. 기본값(1,430원)을 사용합니다.")
+                    exchange_data_payload = 1430.0
+        else:
+            # 고정 환율 값 전달
+            exchange_data_payload = float(exchange_arg_val)
 
-        # B. 포트폴리오 시뮬레이션 실행 (run_portfolio_backtest 함수 호출)
-        # *주의: run_portfolio_backtest 함수가 코드 상단에 정의되어 있어야 합니다.
-        with st.spinner("🔄 전 종목 스캔 및 타임머신 가동 중... (약 15~30초)"):
+        # B. 포트폴리오 시뮬레이션 실행
+        with st.spinner("🔄 전 종목 스캔 및 매매 시뮬레이션 중... (약 15~30초)"):
             targets = list(TICKER_MAP.items())
             
             trade_df, equity_df = run_portfolio_backtest(
@@ -426,7 +437,7 @@ with tab4:
                 max_hold_days, 
                 exchange_data_payload, 
                 comp_mode, 
-                selection_code # ALL or TOP1 전달
+                selection_code
             )
         
         # --------------------------------------------------------------------------------
@@ -434,12 +445,11 @@ with tab4:
         # --------------------------------------------------------------------------------
         if not trade_df.empty and not equity_df.empty:
             
-            # (1) 핵심 지표 계산
+            # (1) 핵심 지표
             final_equity = equity_df.iloc[-1]['equity']
             total_return = (final_equity - initial_cap_input) / initial_cap_input * 100
             profit_amt = final_equity - initial_cap_input
             
-            # 승률 계산 (매도 거래 기준)
             sells = trade_df[trade_df['type'] == 'sell']
             win_count = len(sells[sells['profit'] > 0])
             total_sells = len(sells)
@@ -447,102 +457,143 @@ with tab4:
             
             st.success(f"✅ 시뮬레이션 완료! | 방식: {sel_mode}")
             
-            # (2) KPI 대시보드
+            # KPI 대시보드
             with st.container():
                 k1, k2, k3, k4 = st.columns(4)
+                k1.metric("총 수익률", f"{total_return:,.2f}%")
+                k2.metric("매매 승률", f"{win_rate:.1f}%", f"{win_count}승/{total_sells}전")
                 
-                k1.metric(
-                    "총 수익률 (Total Return)", 
-                    f"{total_return:,.2f}%", 
-                    help=f"{bt_start_date}부터 현재까지의 누적 수익률"
-                )
-                k2.metric(
-                    "매매 승률 (Win Rate)", 
-                    f"{win_rate:.1f}%", 
-                    f"{win_count}승 / {total_sells}전"
-                )
-                
-                # 금액 단위 포맷팅 (억/만)
                 if abs(profit_amt) >= 100000000:
                     amt_str = f"{profit_amt/100000000:,.2f}억 원"
                 else:
                     amt_str = f"{profit_amt/10000:,.0f}만 원"
-                
-                k3.metric("총 수익금", amt_str, delta_color="normal")
-                k4.metric("총 매매 횟수", f"{len(trade_df)//2}회") # 매수+매도=1회
+                k3.metric("총 수익금", amt_str)
+                k4.metric("총 매매 횟수", f"{len(trade_df)//2}회")
 
             st.divider()
 
-            # (3) 자산 곡선 (Equity Curve)
-            st.subheader("📈 내 계좌 자산 변화 (Equity Curve)")
-            
-            fig = px.line(
-                equity_df, 
-                x='date', 
-                y='equity', 
-                title=f"자산 성장 그래프 ({sel_mode})",
-                labels={'equity': '평가 금액(원)', 'date': '날짜'}
-            )
-            # 원금 라인 표시
+            # (2) 자산 곡선
+            st.subheader("📈 내 계좌 자산 변화")
+            fig = px.line(equity_df, x='date', y='equity', title=f"자산 성장 그래프 ({sel_mode})")
             fig.add_hline(y=initial_cap_input, line_dash="dash", line_color="gray", annotation_text="원금")
-            
-            # 영역 채우기 (시각적 효과)
             fig.update_traces(fill='tozeroy', line=dict(color='#00CC96', width=2))
-            fig.update_layout(yaxis_tickformat=',d') # Y축 콤마 포맷
-            
             st.plotly_chart(fig, use_container_width=True)
 
-            # (4) 상세 거래 일지 (Trade Log)
-            st.subheader("📝 상세 거래 일지")
+            st.divider()
+
+            # ---------------------------------------------------------------------------
+            # 🌟 [NEW] 종목별 상세 매매 타점 분석 (Visualization)
+            # ---------------------------------------------------------------------------
+            st.subheader("🔍 종목별 상세 매매 타점 분석")
+            st.caption("아래에서 종목을 선택하면, 어디서 사고 팔았는지 차트에 표시해 드립니다.")
             
-            # 보기 좋게 가공
+            # 매매가 있었던 종목 리스트 추출
+            traded_tickers = trade_df['ticker'].unique()
+            # UI용 이름 리스트 생성
+            ticker_options = [f"{TICKER_MAP.get(t, t)} ({t})" for t in traded_tickers]
+            
+            if len(ticker_options) > 0:
+                selected_option = st.selectbox("분석할 종목 선택", ticker_options)
+                selected_ticker = selected_option.split('(')[-1].replace(')', '')
+                selected_name = TICKER_MAP.get(selected_ticker, selected_ticker)
+
+                # 선택된 종목의 매매 내역 필터링
+                my_trades = trade_df[trade_df['ticker'] == selected_ticker].sort_values('date')
+                
+                # 차트 데이터 다운로드 (시각화용)
+                with st.spinner(f"{selected_name} 차트 로딩 중..."):
+                    chart_data = yf.download(selected_ticker, start=str(bt_start_date), progress=False, auto_adjust=True)
+                    if isinstance(chart_data.columns, pd.MultiIndex):
+                        chart_data.columns = chart_data.columns.get_level_values(0)
+                
+                if not chart_data.empty:
+                    # Plotly 차트 생성
+                    fig_detail = go.Figure()
+
+                    # 1. 주가 라인 (Candlestick or Line) - 여기선 깔끔하게 Line
+                    fig_detail.add_trace(go.Scatter(
+                        x=chart_data.index, 
+                        y=chart_data['Close'],
+                        mode='lines',
+                        name='주가',
+                        line=dict(color='gray', width=1)
+                    ))
+
+                    # 2. 매수 타점 (▲)
+                    buys = my_trades[my_trades['type'] == 'buy']
+                    fig_detail.add_trace(go.Scatter(
+                        x=buys['date'], 
+                        y=buys['price'],
+                        mode='markers',
+                        name='매수 (Buy)',
+                        marker=dict(symbol='triangle-up', color='red', size=12, line=dict(width=1, color='black')),
+                        hovertemplate='매수: %{y:,.2f}<br>날짜: %{x}<extra></extra>'
+                    ))
+
+                    # 3. 매도 타점 (▼)
+                    sells = my_trades[my_trades['type'] == 'sell']
+                    fig_detail.add_trace(go.Scatter(
+                        x=sells['date'], 
+                        y=sells['price'],
+                        mode='markers',
+                        name='매도 (Sell)',
+                        marker=dict(symbol='triangle-down', color='blue', size=12, line=dict(width=1, color='black')),
+                        hovertemplate='매도: %{y:,.2f}<br>수익률: %{text}<extra></extra>',
+                        text=[f"{p:.2f}%" for p in sells['profit']] # 호버 텍스트에 수익률 표시
+                    ))
+
+                    fig_detail.update_layout(
+                        title=f"{selected_name} 매매 타점 복기",
+                        height=500,
+                        xaxis_title="날짜",
+                        yaxis_title="주가",
+                        template="plotly_dark"
+                    )
+                    st.plotly_chart(fig_detail, use_container_width=True)
+                    
+                    # 해당 종목 매매 일지 테이블
+                    st.markdown(f"**📄 {selected_name} 거래 내역**")
+                    disp_trade = my_trades[['date', 'type', 'price', 'profit', 'reason', 'score']].copy()
+                    disp_trade['date'] = disp_trade['date'].dt.date
+                    st.dataframe(
+                        disp_trade, 
+                        hide_index=True, 
+                        use_container_width=True,
+                        column_config={
+                            "date": "날짜",
+                            "type": "구분",
+                            "price": st.column_config.NumberColumn("가격", format="%.2f"),
+                            "profit": st.column_config.NumberColumn("수익률", format="%.2f%%"),
+                            "score": st.column_config.NumberColumn("AI점수", format="%.1f점"),
+                            "reason": "사유"
+                        }
+                    )
+            else:
+                st.info("매매 내역이 없습니다.")
+
+            st.divider()
+
+            # (3) 전체 거래 로그
+            st.subheader("📝 전체 거래 일지")
             display_log = trade_df.copy()
-            # 날짜 포맷
             display_log['date'] = display_log['date'].dt.date
-            # 필요한 컬럼만 선택
             display_log = display_log[['date', 'name', 'type', 'price', 'profit', 'balance', 'reason']]
             
-            # 데이터프레임 출력
             st.dataframe(
                 display_log.sort_values('date', ascending=False),
                 use_container_width=True,
                 hide_index=True,
                 column_config={
                     "date": "날짜",
-                    "name": st.column_config.TextColumn("종목명", width="medium"),
+                    "name": "종목명",
                     "type": st.column_config.TextColumn("구분", width="small"),
-                    "price": st.column_config.NumberColumn("체결가($)", format="%.2f"),
+                    "price": st.column_config.NumberColumn("가격($/₩)", format="%.2f"),
                     "profit": st.column_config.NumberColumn("수익률", format="%.2f%%"),
-                    "balance": st.column_config.NumberColumn("거래 후 잔고", format="%d원"),
-                    "reason": st.column_config.TextColumn("사유", width="large"),
+                    "balance": st.column_config.NumberColumn("잔고(원)", format="%d원"),
+                    "reason": "사유"
                 },
-                height=500
+                height=400
             )
-            
-            # (5) 종목별 성과 요약 (집계)
-            st.subheader("📊 종목별 실현 손익 집계")
-            if not sells.empty:
-                # 종목별로 그룹화하여 수익금 합계 계산
-                # (매도 기록을 기준으로 계산)
-                # 주의: 단순히 profit %를 더하는 건 부정확할 수 있으나, 대략적인 흐름 파악용
-                
-                # 정확한 종목별 손익금 계산을 위해 trade_df 재가공 필요하나, 
-                # 여기서는 매도 리스트를 기반으로 표시
-                stock_summary = sells.groupby('name').agg(
-                    total_profit_pct=('profit', 'sum'),
-                    trade_count=('profit', 'count')
-                ).reset_index().sort_values('total_profit_pct', ascending=False)
-                
-                st.dataframe(
-                    stock_summary,
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "name": "종목명",
-                        "total_profit_pct": st.column_config.NumberColumn("누적 수익률 합계", format="%.2f%%"),
-                        "trade_count": st.column_config.NumberColumn("매도 횟수", format="%d회"),
-                    }
-                )
 
         else:
-            st.warning("⚠️ 매매 신호가 발생하지 않았습니다. (조건을 완화하거나 기간을 늘려보세요)")
+            st.warning("⚠️ 매매 신호가 발생하지 않았습니다.")
