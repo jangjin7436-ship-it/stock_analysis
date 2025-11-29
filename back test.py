@@ -131,14 +131,12 @@ def get_ai_score_row(row):
 # =========================================================
 # 2. 개별 종목 백테스트 엔진
 # =========================================================
-def run_single_stock_backtest(ticker, name, start_date="2023-01-01", initial_capital=1000000, strategy_mode="Basic", max_holding_days=0, exchange_data=1430.0):
+def run_single_stock_backtest(ticker, name, start_date="2023-01-01", initial_capital=1000000, strategy_mode="Basic", max_holding_days=0, exchange_data=1430.0, use_compound=True):
     """
-    exchange_data: 
-      - float/int일 경우: 고정 환율 적용 (예: 1430)
-      - pd.Series일 경우: 날짜별 환율 데이터 (Index가 Datetime)
+    use_compound: True면 복리(전액 재투자), False면 단리(초기 자본금만큼만 투자)
     """
     try:
-        # 1. 주가 데이터 수집
+        # 1. 데이터 수집
         df = yf.download(ticker, start=start_date, progress=False, auto_adjust=True)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
@@ -149,65 +147,50 @@ def run_single_stock_backtest(ticker, name, start_date="2023-01-01", initial_cap
         df = calculate_indicators_for_backtest(df)
         df['AI_Score'] = df.apply(get_ai_score_row, axis=1)
 
-        # -----------------------------------------------------------
-        # 💱 [핵심] 환율 데이터 병합 (Merge)
-        # -----------------------------------------------------------
+        # 3. 환율 처리
         is_kr = ".KS" in ticker or ".KQ" in ticker
-        
         if is_kr:
-            # 한국 주식은 환율 1.0 고정
             df['Exchange_Rate'] = 1.0
         else:
-            # 미국 주식
             if isinstance(exchange_data, (float, int)):
-                # A. 고정 환율 모드
                 df['Exchange_Rate'] = float(exchange_data)
             else:
-                # B. 변동 환율 모드 (과거 데이터 매핑)
-                # 인덱스(날짜)를 기준으로 환율 데이터를 합칩니다.
-                # 휴장일 등으로 환율 데이터가 비어있으면 전날 환율(ffill)을 사용합니다.
-                df['Exchange_Rate'] = exchange_data.reindex(df.index, method='ffill').fillna(method='bfill')
-                
-                # 혹시라도 NaN이 남으면 기본값 1400원으로 채움 (안전장치)
-                df['Exchange_Rate'] = df['Exchange_Rate'].fillna(1400.0)
+                df['Exchange_Rate'] = exchange_data.reindex(df.index, method='ffill').fillna(method='bfill').fillna(1430.0)
 
-        # -----------------------------------------------------------
-
-        # 시뮬레이션 변수
+        # 4. 시뮬레이션 변수
         balance = initial_capital
         shares = 0
         avg_price = 0
         trades = []
         buy_date = None
         
-        # 슈퍼 락킹 변수
         locking_mode = False
         max_price_in_mode = 0
         
-        # 수수료
         fee_buy = 0.00015 if is_kr else 0.001
         fee_sell = 0.003 if is_kr else 0.001
 
         for date, row in df.iterrows():
-            # 🌟 그 날의 환율이 반영된 가격 계산
             rate = row['Exchange_Rate']
-            raw_price = row['Close_Calc']     # 달러(또는 원화)
-            price_krw = raw_price * rate      # 원화 환산 가격
-            
+            raw_price = row['Close_Calc']
+            price_krw = raw_price * rate
             score = row['AI_Score']
             
-            # --- 타임 컷 (Time Cut) ---
+            # --- 공통: 매수 가능 금액 계산 (복리 vs 단리) ---
+            # 복리: 현재 가진 현금 전액 투자
+            # 단리: 초기 자본금까지만 투자 (수익금은 Save), 단 손실나서 원금이 줄면 남은 돈만 투자
+            invest_budget = balance
+            if not use_compound:
+                invest_budget = min(balance, initial_capital)
+
+            # --- 타임 컷 ---
             if shares > 0 and max_holding_days > 0 and buy_date is not None:
                 days_held = (date - buy_date).days
                 if days_held >= max_holding_days:
                     return_amt = shares * price_krw * (1 - fee_sell)
                     balance += return_amt
                     profit_pct = (price_krw - avg_price) / avg_price * 100
-                    trades.append({
-                        'date': date, 'type': 'sell', 'price': raw_price, 
-                        'score': score, 'profit': profit_pct, 'reason': f'⏱️ TimeCut({days_held}일)',
-                        'rate': rate # 환율 기록
-                    })
+                    trades.append({'date': date, 'type': 'sell', 'price': raw_price, 'score': score, 'profit': profit_pct, 'reason': f'⏱️ TimeCut({days_held}일)', 'rate': rate})
                     shares = 0
                     buy_date = None
                     locking_mode = False
@@ -215,9 +198,9 @@ def run_single_stock_backtest(ticker, name, start_date="2023-01-01", initial_cap
 
             # --- [전략 1] 기본 (Basic) ---
             if strategy_mode == "Basic":
-                # 매수
                 if score >= 65 and shares == 0:
-                    can_buy = int(balance / (price_krw * (1 + fee_buy)))
+                    # 설정한 예산(invest_budget) 내에서 매수
+                    can_buy = int(invest_budget / (price_krw * (1 + fee_buy)))
                     if can_buy > 0:
                         shares = can_buy
                         balance -= shares * price_krw * (1 + fee_buy)
@@ -225,7 +208,6 @@ def run_single_stock_backtest(ticker, name, start_date="2023-01-01", initial_cap
                         buy_date = date
                         trades.append({'date': date, 'type': 'buy', 'price': raw_price, 'score': score, 'reason': 'AI 65↑', 'rate': rate})
 
-                # 매도
                 elif score <= 45 and shares > 0:
                     return_amt = shares * price_krw * (1 - fee_sell)
                     balance += return_amt
@@ -236,9 +218,8 @@ def run_single_stock_backtest(ticker, name, start_date="2023-01-01", initial_cap
 
             # --- [전략 2] 슈퍼 락킹 (SuperLocking) ---
             elif strategy_mode == "SuperLocking":
-                # 매수
                 if score >= 80 and shares == 0:
-                    can_buy = int(balance / (price_krw * (1 + fee_buy)))
+                    can_buy = int(invest_budget / (price_krw * (1 + fee_buy)))
                     if can_buy > 0:
                         shares = can_buy
                         balance -= shares * price_krw * (1 + fee_buy)
@@ -248,38 +229,37 @@ def run_single_stock_backtest(ticker, name, start_date="2023-01-01", initial_cap
                         max_price_in_mode = 0
                         trades.append({'date': date, 'type': 'buy', 'price': raw_price, 'score': score, 'reason': 'Strong Buy(80↑)', 'rate': rate})
                 
-                # 보유 관리
                 elif shares > 0:
                     curr_return = (price_krw - avg_price) / avg_price
-                    
                     if not locking_mode and curr_return >= 0.03:
                         locking_mode = True
                         max_price_in_mode = price_krw
                     
+                    should_sell = False
+                    sell_reason = ""
+                    
                     if locking_mode:
                         if price_krw > max_price_in_mode: max_price_in_mode = price_krw
-                        
                         if price_krw <= max_price_in_mode * 0.98:
-                            return_amt = shares * price_krw * (1 - fee_sell)
-                            balance += return_amt
-                            profit_pct = (price_krw - avg_price) / avg_price * 100
-                            trades.append({'date': date, 'type': 'sell', 'price': raw_price, 'score': score, 'profit': profit_pct, 'reason': '💎 Locking Trailing', 'rate': rate})
-                            shares = 0
-                            buy_date = None
-                            locking_mode = False
+                            should_sell = True
+                            sell_reason = '💎 Locking Trailing'
                     else:
                         if score <= 45:
-                            return_amt = shares * price_krw * (1 - fee_sell)
-                            balance += return_amt
-                            profit_pct = (price_krw - avg_price) / avg_price * 100
-                            trades.append({'date': date, 'type': 'sell', 'price': raw_price, 'score': score, 'profit': profit_pct, 'reason': 'Defense(45↓)', 'rate': rate})
-                            shares = 0
-                            buy_date = None
+                            should_sell = True
+                            sell_reason = 'Defense(45↓)'
+                            
+                    if should_sell:
+                        return_amt = shares * price_krw * (1 - fee_sell)
+                        balance += return_amt
+                        profit_pct = (price_krw - avg_price) / avg_price * 100
+                        trades.append({'date': date, 'type': 'sell', 'price': raw_price, 'score': score, 'profit': profit_pct, 'reason': sell_reason, 'rate': rate})
+                        shares = 0
+                        buy_date = None
+                        locking_mode = False
 
-        # 최종 평가 (마지막 날 환율 적용)
+        # 최종 평가
         final_row = df.iloc[-1]
         final_price_krw = final_row['Close_Calc'] * final_row['Exchange_Rate']
-        
         final_equity = balance + (shares * final_price_krw)
         total_return = (final_equity - initial_capital) / initial_capital * 100
         
@@ -304,246 +284,190 @@ tab4 = st.tabs(["📊 전체 백테스트 시뮬레이션"])[0] # 기존 tabs �
 
 with tab4:
     st.markdown("### 🧪 포트폴리오 유니버스 백테스트")
-    st.caption("과거 데이터 기반 전략 시뮬레이션")
+    st.caption("전체 시장을 대상으로 날짜별 시뮬레이션을 수행합니다. (환율/복리/집중투자 반영)")
     
-    # 설정 UI (4단 컬럼 구성)
-    col_set1, col_set2, col_set3, col_set4 = st.columns([1.2, 1.2, 1.2, 1.2])
+    # --------------------------------------------------------------------------------
+    # 1. 설정 UI (3단 컬럼 구성)
+    # --------------------------------------------------------------------------------
+    r1_c1, r1_c2, r1_c3 = st.columns(3)
     
-    with col_set1:
+    with r1_c1:
         bt_start_date = st.date_input("시작일", value=pd.to_datetime("2024-01-01"))
-        max_hold_days = st.slider("⏱️ 타임 컷 (일)", 0, 60, 0, help="0: 제한 없음")
+        max_hold_days = st.slider("⏱️ 타임 컷 (일)", 0, 60, 0, help="0: 제한 없음. 설정 시 N일 후 강제 매도")
 
-    with col_set2:
-        # 🌟 환율 설정
-        ex_mode = st.radio("💱 환율 적용 방식", ["고정 환율 (Fixed)", "실시간 변동 (Dynamic)"])
+    with r1_c2:
+        initial_cap_input = st.number_input("💰 초기 자본금 (원)", value=10000000, step=1000000, format="%d")
         
-        if "고정" in ex_mode:
-            fixed_rate_val = st.number_input("적용 환율(원/$)", value=1430.0, step=10.0)
-            exchange_arg = fixed_rate_val
-        else:
-            st.caption("📅 매수/매도일 당시 환율을 적용합니다.")
-            exchange_arg = "DYNAMIC" # 플래그
-
-    with col_set3:
-        selected_strategy = st.radio(
-            "⚔️ 전략 선택", 
-            ["기본 (Basic)", "슈퍼 락킹 (SuperLocking)"],
-            captions=["65↑ 매수 / 45↓ 매도", "80↑ 매수 / +3% 후 익절"]
+        # 🌟 투자 스타일 선택 (All vs Top1)
+        sel_mode = st.selectbox(
+            "🎯 종목 선정 방식", 
+            ["조건 만족 전부 매수 (분산)", "점수 1등만 매수 (집중)"],
+            help="분산: 최대 10종목까지 자금을 쪼개서 매수\n집중: 가장 점수 높은 1개 종목에 자금 올인"
         )
+        selection_code = "TOP1" if "집중" in sel_mode else "ALL"
+
+    with r1_c3:
+        # ⚔️ 전략 선택
+        selected_strategy = st.radio("⚔️ 매매 전략", ["기본 (65/45)", "슈퍼 락킹 (80/Trailing)"])
         strat_code = "Basic" if "기본" in selected_strategy else "SuperLocking"
         
-    with col_set4:
-        st.write("")
-        st.write("")
-        start_btn = st.button("🚀 시뮬레이션 시작", type="primary", use_container_width=True)
+        # 옵션 체크박스
+        comp_mode = st.checkbox("복리 투자 (수익 재투자)", value=True)
+        ex_mode = st.checkbox("실시간 환율 적용 (Dynamic)", value=True)
+    
+    # 실행 버튼
+    st.write("")
+    start_btn = st.button("🚀 시뮬레이션 시작", type="primary", use_container_width=True)
 
+    # --------------------------------------------------------------------------------
+    # 2. 시뮬레이션 로직 실행
+    # --------------------------------------------------------------------------------
     if start_btn:
-        results = []
         progress_text = st.empty()
-        bar = st.progress(0)
         
-        # 1. 변동 환율 모드일 경우, 환율 데이터 먼저 다운로드 (한 번만!)
-        exchange_data_payload = exchange_arg
-        if exchange_arg == "DYNAMIC":
+        # A. 환율 데이터 준비
+        exchange_data_payload = 1430.0 # 기본값
+        if ex_mode:
             with st.spinner("💱 과거 환율 데이터(KRW=X) 수집 중..."):
                 try:
-                    # 시작일보다 조금 더 여유있게 가져옴
                     ex_df = yf.download("KRW=X", start=str(bt_start_date), progress=False)
                     if isinstance(ex_df.columns, pd.MultiIndex):
                         ex_df.columns = ex_df.columns.get_level_values(0)
-                    exchange_data_payload = ex_df['Close'] # Series 전달
-                    st.success(f"환율 데이터 로드 완료 ({len(exchange_data_payload)}일)")
-                except Exception as e:
-                    st.error(f"환율 데이터 수집 실패: {e}")
-                    st.stop()
-        
-        # 2. 병렬 시뮬레이션 시작
-        targets = list(TICKER_MAP.items())
-        total_stocks = len(targets)
-        
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            futures = {
-                executor.submit(
-                    run_single_stock_backtest, 
-                    code, 
-                    name, 
-                    str(bt_start_date), 
-                    1000000, 
-                    strat_code,
-                    max_hold_days,
-                    exchange_data_payload # 🌟 환율 데이터(값 또는 Series) 전달
-                ): code for code, name in targets
-            }
-            
-            completed = 0
-            for future in futures:
-                res = future.result()
-                if res: results.append(res)
-                completed += 1
-                bar.progress(completed / total_stocks)
-                progress_text.text(f"분석 중... ({completed}/{total_stocks})")
+                    exchange_data_payload = ex_df['Close']
+                    st.success("환율 데이터 적용 완료")
+                except: 
+                    st.warning("환율 데이터 수집 실패. 고정 환율(1,430원)을 사용합니다.")
 
-        bar.empty()
-        progress_text.empty()
+        # B. 포트폴리오 시뮬레이션 실행 (run_portfolio_backtest 함수 호출)
+        # *주의: run_portfolio_backtest 함수가 코드 상단에 정의되어 있어야 합니다.
+        with st.spinner("🔄 전 종목 스캔 및 타임머신 가동 중... (약 15~30초)"):
+            targets = list(TICKER_MAP.items())
+            
+            trade_df, equity_df = run_portfolio_backtest(
+                targets, 
+                str(bt_start_date), 
+                initial_cap_input, 
+                strat_code, 
+                max_hold_days, 
+                exchange_data_payload, 
+                comp_mode, 
+                selection_code # ALL or TOP1 전달
+            )
         
-        if results:
-            df_res = pd.DataFrame(results)
+        # --------------------------------------------------------------------------------
+        # 3. 결과 시각화
+        # --------------------------------------------------------------------------------
+        if not trade_df.empty and not equity_df.empty:
             
-            # ---------------------------------------------------------
-            # 1. 데이터 가공 및 통계 계산
-            # ---------------------------------------------------------
-            # 수익률의 평균은 '일간'이 아니라, 시뮬레이션 '전체 기간' 동안의 평균입니다.
-            avg_return = df_res['total_return'].mean()
-            win_rate_avg = df_res['win_rate'].mean()
+            # (1) 핵심 지표 계산
+            final_equity = equity_df.iloc[-1]['equity']
+            total_return = (final_equity - initial_cap_input) / initial_cap_input * 100
+            profit_amt = final_equity - initial_cap_input
             
-            # 초기 자본 총액 (종목 수 * 100만원) 대비 최종 자산 총액
-            initial_total_capital = 1000000 * len(df_res)
-            final_total_equity = df_res['final_equity'].sum()
-            total_profit_amt = final_total_equity - initial_total_capital
-            total_profit_pct = (total_profit_amt / initial_total_capital) * 100
+            # 승률 계산 (매도 거래 기준)
+            sells = trade_df[trade_df['type'] == 'sell']
+            win_count = len(sells[sells['profit'] > 0])
+            total_sells = len(sells)
+            win_rate = (win_count / total_sells * 100) if total_sells > 0 else 0.0
             
-            st.success(f"✅ 분석 완료! ({bt_start_date} ~ 현재) | 전략: {selected_strategy}")
+            st.success(f"✅ 시뮬레이션 완료! | 방식: {sel_mode}")
             
-            # ---------------------------------------------------------
-            # 2. 메인 대시보드 (KPI 카드)
-            # ---------------------------------------------------------
-            st.markdown("### 📊 포트폴리오 성과 요약")
-            
-            # 스타일링된 컨테이너 사용
+            # (2) KPI 대시보드
             with st.container():
-                kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+                k1, k2, k3, k4 = st.columns(4)
                 
-                # 기간 수익률 (전체 자산 기준)
-                kpi1.metric(
-                    label="총 누적 수익률 (기간)",
-                    value=f"{total_profit_pct:,.2f}%",
-                    delta=f"{avg_return:,.2f}% (종목 평균)",
-                    help="설정한 기간 동안 전체 계좌가 얼마나 불어났는지를 의미합니다."
+                k1.metric(
+                    "총 수익률 (Total Return)", 
+                    f"{total_return:,.2f}%", 
+                    help=f"{bt_start_date}부터 현재까지의 누적 수익률"
+                )
+                k2.metric(
+                    "매매 승률 (Win Rate)", 
+                    f"{win_rate:.1f}%", 
+                    f"{win_count}승 / {total_sells}전"
                 )
                 
-                # 평균 승률
-                kpi2.metric(
-                    label="평균 승률",
-                    value=f"{win_rate_avg:.1f}%",
-                    help="익절로 끝난 매매의 비율입니다."
-                )
+                # 금액 단위 포맷팅 (억/만)
+                if abs(profit_amt) >= 100000000:
+                    amt_str = f"{profit_amt/100000000:,.2f}억 원"
+                else:
+                    amt_str = f"{profit_amt/10000:,.0f}만 원"
                 
-                # 총 수익금
-                kpi3.metric(
-                    label="총 예상 수익금",
-                    value=f"{total_profit_amt/10000:,.0f}만 원", # 만원 단위로 축약
-                    delta_color="normal",
-                    help="종목당 100만 원 투자 시 예상되는 총 수익금입니다."
-                )
-                
-                # 종목 수
-                kpi4.metric(
-                    label="분석 종목 수",
-                    value=f"{len(df_res)}개",
-                    help="백테스트에 포함된 총 종목 개수입니다."
-                )
+                k3.metric("총 수익금", amt_str, delta_color="normal")
+                k4.metric("총 매매 횟수", f"{len(trade_df)//2}회") # 매수+매도=1회
 
             st.divider()
 
-            # ---------------------------------------------------------
-            # 3. 차트 섹션 (좌: 수익률 분포 / 우: Top & Worst)
-            # ---------------------------------------------------------
-            col_chart, col_list = st.columns([1.5, 1])
+            # (3) 자산 곡선 (Equity Curve)
+            st.subheader("📈 내 계좌 자산 변화 (Equity Curve)")
             
-            with col_chart:
-                st.markdown("#### 📈 수익률 분포 (Histogram)")
-                # Plotly 디자인 개선
-                fig = px.histogram(
-                    df_res, 
-                    x="total_return", 
-                    nbins=25,
-                    color_discrete_sequence=['#4C78A8']
-                )
-                fig.update_layout(
-                    xaxis_title="기간 수익률 (%)",
-                    yaxis_title="종목 개수",
-                    showlegend=False,
-                    paper_bgcolor="rgba(0,0,0,0)", # 투명 배경
-                    plot_bgcolor="rgba(0,0,0,0)",
-                    margin=dict(l=20, r=20, t=30, b=20)
-                )
-                # 평균선 강조
-                fig.add_vline(x=avg_return, line_dash="dash", line_color="#FF4B4B", annotation_text="평균")
-                st.plotly_chart(fig, use_container_width=True)
+            fig = px.line(
+                equity_df, 
+                x='date', 
+                y='equity', 
+                title=f"자산 성장 그래프 ({sel_mode})",
+                labels={'equity': '평가 금액(원)', 'date': '날짜'}
+            )
+            # 원금 라인 표시
+            fig.add_hline(y=initial_cap_input, line_dash="dash", line_color="gray", annotation_text="원금")
+            
+            # 영역 채우기 (시각적 효과)
+            fig.update_traces(fill='tozeroy', line=dict(color='#00CC96', width=2))
+            fig.update_layout(yaxis_tickformat=',d') # Y축 콤마 포맷
+            
+            st.plotly_chart(fig, use_container_width=True)
 
-            with col_list:
-                st.markdown("#### 🏆 수익률 Best 3")
-                top3 = df_res.sort_values('total_return', ascending=False).head(3)
-                
-                # 미니 데이터프레임 (깔끔하게)
-                st.dataframe(
-                    top3[['name', 'total_return']],
-                    hide_index=True,
-                    use_container_width=True,
-                    column_config={
-                        "name": "종목명",
-                        "total_return": st.column_config.NumberColumn("수익률", format="%.2f%%")
-                    }
-                )
-                
-                st.markdown("#### 💀 수익률 Worst 3")
-                worst3 = df_res.sort_values('total_return', ascending=True).head(3)
-                st.dataframe(
-                    worst3[['name', 'total_return']],
-                    hide_index=True,
-                    use_container_width=True,
-                    column_config={
-                        "name": "종목명",
-                        "total_return": st.column_config.NumberColumn("수익률", format="%.2f%%")
-                    }
-                )
-
-            # ---------------------------------------------------------
-            # 4. 전체 상세 내역 (비주얼 업그레이드)
-            # ---------------------------------------------------------
-            st.markdown("#### 📑 종목별 상세 리포트")
+            # (4) 상세 거래 일지 (Trade Log)
+            st.subheader("📝 상세 거래 일지")
             
-            # 데이터프레임 컬럼 설정 (핵심 디자인)
-            column_configuration = {
-                "name": st.column_config.TextColumn("종목명", width="medium"),
-                
-                # 수익률: 숫자가 클수록 진하게 표시되는 히트맵 효과는 없지만, 깔끔하게 포맷팅
-                "total_return": st.column_config.NumberColumn(
-                    "기간 수익률",
-                    help="해당 기간 동안의 총 수익률",
-                    format="%.2f%%"
-                ),
-                
-                # 승률: 0~100% 진행바(Bar)로 표시 -> 엑셀 느낌 탈피!
-                "win_rate": st.column_config.ProgressColumn(
-                    "승률 (Win Rate)",
-                    help="매매 승률",
-                    format="%.1f%%",
-                    min_value=0,
-                    max_value=100,
-                ),
-                
-                # 매매 횟수
-                "trade_count": st.column_config.NumberColumn(
-                    "매매 횟수",
-                    format="%d회"
-                ),
-                
-                # 최종 자산
-                "final_equity": st.column_config.NumberColumn(
-                    "최종 평가금",
-                    help="100만 원 투자 시 최종 금액",
-                    format="%d원"
-                )
-            }
+            # 보기 좋게 가공
+            display_log = trade_df.copy()
+            # 날짜 포맷
+            display_log['date'] = display_log['date'].dt.date
+            # 필요한 컬럼만 선택
+            display_log = display_log[['date', 'name', 'type', 'price', 'profit', 'balance', 'reason']]
             
+            # 데이터프레임 출력
             st.dataframe(
-                df_res[['name', 'total_return', 'win_rate', 'trade_count', 'final_equity']].sort_values('total_return', ascending=False),
+                display_log.sort_values('date', ascending=False),
                 use_container_width=True,
                 hide_index=True,
-                column_config=column_configuration,
-                height=500 # 높이 고정으로 스크롤 편의성 제공
+                column_config={
+                    "date": "날짜",
+                    "name": st.column_config.TextColumn("종목명", width="medium"),
+                    "type": st.column_config.TextColumn("구분", width="small"),
+                    "price": st.column_config.NumberColumn("체결가($)", format="%.2f"),
+                    "profit": st.column_config.NumberColumn("수익률", format="%.2f%%"),
+                    "balance": st.column_config.NumberColumn("거래 후 잔고", format="%d원"),
+                    "reason": st.column_config.TextColumn("사유", width="large"),
+                },
+                height=500
             )
             
+            # (5) 종목별 성과 요약 (집계)
+            st.subheader("📊 종목별 실현 손익 집계")
+            if not sells.empty:
+                # 종목별로 그룹화하여 수익금 합계 계산
+                # (매도 기록을 기준으로 계산)
+                # 주의: 단순히 profit %를 더하는 건 부정확할 수 있으나, 대략적인 흐름 파악용
+                
+                # 정확한 종목별 손익금 계산을 위해 trade_df 재가공 필요하나, 
+                # 여기서는 매도 리스트를 기반으로 표시
+                stock_summary = sells.groupby('name').agg(
+                    total_profit_pct=('profit', 'sum'),
+                    trade_count=('profit', 'count')
+                ).reset_index().sort_values('total_profit_pct', ascending=False)
+                
+                st.dataframe(
+                    stock_summary,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "name": "종목명",
+                        "total_profit_pct": st.column_config.NumberColumn("누적 수익률 합계", format="%.2f%%"),
+                        "trade_count": st.column_config.NumberColumn("매도 횟수", format="%d회"),
+                    }
+                )
+
         else:
-            st.error("결과가 없습니다. 날짜를 변경하거나 데이터를 확인해주세요.")
+            st.warning("⚠️ 매매 신호가 발생하지 않았습니다. (조건을 완화하거나 기간을 늘려보세요)")
