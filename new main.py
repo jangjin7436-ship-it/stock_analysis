@@ -422,21 +422,24 @@ def calculate_total_profit(ticker, avg_price, current_price, quantity):
         "currency": currency
     }
 
-def analyze_advanced_strategy(df):
+def analyze_advanced_strategy(df, curr_override=None):
     """
     [2~4주 스윙 전용] 매수 매력도 스코어링 엔진
-
-    목표:
-    - 최대 보유기간 4주, 보통 2주 안에서
-      '강한 중기 상승 추세 + 단기 눌림목' 구간을 찾는다.
-    - 과열/급등, 과도한 변동성 종목은 감점하여
-      단기 고점 추격매수·롤러코스터 종목을 피하려고 한다.
     """
     if df is None or df.empty:
         return "분석 불가", "gray", "데이터 부족", 0
 
     try:
+        # 기본값은 일봉 종가
         curr = float(df['Close_Calc'].iloc[-1])
+
+        # 🔑 실시간 가격이 들어오면 그걸로 덮어쓰기
+        if curr_override is not None:
+            try:
+                curr = float(curr_override)
+            except:
+                pass
+
         ma5  = float(df['MA5'].iloc[-1])
         ma10 = float(df['MA10'].iloc[-1])
         ma20 = float(df['MA20'].iloc[-1])
@@ -609,18 +612,21 @@ with tab1:
                         if df_tk.empty: continue
                         
                         df_indi = calculate_indicators(df_tk)
-                        if df_indi is None: continue
+                        if df_indi is None:
+                            continue
 
-                        cat, col_name, reasoning, score = analyze_advanced_strategy(df_indi)
-                        
-                        # 화면 표시는 실시간 맵에 있는 가격 우선
-                        curr_price = realtime_map.get(ticker_code, df_indi['Close_Calc'].iloc[-1])
+                        # 🔑 실시간 가격 (없으면 일봉 종가 사용)
+                        base_close = float(df_indi['Close_Calc'].iloc[-1])
+                        curr_price = realtime_map.get(ticker_code, base_close)
+
+                        # 🔑 추세 판단에 실시간 가격 반영
+                        cat, col_name, reasoning, score = analyze_advanced_strategy(df_indi, curr_override=curr_price)
+
                         rsi_val = float(df_indi['RSI'].iloc[-1])
                         name = TICKER_MAP.get(ticker_code, ticker_code)
-                        
+
                         is_kr = ticker_code.endswith(".KS") or ticker_code.endswith(".KQ")
                         sym = "₩" if is_kr else "$"
-                        
                         fmt_price = f"{sym}{curr_price:,.0f}" if is_kr else f"{sym}{curr_price:,.2f}"
 
                         scan_results.append({
@@ -767,18 +773,25 @@ with tab2:
                 qty = item.get('qty', 1)
                 name = TICKER_MAP.get(tk, tk)
                 
-                df_tk = None
+                df_indi = None
+                curr = 0
+
                 if tk in raw_data_dict:
                     df_tk = raw_data_dict[tk].dropna(how='all')
-                
+                    if not df_tk.empty:
+                        df_indi = calculate_indicators(df_tk)
+
+                # 🔑 현재가 (실시간 우선)
+                if tk in realtime_map:
+                    curr = float(realtime_map[tk])
+                elif df_tk is not None and not df_tk.empty:
+                    curr = float(df_tk['Close'].iloc[-1])
+
                 cat, col_name, reasoning, score = "데이터 로딩 중", "gray", "잠시 후 다시 시도", 0
-                curr = 0
-                
-                if df_tk is not None and not df_tk.empty:
-                    df_indi = calculate_indicators(df_tk)
-                    if df_indi is not None:
-                        # 분석은 업데이트된 마지막 종가 기준
-                        cat, col_name, reasoning, score = analyze_advanced_strategy(df_indi)
+
+                if df_indi is not None:
+                    # 🔑 추세 분석에 실시간 가격 반영
+                    cat, col_name, reasoning, score = analyze_advanced_strategy(df_indi, curr_override=curr)
                 
                 # 표시는 실시간 맵 기준 (가장 정확)
                 if tk in realtime_map:
