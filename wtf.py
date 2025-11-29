@@ -594,9 +594,14 @@ with tab4:
             )
         
         # --------------------------------------------------------------------------------
-        # 3. 결과 대시보드
+        # 3. 결과 대시보드 (UI/UX 개선 버전)
         # --------------------------------------------------------------------------------
         if not trade_df.empty and not equity_df.empty:
+            # --- 추가 지표 계산 (MDD) ---
+            equity_df['max_equity'] = equity_df['equity'].cummax()
+            equity_df['drawdown'] = (equity_df['equity'] - equity_df['max_equity']) / equity_df['max_equity'] * 100
+            mdd = equity_df['drawdown'].min() # MDD는 보통 음수로 표현
+
             final_equity = equity_df.iloc[-1]['equity']
             total_return = (final_equity - initial_cap_input) / initial_cap_input * 100
             profit_amt = final_equity - initial_cap_input
@@ -605,83 +610,174 @@ with tab4:
             win_count = len(sells[sells['profit'] > 0])
             total_sells = len(sells)
             win_rate = (win_count / total_sells * 100) if total_sells > 0 else 0.0
+
+            # ---------------------------
+            # [섹션 A] 핵심 성과 지표 (KPI)
+            # ---------------------------
+            st.markdown("#### 🚀 백테스트 요약 리포트")
             
-            st.success(f"✅ 완료! 최종 자산: {final_equity:,.0f}원")
-            
-            with st.container():
-                k1, k2, k3, k4 = st.columns(4)
-                k1.metric("총 수익률", f"{total_return:,.2f}%")
-                k2.metric("승률", f"{win_rate:.1f}%", f"{win_count}승/{total_sells}전")
+            # 스타일을 위한 컨테이너
+            with st.container(border=True):
+                k1, k2, k3, k4, k5 = st.columns(5)
                 
-                amt_str = f"{profit_amt/100000000:,.2f}억" if abs(profit_amt) > 1e8 else f"{profit_amt/10000:,.0f}만"
-                k3.metric("총 수익금", f"{amt_str}원", delta_color="normal")
-                k4.metric("매매 횟수", f"{len(trade_df)//2}회")
+                k1.metric("최종 자산", f"{final_equity/10000:,.0f}만원", 
+                          delta=f"{profit_amt/10000:,.0f}만원", delta_color="normal")
+                
+                k2.metric("총 수익률", f"{total_return:,.2f}%", 
+                          delta="복리 적용" if comp_mode else "단리 적용")
+                
+                k3.metric("승률 (Win Rate)", f"{win_rate:.1f}%", 
+                          f"{win_count}승 {total_sells-win_count}패")
+                
+                # MDD는 리스크 관리의 핵심이므로 강조
+                k4.metric("MDD (최대낙폭)", f"{mdd:.2f}%", 
+                          "Risk Level", delta_color="off")
+                
+                k5.metric("총 매매 횟수", f"{len(trade_df)//2}회", 
+                          f"평균 {len(trade_df)//2 / len(equity_df) * 5:.1f}회/주")
+
+            # ---------------------------
+            # [섹션 B] 자산 성장 그래프
+            # ---------------------------
+            st.markdown("#### 📈 자산 성장 & MDD 추이")
+            
+            # 탭으로 분리하여 그래프 제공
+            tab_g1, tab_g2 = st.tabs(["💰 자산 커브 (Equity)", "💧 낙폭 (Drawdown)"])
+            
+            with tab_g1:
+                fig = px.line(equity_df, x='date', y='equity', 
+                              title=None, height=350)
+                fig.add_hline(y=initial_cap_input, line_dash="dash", line_color="gray", annotation_text="원금")
+                fig.update_traces(line=dict(color='#00CC96', width=2), fill='tozeroy')
+                fig.update_layout(xaxis_title="", yaxis_title="평가 금액 (원)", hovermode="x unified")
+                st.plotly_chart(fig, use_container_width=True)
+                
+            with tab_g2:
+                fig_dd = px.area(equity_df, x='date', y='drawdown', 
+                                 title=None, height=350)
+                fig_dd.update_traces(line=dict(color='#EF553B'), fill_color='rgba(239, 85, 59, 0.2)')
+                fig_dd.update_layout(xaxis_title="", yaxis_title="낙폭 (%)", hovermode="x unified", yaxis_range=[min(mdd*1.2, -5), 1])
+                st.plotly_chart(fig_dd, use_container_width=True)
 
             st.divider()
 
-            # 자산 그래프
-            fig = px.line(equity_df, x='date', y='equity', title=f"자산 성장 ({selected_strategy})")
-            fig.add_hline(y=initial_cap_input, line_dash="dash", line_color="gray", annotation_text="원금")
-            fig.update_traces(fill='tozeroy', line=dict(color='#00CC96', width=2))
-            st.plotly_chart(fig, use_container_width=True)
+            # ---------------------------
+            # [섹션 C] 매매 상세 분석
+            # ---------------------------
+            c_left, c_right = st.columns([1, 1.5])
+            
+            with c_left:
+                st.markdown("#### 🏆 Best & Worst")
+                if not sells.empty:
+                    best_trade = sells.loc[sells['profit'].idxmax()]
+                    worst_trade = sells.loc[sells['profit'].idxmin()]
+                    
+                    with st.container(border=True):
+                        st.caption("🔥 최고의 매매")
+                        st.markdown(f"**{best_trade['name']}**")
+                        st.write(f"수익률: :red[**+{best_trade['profit']:.2f}%**]")
+                        st.caption(f"이유: {best_trade['reason']}")
+                        
+                    with st.container(border=True):
+                        st.caption("💧 최악의 매매")
+                        st.markdown(f"**{worst_trade['name']}**")
+                        st.write(f"수익률: :blue[**{worst_trade['profit']:.2f}%**]")
+                        st.caption(f"이유: {worst_trade['reason']}")
+                else:
+                    st.info("매도 완료된 거래가 없습니다.")
+
+            with c_right:
+                st.markdown("#### 🔍 종목별 타점 복기")
+                traded_tickers = trade_df['ticker'].unique()
+                ticker_options = [f"{TICKER_MAP.get(t, t)} ({t})" for t in traded_tickers]
+                
+                if len(ticker_options) > 0:
+                    selected_option = st.selectbox("종목 선택", ticker_options, label_visibility="collapsed")
+                    selected_ticker = selected_option.split('(')[-1].replace(')', '')
+                    
+                    # --- 개별 차트 그리기 로직 (기존과 동일하되 디자인 다듬음) ---
+                    my_trades = trade_df[trade_df['ticker'] == selected_ticker].sort_values('date')
+                    
+                    with st.spinner("차트 로딩..."):
+                        # 차트 데이터 로드 (캐시 활용)
+                        chart_data = yf.download(selected_ticker, start=str(bt_start_date), progress=False, auto_adjust=True)
+                        if isinstance(chart_data.columns, pd.MultiIndex):
+                            chart_data.columns = chart_data.columns.get_level_values(0)
+                        chart_data = chart_data.loc[:, ~chart_data.columns.duplicated()]
+
+                    if not chart_data.empty:
+                        fig_d = go.Figure()
+                        # 캔들차트 대신 깔끔한 라인차트 + 영역
+                        fig_d.add_trace(go.Scatter(x=chart_data.index, y=chart_data['Close'], 
+                                                   mode='lines', name='주가', 
+                                                   line=dict(color='rgba(255, 255, 255, 0.5)', width=1)))
+                        
+                        # 매수 마커
+                        buys = my_trades[my_trades['type'] == 'buy']
+                        if not buys.empty:
+                            fig_d.add_trace(go.Scatter(x=buys['date'], y=buys['price'], mode='markers', name='매수', 
+                                                       marker=dict(symbol='triangle-up', color='#EF553B', size=10),
+                                                       hovertemplate='매수: %{y:,.2f}<br>날짜: %{x}'))
+                        # 매도 마커
+                        sells_sub = my_trades[my_trades['type'] == 'sell']
+                        if not sells_sub.empty:
+                            fig_d.add_trace(go.Scatter(x=sells_sub['date'], y=sells_sub['price'], mode='markers', name='매도', 
+                                                       marker=dict(symbol='triangle-down', color='#636EFA', size=10),
+                                                       text=[f"{p:.1f}%" for p in sells_sub['profit']], 
+                                                       hovertemplate='매도: %{y:,.2f}<br>수익: %{text}'))
+                        
+                        fig_d.update_layout(
+                            title=dict(text=f"{selected_option} 매매 타점", font=dict(size=15)),
+                            height=350, 
+                            margin=dict(l=10, r=10, t=40, b=10),
+                            template="plotly_dark",
+                            paper_bgcolor="rgba(0,0,0,0)",
+                            plot_bgcolor="rgba(0,0,0,0)",
+                            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+                        )
+                        st.plotly_chart(fig_d, use_container_width=True)
+                    else:
+                        st.warning("차트 데이터를 불러올 수 없습니다.")
+                else:
+                    st.info("거래 내역이 없습니다.")
 
             st.divider()
 
-            # 🔍 상세 타점 분석 (오류 수정됨)
-            st.subheader("🔍 매매 타점 분석기")
+            # ---------------------------
+            # [섹션 D] 전체 거래 일지 (데이터프레임)
+            # ---------------------------
+            st.subheader("📝 전체 거래 로그 (Journal)")
             
-            traded_tickers = trade_df['ticker'].unique()
-            ticker_options = [f"{TICKER_MAP.get(t, t)} ({t})" for t in traded_tickers]
-            
-            if len(ticker_options) > 0:
-                selected_option = st.selectbox("종목 선택", ticker_options)
-                selected_ticker = selected_option.split('(')[-1].replace(')', '')
-                selected_name = TICKER_MAP.get(selected_ticker, selected_ticker)
-
-                my_trades = trade_df[trade_df['ticker'] == selected_ticker].sort_values('date')
+            with st.expander("전체 거래 내역 보기 (클릭하여 펼치기)", expanded=True):
+                log_df = trade_df.copy()
+                log_df['date'] = log_df['date'].dt.date
                 
-                with st.spinner("차트 로딩..."):
-                    chart_data = yf.download(selected_ticker, start=str(bt_start_date), progress=False, auto_adjust=True)
-                    if isinstance(chart_data.columns, pd.MultiIndex):
-                        chart_data.columns = chart_data.columns.get_level_values(0)
-                    # 중복 컬럼 제거 (DuplicateError 방지)
-                    chart_data = chart_data.loc[:, ~chart_data.columns.duplicated()]
-                
-                if not chart_data.empty:
-                    fig_d = go.Figure()
-                    fig_d.add_trace(go.Scatter(x=chart_data.index, y=chart_data['Close'], mode='lines', name='주가', line=dict(color='gray')))
-                    
-                    buys = my_trades[my_trades['type'] == 'buy']
-                    if not buys.empty:
-                        fig_d.add_trace(go.Scatter(x=buys['date'], y=buys['price'], mode='markers', name='매수', 
-                                                   marker=dict(symbol='triangle-up', color='red', size=12),
-                                                   hovertemplate='매수: %{y:,.2f}<br>날짜: %{x}'))
-                    
-                    sells = my_trades[my_trades['type'] == 'sell']
-                    if not sells.empty:
-                        fig_d.add_trace(go.Scatter(x=sells['date'], y=sells['price'], mode='markers', name='매도', 
-                                                   marker=dict(symbol='triangle-down', color='blue', size=12),
-                                                   text=[f"{p:.1f}%" for p in sells['profit']], hovertemplate='매도: %{y:,.2f}<br>수익: %{text}'))
-                    
-                    fig_d.update_layout(title=f"{selected_name} 매매 복기", height=500, template="plotly_dark")
-                    st.plotly_chart(fig_d, use_container_width=True)
-                    
-                    st.dataframe(my_trades[['date', 'type', 'price', 'profit', 'reason', 'score']], hide_index=True, use_container_width=True)
-            else:
-                st.info("거래 내역이 없습니다.")
+                # 가독성을 위해 컬럼명 변경
+                log_df = log_df[['date', 'name', 'type', 'price', 'profit', 'score', 'reason']]
+                log_df.columns = ['날짜', '종목명', '구분', '가격', '수익률', 'AI점수', '매매사유']
 
-            # 전체 로그
-            st.subheader("📝 전체 거래 일지")
-            log_df = trade_df.copy()
-            log_df['date'] = log_df['date'].dt.date
-            st.dataframe(
-                log_df[['date', 'name', 'type', 'price', 'profit', 'balance', 'reason']].sort_values('date', ascending=False),
-                hide_index=True, use_container_width=True, height=400,
-                column_config={
-                    "price": st.column_config.NumberColumn("가격", format="%.2f"),
-                    "profit": st.column_config.NumberColumn("수익률", format="%.2f%%"),
-                    "balance": st.column_config.NumberColumn("잔고", format="%d원")
-                }
-            )
+                # 수익률에 색상 입히기 및 포맷팅
+                st.dataframe(
+                    log_df.sort_values('날짜', ascending=False),
+                    hide_index=True,
+                    use_container_width=True,
+                    height=500,
+                    column_config={
+                        "날짜": st.column_config.DateColumn("날짜", format="YYYY-MM-DD"),
+                        "가격": st.column_config.NumberColumn("체결가($)", format="$%.2f"),
+                        "AI점수": st.column_config.ProgressColumn(
+                            "AI Score", format="%.1f점", min_value=0, max_value=100
+                        ),
+                        "수익률": st.column_config.NumberColumn(
+                            "수익률(%)",
+                            format="%.2f%%",
+                            # 양수면 빨간색(한국식), 음수면 파란색 시각화가 좋은데
+                            # Streamlit 기본 차트는 상승이 초록인 경우가 많으므로 숫자로 표시하되
+                            # 데이터프레임 스타일링을 사용하거나 단순 NumberColumn 사용
+                        ),
+                        "구분": st.column_config.TextColumn("Type", width="small")
+                    }
+                )
+
         else:
-            st.warning("매매 신호가 발생하지 않았습니다.")
+            st.warning("⚠️ 매매 신호가 발생하지 않았습니다. 전략 조건을 완화하거나 기간을 늘려보세요.")
