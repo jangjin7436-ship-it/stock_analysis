@@ -873,47 +873,49 @@ def analyze_advanced_strategy(df):
 
 
 def calculate_total_profit(ticker, avg_price, current_price, quantity):
-
+    # 국내/해외 구분
     is_kr = ticker.endswith(".KS") or ticker.endswith(".KQ")
 
-    qty, avg, curr = float(quantity), float(avg_price), float(current_price)
+    qty = float(quantity)
+    avg = float(avg_price)
+    curr = float(current_price)
 
-
-
+    # 매수 원금 (수수료는 avg에 이미 반영 안 되어 있다고 가정)
     total_buy = avg * qty
 
+    # 매도 금액(수수료·세금 공제 전)
     gross_eval = curr * qty
 
+    # 🔹 수수료·세율 설정 (네가 준 값 그대로 반영)
+    if is_kr:
+        # 국내: 수수료 0.0295%, 세금 0.15%
+        fee_rate = 0.000295      # 0.0295%
+        tax_rate = 0.0015        # 0.15%
+        currency = "₩"
+    else:
+        # 미국: 수수료 약 0.1968%, 세금 0%
+        fee_rate = 0.001968      # 0.1968%
+        tax_rate = 0.0
+        currency = "$"
 
-
-    fee_rate = 0.000295 if is_kr else 0.001965
-
-    tax_rate = 0.0015 if is_kr else 0.0
-
-
-
+    # 매도 시 차감되는 수수료·세금
     sell_fee = gross_eval * fee_rate
-
     sell_tax = gross_eval * tax_rate
 
+    # 실제 손에 들어오는 평가금액(매도 대금 - 수수료 - 세금)
     net_eval = gross_eval - sell_fee - sell_tax
 
+    # 순수익 = (실제 평가금액) - (매수 원금)
     net_profit = net_eval - total_buy
 
+    # 수익률(%)
     pct = (net_profit / total_buy) * 100 if total_buy > 0 else 0.0
 
-
-
     return {
-
         "pct": pct,
-
         "profit_amt": net_profit,
-
         "net_eval_amt": net_eval,
-
-        "currency": "₩" if is_kr else "$",
-
+        "currency": currency,
     }
 
 
