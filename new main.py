@@ -16,6 +16,26 @@ import re  # ✅ 국내 애프터마켓 가격 파싱용
 import firebase_admin
 from firebase_admin import credentials, firestore
 
+def _now_kst():
+    """UTC 기준 현재 시간을 KST(UTC+9)로 변환."""
+    now_utc = datetime.datetime.utcnow()
+    return now_utc + datetime.timedelta(hours=9)
+
+def _is_kr_regular_session():
+    """
+    한국 정규장(09:00~15:30) 여부 판별.
+    정확한 초 단위까지 필요 없으니 대략 시간 만으로 판단.
+    """
+    t = _now_kst().time()
+    return datetime.time(9, 0) <= t <= datetime.time(15, 30)
+
+def _is_kr_after_session():
+    """
+    시간외 단일가(16:00~18:00) 구간 여부.
+    """
+    t = _now_kst().time()
+    return datetime.time(16, 0) <= t <= datetime.time(18, 0)
+
 def get_db():
     if not firebase_admin._apps:
         try:
@@ -82,12 +102,17 @@ USER_WATCHLIST = list(TICKER_MAP.keys())
 
 def fetch_kr_polling(ticker):
     """
-    [Final] 국내 주식 현재가 = 시간외 단일가(있으면) 우선 사용
-    - 네이버 domestic realtime API 사용
-    - overMarketPriceInfo.overPrice 가 존재하면 그 값을 사용
-    - 없으면 정규장 closePrice 로 폴백
+    국내 주식 실시간 가격
+
+    - 장중(09:00~15:30): 항상 '정규장 현재가(체결가)'를 사용
+    - 장 마감 이후:
+        • 시간외 단일가 구간(16:00~18:00): overPrice(시간외)를 우선 사용
+        • 그 외 시간에는 overPrice가 있으면 사용, 없으면 정규장 종가 사용
     """
     code = ticker.split('.')[0]  # "005930.KS" -> "005930"
+
+    in_regular = _is_kr_regular_session()
+    in_after   = _is_kr_after_session()
 
     try:
         url = f"https://polling.finance.naver.com/api/realtime/domestic/stock/{code}"
@@ -109,23 +134,34 @@ def fetch_kr_polling(ticker):
 
         item = datas[0]
 
-        # 1️⃣ 시간외 단일가가 있으면 그걸 우선 사용
+        # 문자열 정리
         over_info = item.get("overMarketPriceInfo") or {}
-        over_price_str = str(over_info.get("overPrice", "")).replace(",", "").strip()
-
-        if over_price_str and over_price_str != "0":
-            return (ticker, float(over_price_str))
-
-        # 2️⃣ 시간외 정보가 없으면 정규장 종가 사용
+        over_price_str  = str(over_info.get("overPrice", "")).replace(",", "").strip()
         close_price_str = str(item.get("closePrice", "")).replace(",", "").strip()
-        if close_price_str:
-            return (ticker, float(close_price_str))
 
-        # 3️⃣ 둘 다 없으면 실패 처리 -> 아래 FDR 폴백
-        raise ValueError("no price field in naver realtime response")
+        # 숫자로 변환 (있을 때만)
+        over_price  = float(over_price_str)  if over_price_str  not in ("", "0") else None
+        close_price = float(close_price_str) if close_price_str not in ("", "0") else None
+
+        # 1) 장중: 항상 가장 최신 정규장 체결가를 사용
+        if in_regular and close_price is not None:
+            return (ticker, close_price)
+
+        # 2) 시간외 단일가 구간: 시간외 단일가 있으면 그게 "현재 주가"
+        if in_after and over_price is not None:
+            return (ticker, over_price)
+
+        # 3) 그 외 시간: 시간외가 남아 있으면 그걸 우선, 없으면 정규장 종가
+        if over_price is not None:
+            return (ticker, over_price)
+        if close_price is not None:
+            return (ticker, close_price)
+
+        # 둘 다 없으면 FDR로 폴백
+        raise ValueError("no usable price in naver realtime response")
 
     except Exception:
-        # 네이버 API 실패 시 FDR 종가로 폴백 (애프터마켓은 아님)
+        # 네이버 API 실패 시 FDR 종가로 폴백 (애프터마켓은 반영 안 됨)
         try:
             df = fdr.DataReader(code, "2023-01-01")
             if not df.empty:
