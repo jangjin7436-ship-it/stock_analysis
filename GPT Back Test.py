@@ -7,8 +7,6 @@ import plotly.graph_objects as go
 from concurrent.futures import ThreadPoolExecutor
 import time
 
-st.set_page_config(page_title="AI 전략 스윙 백테스터", layout="wide")
-
 # =========================================================
 # 0. 데이터 로딩 (캐시)
 # =========================================================
