@@ -41,7 +41,7 @@ def get_db():
 # ---------------------------------------------------------
 # 1. 설정 및 매핑
 # ---------------------------------------------------------
-st.set_page_config(page_title="AI 주식 스캐너 Pro", page_icon="📈", layout="wide")
+st.set_page_config(page_title="AI 주식 스캐너 by NXO", page_icon="📈", layout="wide")
 
 if 'scan_result_df' not in st.session_state:
     st.session_state['scan_result_df'] = None
