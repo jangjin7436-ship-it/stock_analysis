@@ -1,5 +1,5 @@
-streaance
+streamlit
 pandas
 numpy
-plotlymlit
-yfin
+plotly
+yfinance
