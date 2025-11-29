@@ -82,54 +82,82 @@ USER_WATCHLIST = list(TICKER_MAP.keys())
 
 def fetch_kr_polling(ticker):
     """
-    [New Method v2] 네이버 국내주식 실시간 + 시간외 단일가 조회
-    - 기본: closePrice
-    - 시간외 단일가 장이 열려 있으면 overMarketPriceInfo.overPrice 를 우선 사용
+    [New Method v2] 네이버 모바일 주식 API 사용
+    - https://m.stock.naver.com/api/json/search/searchListJson.nhn?keyword=티커
+    - 응답 JSON의 'nv' 값을 실시간 가격(시간외 포함)으로 사용
     """
     code = ticker.split('.')[0]
 
+    # 1차: m.stock.naver.com 검색 API (실시간/시간외 가격)
     try:
-        # 예: https://polling.finance.naver.com/api/realtime/domestic/stock/005930
-        url = f"https://polling.finance.naver.com/api/realtime/domestic/stock/{code}"
+        url = f"https://m.stock.naver.com/api/json/search/searchListJson.nhn?keyword={code}"
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://m.stock.naver.com"
+        }
+        res = requests.get(url, headers=headers, timeout=3)
+        res.raise_for_status()
+
+        data = res.json()
+
+        # data 형태가 리스트일 가능성이 높음: [{"cd":"005930","nm":"삼성전자","nv":101500, ...}, ...]
+        items = []
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict):
+            # 혹시 dict로 감싸져 있으면 안쪽에서 리스트를 찾아본다
+            for v in data.values():
+                if isinstance(v, list):
+                    items = v
+                    break
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            cd = str(item.get("cd", "")).strip()
+            if cd == code or cd.endswith(code):
+                nv = item.get("nv")
+                if nv is not None:
+                    # 문자열/숫자 모두 처리
+                    price = float(str(nv).replace(",", ""))
+                    return (ticker, price)
+
+        # cd 매칭이 안 되면, 첫 번째 아이템의 nv라도 사용
+        if items:
+            first = items[0]
+            if isinstance(first, dict) and "nv" in first:
+                price = float(str(first["nv"]).replace(",", ""))
+                return (ticker, price)
+
+    except Exception:
+        pass  # 아래 백업 로직으로 이동
+
+    # 2차: 기존 polling API (실패 시 백업용, 여전히 종가 기준일 수 있음)
+    try:
+        url = f"https://polling.finance.naver.com/api/realtime?query=SERVICE_ITEM:{code}"
         headers = {
             "User-Agent": "Mozilla/5.0",
             "Referer": "https://finance.naver.com/"
         }
         res = requests.get(url, headers=headers, timeout=3)
         data = res.json()
-
-        if "datas" not in data or not data["datas"]:
-            return (ticker, None)
-
-        item = data["datas"][0]
-
-        price_str = None
-
-        # 1) 시간외 단일가 장이 열려 있으면 그 가격을 최우선으로 사용
-        over_info = item.get("overMarketPriceInfo")
-        if over_info and over_info.get("overMarketStatus") == "OPEN":
-            # overPrice가 시간외 현재가
-            price_str = over_info.get("overPrice") or over_info.get("closePrice")
-
-        # 2) 시간외가 없으면 정규장 기준 closePrice 사용
-        if not price_str:
-            price_str = item.get("closePrice")
-
-        if not price_str:
-            return (ticker, None)
-
-        price = float(str(price_str).replace(",", ""))
-        return (ticker, price)
-
+        if data.get("result", {}).get("code") == "200":
+            for area in data["result"].get("areas", []):
+                for item in area.get("datas", []):
+                    if item.get("cd") == code and "nv" in item:
+                        return (ticker, float(item["nv"]))
     except Exception:
-        # 실패 시 FDR 종가 백업
-        try:
-            df = fdr.DataReader(code, '2023-01-01')
-            if not df.empty:
-                return (ticker, float(df['Close'].iloc[-1]))
-        except:
-            pass
-        return (ticker, None)
+        pass
+
+    # 3차: FDR 종가 (최후의 백업 – 애프터마켓은 아님)
+    try:
+        df = fdr.DataReader(code, "2023-01-01")
+        if not df.empty:
+            return (ticker, float(df["Close"].iloc[-1]))
+    except Exception:
+        pass
+
+    return (ticker, None)
 
 def fetch_us_1m_candle(ticker):
     """
