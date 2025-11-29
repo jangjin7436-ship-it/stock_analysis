@@ -220,30 +220,96 @@ def get_precise_data(tickers_list):
 
 
 # ---------------------------------------------------------
-# 3. 분석 엔진 (백테스트 점수/매매 기준 그대로 적용 - AI 스나이퍼)
+# 3. 분석 엔진 (백테스트와 완전 동일한 지표/점수 로직)
 # ---------------------------------------------------------
-def get_ai_score_row(row):
+
+def calculate_indicators(df, realtime_price=None):
     """
-    2주 스윙 기준 AI 점수:
+    2주 스윙 백테스트에서 쓰는 지표 계산 로직 그대로 사용
+    - Close/Adj Close 정리
+    - 실시간가(realtime_price)가 들어오면 마지막 캔들 가격만 교체
+    - MA5/20/60, RSI, MACD, MACD_Hist, Prev_MACD_Hist, STD20, Ret5 모두 계산
+    """
+    if df is None or len(df) < 60:
+        return None
+
+    df = df.copy()
+
+    # 컬럼 정리 (yfinance/FDR 모두 대응)
+    cols_lower = {c.lower(): c for c in df.columns}
+    if 'close' in cols_lower:
+        close_col = cols_lower['close']
+    elif 'adj close' in cols_lower:
+        close_col = cols_lower['adj close']
+    else:
+        return None
+
+    close = df[close_col]
+    if isinstance(close, pd.DataFrame):
+        close = close.iloc[:, 0]
+
+    # 실시간 가격 주입 (가능하면 마지막 캔들 교체)
+    if realtime_price is not None and realtime_price > 0:
+        try:
+            close = close.copy()
+            close.iloc[-1] = float(realtime_price)
+        except Exception:
+            pass
+
+    df['Close_Calc'] = close.astype(float)
+
+    # 이동평균
+    df['MA5'] = df['Close_Calc'].rolling(5).mean()
+    df['MA20'] = df['Close_Calc'].rolling(20).mean()
+    df['MA60'] = df['Close_Calc'].rolling(60).mean()
+
+    # RSI (14)
+    delta = df['Close_Calc'].diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+    avg_gain = gain.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
+    rs = avg_gain / avg_loss
+    df['RSI'] = 100 - (100 / (1 + rs))
+
+    # MACD (12-26-9)
+    exp12 = df['Close_Calc'].ewm(span=12, adjust=False).mean()
+    exp26 = df['Close_Calc'].ewm(span=26, adjust=False).mean()
+    df['MACD'] = exp12 - exp26
+    df['Signal_Line'] = df['MACD'].ewm(span=9, adjust=False).mean()
+    df['MACD_Hist'] = df['MACD'] - df['Signal_Line']
+    df['Prev_MACD_Hist'] = df['MACD_Hist'].shift(1)
+
+    # 20일 변동성
+    df['STD20'] = df['Close_Calc'].rolling(20).std()
+
+    # 최근 5일 수익률 (2주 스윙용 단기 모멘텀)
+    df['Ret5'] = df['Close_Calc'].pct_change(5)
+
+    return df.dropna()
+
+
+def get_ai_score_row(row: pd.Series) -> float:
+    """
+    2주 스윙 백테스트에서 쓰던 AI_Score 로직 100% 동일 이식
     - 상승 추세 + 20일선 근처 눌림
-    - 적당한 RSI 구간
+    - RSI 구간
     - 최근 5일 모멘텀
-    - MACD 방향
+    - MACD 방향/가속
     - 변동성 페널티
-    (백테스트 엔진과 완전히 동일)
     """
     try:
-        curr = row['Close_Calc']
-        ma5 = row['MA5']
-        ma20 = row['MA20']
-        ma60 = row['MA60']
-        rsi = row['RSI']
-        macd = row['MACD']
-        sig = row['Signal_Line']
-        macd_hist = row['MACD_Hist']
-        prev_hist = row['Prev_MACD_Hist']
-        std20 = row['STD20']
-        ret5 = row.get('Ret5', 0.0)
+        curr = float(row['Close_Calc'])
+        ma5 = float(row['MA5'])
+        ma20 = float(row['MA20'])
+        ma60 = float(row['MA60'])
+        rsi = float(row['RSI'])
+        macd = float(row['MACD'])
+        sig = float(row['Signal_Line'])
+        macd_hist = float(row['MACD_Hist'])
+        prev_hist = float(row['Prev_MACD_Hist'])
+        std20 = float(row['STD20'])
+        ret5 = float(row.get('Ret5', 0.0) or 0.0)
 
         if curr <= 0 or ma20 <= 0 or ma60 <= 0:
             return 0.0
@@ -261,10 +327,10 @@ def get_ai_score_row(row):
                 score -= 10.0
 
         # 2) 20일선과의 거리 (눌림 구간)
-        dist20 = (curr - ma20) / ma20  # 비율
+        dist20 = (curr - ma20) / ma20
         abs_d20 = abs(dist20)
 
-        # -2% ~ +3%: 최적 매수 존, 20점까지 가산 (0에 가까울수록 가장 좋음)
+        # -2% ~ +3%: 최적 매수 존, 20점까지 가산
         if -0.02 <= dist20 <= 0.03:
             score += 20.0 * (1.0 - abs_d20 / 0.03)
         # -5% ~ -2%: 조금 깊은 눌림, 소폭 가산
@@ -284,15 +350,11 @@ def get_ai_score_row(row):
         elif rsi < 25 or rsi > 75:
             score -= 10.0
 
-        # 4) 최근 5일 수익률 (2주 스윙용 단기 모멘텀)
-        if ret5 is None:
-            ret5 = 0.0
+        # 4) 최근 5일 수익률 (단기 모멘텀)
         if ret5 > 0:
-            # 5일 +3%면 약 +6점
-            score += min(7.0, float(ret5) * 100 * 2.0)
+            score += min(7.0, ret5 * 100.0 * 2.0)
         else:
-            # 하락이면 약하게 감점
-            score += float(ret5) * 100.0 * 0.5
+            score += ret5 * 100.0 * 0.5
 
         # 5) MACD 방향 (상승 + 에너지 증가)
         if macd > sig and macd_hist > 0:
@@ -320,85 +382,25 @@ def get_ai_score_row(row):
         return 0.0
 
 
-def calculate_indicators(df, realtime_price=None):
-    """
-    백테스트 엔진과 동일한 방식의 지표 계산 + Ret5/AI_Score 포함
-    - Close/Adj Close 중 하나 사용
-    - 실시간가가 들어오면 마지막 캔들에 반영 후 지표 계산
-    """
-    if df is None or len(df) < 60:
-        return None
-
-    df = df.copy()
-
-    # 컬럼 통일
-    if 'Close' not in df.columns and 'Adj Close' in df.columns:
-        df['Close'] = df['Adj Close']
-    if 'Close' not in df.columns:
-        return None
-
-    close = df['Close']
-    if isinstance(close, pd.DataFrame):
-        close = close.iloc[:, 0]
-
-    # 실시간 가격 주입 (스캐너 특화)
-    if realtime_price is not None and realtime_price > 0:
-        try:
-            close.iloc[-1] = realtime_price
-        except Exception:
-            pass
-
-    df['Close_Calc'] = close
-
-    # 이동평균 (5/20/60)
-    df['MA5'] = df['Close_Calc'].rolling(5).mean()
-    df['MA20'] = df['Close_Calc'].rolling(20).mean()
-    df['MA60'] = df['Close_Calc'].rolling(60).mean()
-
-    # RSI (14일)
-    delta = df['Close_Calc'].diff()
-    gain = delta.where(delta > 0, 0)
-    loss = -delta.where(delta < 0, 0)
-    avg_gain = gain.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
-    rs = avg_gain / avg_loss
-    df['RSI'] = 100 - (100 / (1 + rs))
-
-    # MACD (12-26-9)
-    exp12 = df['Close_Calc'].ewm(span=12, adjust=False).mean()
-    exp26 = df['Close_Calc'].ewm(span=26, adjust=False).mean()
-    df['MACD'] = exp12 - exp26
-    df['Signal_Line'] = df['MACD'].ewm(span=9, adjust=False).mean()
-    df['MACD_Hist'] = df['MACD'] - df['Signal_Line']
-    df['Prev_MACD_Hist'] = df['MACD_Hist'].shift(1)
-
-    # 20일 변동성
-    df['STD20'] = df['Close_Calc'].rolling(20).std()
-
-    # 최근 5일 수익률 (2주 스윙용 단기 모멘텀)
-    df['Ret5'] = df['Close_Calc'].pct_change(5)
-
-    df = df.dropna()
-
-    # AI 점수 계산 (백테스트와 완전히 동일)
-    df['AI_Score'] = df.apply(get_ai_score_row, axis=1)
-
-    return df
-
-
 def analyze_advanced_strategy(df):
     """
-    스캐너/포트폴리오용 AI 해석 엔진
-    - 백테스트의 AI_Score/필터를 그대로 사용
-    - 매매 전략은 'AI 스나이퍼'
-    - 종목 선정은 '조건 만족 전부 매수' 가정
+    스캐너 / 마이포트폴리오 / (원하면 백테스트) 에서 공통으로 쓰는 해석 함수
+    - 점수는 위 get_ai_score_row로만 계산
+    - 스나이퍼 진입 조건도 백테스트 로직 그대로:
+      * 추세(60일선 위 & 20>60)
+      * 20일선 ±3% 눌림
+      * RSI 35~65
+      * MACD 상승 (MACD>시그널, 히스토그램>0)
+      * AI_Score >= 70
+      * 최근 5일 수익률 Ret5 >= -2%
     """
-    if df is None or df.empty:
+    if df is None or df.empty or len(df) < 60:
         return "분석 불가", "gray", "데이터 부족", 0.0
 
     try:
         row = df.iloc[-1]
-        score = float(row.get('AI_Score', get_ai_score_row(row)))
+        score = float(get_ai_score_row(row))
+
         curr = float(row['Close_Calc'])
         ma20 = float(row['MA20'])
         ma60 = float(row['MA60'])
@@ -406,28 +408,30 @@ def analyze_advanced_strategy(df):
         macd = float(row['MACD'])
         sig = float(row['Signal_Line'])
         hist = float(row['MACD_Hist'])
-        ret5 = float(row.get('Ret5', 0.0))
+        std20 = float(row['STD20'])
+        ret5 = float(row.get('Ret5', 0.0) or 0.0)
     except Exception:
         return "오류", "gray", "계산 실패", 0.0
 
     reasons = []
 
-    # 1) 추세 설명
+    # 1) 추세
     if curr > ma60 and ma20 > ma60:
         reasons.append("상승 추세(20·60일선 위 정배열)")
+        trend_ok = True
     elif curr > ma60:
         reasons.append("60일선 위지만 20일선이 약함")
+        trend_ok = False
     else:
-        reasons.append("60일선 아래(조정/하락 구간)")
+        reasons.append("60일선 아래(조정/하락 추세)")
+        trend_ok = False
 
-    # 2) 20일선과의 거리(눌림/과열)
-    dist_ma20 = (curr - ma20) / ma20 if ma20 > 0 else 0.0
-    if curr > ma60 and -0.03 <= dist_ma20 <= 0.03:
-        reasons.append(f"20일선 근처 눌림({dist_ma20 * 100:.1f}%)")
-    elif dist_ma20 > 0.08:
-        reasons.append("20일선 대비 단기 과열(8%↑)")
-    elif dist_ma20 < -0.05:
-        reasons.append("20일선 아래 깊은 조정")
+    # 2) 20일선과의 거리
+    dist_ma20 = (curr - ma20) / ma20 if ma20 != 0 else 0.0
+    if curr > ma60 and abs(dist_ma20) <= 0.03:
+        reasons.append(f"20일선 근처 눌림({dist_ma20*100:.1f}%)")
+    elif dist_ma20 > 0.10:
+        reasons.append("20일선 대비 과열(10%↑)")
 
     # 3) RSI 상태
     if rsi < 30:
@@ -437,36 +441,55 @@ def analyze_advanced_strategy(df):
     elif 40 <= rsi <= 60:
         reasons.append(f"안정적 RSI({rsi:.1f})")
 
-    # --- 스나이퍼 진입 기준 (백테스트와 동일) ---
-    trend_ok = (curr > ma60) and (ma20 > ma60)
+    # 4) 변동성 정보
+    vol_ratio = std20 / curr if curr > 0 else 0.0
+    if vol_ratio > 0.05:
+        reasons.append(f"변동성 높음({vol_ratio*100:.1f}%)")
+    elif 0.015 <= vol_ratio <= 0.05:
+        reasons.append(f"적정 변동성({vol_ratio*100:.1f}%)")
+
+    # 5) 최근 5일 수익률
+    if ret5 > 0:
+        reasons.append(f"최근 5일 +{ret5*100:.1f}%")
+    elif ret5 < 0:
+        reasons.append(f"최근 5일 {ret5*100:.1f}%")
+
+    # 6) MACD 방향
+    macd_ok = (macd > sig and hist > 0)
+    if macd_ok:
+        reasons.append("MACD 상승 에너지")
+    else:
+        reasons.append("MACD 약세/조정")
+
+    # ---- 스나이퍼 진입 조건 (백테스트와 동일) ----
     pullback_ok = (-0.03 <= dist_ma20 <= 0.03)
     rsi_ok = (35 <= rsi <= 65)
-    macd_ok = (macd > sig and hist > 0)
     base_entry = trend_ok and pullback_ok and rsi_ok and macd_ok
+    entry_signal = base_entry and (score >= 70.0) and (ret5 >= -0.02)
 
-    entry_signal = base_entry and score >= 70 and ret5 >= -0.02
-
-    # --- 점수 구간별 해석 (스나이퍼 기준) ---
+    # ---- 최종 카테고리 ----
     if entry_signal:
         cat = "🚀 AI 스나이퍼 매수 신호 (조건 만족 전부 매수)"
         col = "green"
     else:
-        if score < 45:
-            cat = "💥 스나이퍼 매도/회피 구간 (추세 이탈)"
+        if score >= 80:
+            cat = "📈 강한 상승 추세 (매수 우위)"
+            col = "blue"
+        elif score >= 65:
+            cat = "📈 매수 우위 (조건 일부 부족)"
+            col = "blue"
+        elif score >= 45:
+            cat = "👀 관망 구간 (중립)"
+            col = "gray"
+        elif score >= 30:
+            cat = "📉 비중 축소/부분 매도 구간"
+            col = "orange"
+        else:
+            cat = "💥 스나이퍼 매도/회피 구간 (추세 이탈/위험)"
             col = "red"
-        elif score < 60:
-            cat = "👀 관망 구간 (약한 추세, 보유자 점검)"
-            col = "orange" if score < 50 else "gray"
-        elif score < 70:
-            cat = "📈 상승 추세지만 스나이퍼 진입 조건 미충족"
-            col = "blue"
-        else:  # score >= 70 이지만 base_entry 조건이 일부 부족
-            cat = "📈 강한 종목 (추세 양호, 이상적 눌림 대기)"
-            col = "blue"
 
     reasoning = " / ".join(reasons[:3]) if reasons else "지표 정보 부족"
-
-    return cat, col, reasoning, round(score, 3)
+    return cat, col, reasoning, round(score, 2)
 
 
 def calculate_total_profit(ticker, avg_price, current_price, quantity):
