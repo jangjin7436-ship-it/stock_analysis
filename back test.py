@@ -386,37 +386,164 @@ with tab4:
         bar.empty()
         progress_text.empty()
         
-        if results:
+if results:
             df_res = pd.DataFrame(results)
+            
+            # ---------------------------------------------------------
+            # 1. 데이터 가공 및 통계 계산
+            # ---------------------------------------------------------
+            # 수익률의 평균은 '일간'이 아니라, 시뮬레이션 '전체 기간' 동안의 평균입니다.
             avg_return = df_res['total_return'].mean()
             win_rate_avg = df_res['win_rate'].mean()
-            total_profit_sum = df_res['final_equity'].sum() - (1000000 * len(df_res))
             
-            st.success(f"✅ 테스트 완료! (전략: {selected_strategy} / 환율: {ex_mode})")
+            # 초기 자본 총액 (종목 수 * 100만원) 대비 최종 자산 총액
+            initial_total_capital = 1000000 * len(df_res)
+            final_total_equity = df_res['final_equity'].sum()
+            total_profit_amt = final_total_equity - initial_total_capital
+            total_profit_pct = (total_profit_amt / initial_total_capital) * 100
             
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("평균 수익률", f"{avg_return:.2f}%")
-            m2.metric("평균 승률", f"{win_rate_avg:.1f}%")
-            m3.metric("총 종목 수", f"{len(df_res)}개")
-            m4.metric("총 수익금", f"{total_profit_sum:,.0f}원")
+            st.success(f"✅ 분석 완료! ({bt_start_date} ~ 현재) | 전략: {selected_strategy}")
             
-            st.divider()
+            # ---------------------------------------------------------
+            # 2. 메인 대시보드 (KPI 카드)
+            # ---------------------------------------------------------
+            st.markdown("### 📊 포트폴리오 성과 요약")
             
-            # (아래 결과 표시 부분은 기존과 동일)
-            c_best, c_worst = st.columns(2)
-            with c_best:
-                st.subheader("🏆 수익률 Top 5")
-                st.dataframe(df_res.sort_values('total_return', ascending=False).head(5)[['name', 'total_return', 'trade_count']], hide_index=True)
-            
-            with c_worst:
-                st.subheader("💀 수익률 Worst 5")
-                st.dataframe(df_res.sort_values('total_return', ascending=True).head(5)[['name', 'total_return', 'trade_count']], hide_index=True)
+            # 스타일링된 컨테이너 사용
+            with st.container():
+                kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+                
+                # 기간 수익률 (전체 자산 기준)
+                kpi1.metric(
+                    label="총 누적 수익률 (기간)",
+                    value=f"{total_profit_pct:,.2f}%",
+                    delta=f"{avg_return:,.2f}% (종목 평균)",
+                    help="설정한 기간 동안 전체 계좌가 얼마나 불어났는지를 의미합니다."
+                )
+                
+                # 평균 승률
+                kpi2.metric(
+                    label="평균 승률",
+                    value=f"{win_rate_avg:.1f}%",
+                    help="익절로 끝난 매매의 비율입니다."
+                )
+                
+                # 총 수익금
+                kpi3.metric(
+                    label="총 예상 수익금",
+                    value=f"{total_profit_amt/10000:,.0f}만 원", # 만원 단위로 축약
+                    delta_color="normal",
+                    help="종목당 100만 원 투자 시 예상되는 총 수익금입니다."
+                )
+                
+                # 종목 수
+                kpi4.metric(
+                    label="분석 종목 수",
+                    value=f"{len(df_res)}개",
+                    help="백테스트에 포함된 총 종목 개수입니다."
+                )
 
-            st.markdown("#### 📄 상세 내역")
-            st.dataframe(df_res[['name', 'total_return', 'win_rate', 'trade_count', 'final_equity']], use_container_width=True)
+            st.divider()
+
+            # ---------------------------------------------------------
+            # 3. 차트 섹션 (좌: 수익률 분포 / 우: Top & Worst)
+            # ---------------------------------------------------------
+            col_chart, col_list = st.columns([1.5, 1])
             
-            fig = px.histogram(df_res, x="total_return", nbins=20, title="수익률 분포")
-            fig.add_vline(x=avg_return, line_dash="dash", line_color="red")
-            st.plotly_chart(fig, use_container_width=True)
+            with col_chart:
+                st.markdown("#### 📈 수익률 분포 (Histogram)")
+                # Plotly 디자인 개선
+                fig = px.histogram(
+                    df_res, 
+                    x="total_return", 
+                    nbins=25,
+                    color_discrete_sequence=['#4C78A8']
+                )
+                fig.update_layout(
+                    xaxis_title="기간 수익률 (%)",
+                    yaxis_title="종목 개수",
+                    showlegend=False,
+                    paper_bgcolor="rgba(0,0,0,0)", # 투명 배경
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    margin=dict(l=20, r=20, t=30, b=20)
+                )
+                # 평균선 강조
+                fig.add_vline(x=avg_return, line_dash="dash", line_color="#FF4B4B", annotation_text="평균")
+                st.plotly_chart(fig, use_container_width=True)
+
+            with col_list:
+                st.markdown("#### 🏆 수익률 Best 3")
+                top3 = df_res.sort_values('total_return', ascending=False).head(3)
+                
+                # 미니 데이터프레임 (깔끔하게)
+                st.dataframe(
+                    top3[['name', 'total_return']],
+                    hide_index=True,
+                    use_container_width=True,
+                    column_config={
+                        "name": "종목명",
+                        "total_return": st.column_config.NumberColumn("수익률", format="%.2f%%")
+                    }
+                )
+                
+                st.markdown("#### 💀 수익률 Worst 3")
+                worst3 = df_res.sort_values('total_return', ascending=True).head(3)
+                st.dataframe(
+                    worst3[['name', 'total_return']],
+                    hide_index=True,
+                    use_container_width=True,
+                    column_config={
+                        "name": "종목명",
+                        "total_return": st.column_config.NumberColumn("수익률", format="%.2f%%")
+                    }
+                )
+
+            # ---------------------------------------------------------
+            # 4. 전체 상세 내역 (비주얼 업그레이드)
+            # ---------------------------------------------------------
+            st.markdown("#### 📑 종목별 상세 리포트")
+            
+            # 데이터프레임 컬럼 설정 (핵심 디자인)
+            column_configuration = {
+                "name": st.column_config.TextColumn("종목명", width="medium"),
+                
+                # 수익률: 숫자가 클수록 진하게 표시되는 히트맵 효과는 없지만, 깔끔하게 포맷팅
+                "total_return": st.column_config.NumberColumn(
+                    "기간 수익률",
+                    help="해당 기간 동안의 총 수익률",
+                    format="%.2f%%"
+                ),
+                
+                # 승률: 0~100% 진행바(Bar)로 표시 -> 엑셀 느낌 탈피!
+                "win_rate": st.column_config.ProgressColumn(
+                    "승률 (Win Rate)",
+                    help="매매 승률",
+                    format="%.1f%%",
+                    min_value=0,
+                    max_value=100,
+                ),
+                
+                # 매매 횟수
+                "trade_count": st.column_config.NumberColumn(
+                    "매매 횟수",
+                    format="%d회"
+                ),
+                
+                # 최종 자산
+                "final_equity": st.column_config.NumberColumn(
+                    "최종 평가금",
+                    help="100만 원 투자 시 최종 금액",
+                    format="%d원"
+                )
+            }
+            
+            st.dataframe(
+                df_res[['name', 'total_return', 'win_rate', 'trade_count', 'final_equity']].sort_values('total_return', ascending=False),
+                use_container_width=True,
+                hide_index=True,
+                column_config=column_configuration,
+                height=500 # 높이 고정으로 스크롤 편의성 제공
+            )
+            
         else:
-            st.error("결과 없음")
+            st.error("결과가 없습니다. 날짜를 변경하거나 데이터를 확인해주세요.")
