@@ -272,27 +272,58 @@ def calculate_indicators(df):
     return df.dropna()
 
 def calculate_total_profit(ticker, avg_price, current_price, quantity):
+    """
+    토스증권 방식에 최대한 맞춘 순수익/수익률 계산
+
+    - avg_price: 토스 '1주 평균금액' 그대로 입력했다고 가정 (매수 수수료 이미 포함)
+    - current_price: 우리가 실시간으로 가져온 현재가 (애프터마켓 포함)
+    - quantity: 보유 주식 수
+
+    국내주식(KS/KQ):
+        • 매도 수수료 ≈ 0.0295%
+        • 증권거래세   = 0.15%
+        → 평가금 = 현재가*수량 - (수수료 + 세금)
+
+    해외주식(그 외):
+        • 매도 수수료 ≈ 0.1965%
+        • 세금 없음 (토스 화면 기준)
+    """
+    # 1) 기본 값 계산
     is_kr = ticker.endswith(".KS") or ticker.endswith(".KQ")
-    if is_kr: fee_tax_rate = 0.0018 
-    else: fee_tax_rate = 0.002
-    
-    total_buy = avg_price * quantity
-    raw_eval = current_price * quantity
-    total_fee = raw_eval * fee_tax_rate
-    net_eval = raw_eval - total_fee
-    net_profit_amt = net_eval - total_buy
-    
+
+    qty = float(quantity)
+    avg_price = float(avg_price)
+    current_price = float(current_price)
+
+    total_buy = avg_price * qty              # 원금 (이미 매수 수수료 포함된 평단이라고 가정)
+    gross_eval = current_price * qty         # 세전 평가금 (현재가 * 수량)
+
+    # 2) 시장별 수수료/세금율 설정 (토스 캡처 기반 튜닝)
+    if is_kr:
+        fee_rate = 0.000295   # ≈ 0.0295%
+        tax_rate = 0.0015     # 0.15% 증권거래세
+    else:
+        fee_rate = 0.001965   # ≈ 0.1965% (TQQQ 예시 기준)
+        tax_rate = 0.0        # 해외주식은 세금 컬럼 '-' 기준
+
+    sell_fee = gross_eval * fee_rate
+    sell_tax = gross_eval * tax_rate
+
+    # 3) 세후 평가금 & 순수익
+    net_eval = gross_eval - sell_fee - sell_tax       # 세후 총 평가금
+    net_profit_amt = net_eval - total_buy             # 총 순수익 (수수료·세금 반영)
+
     if total_buy > 0:
         net_profit_pct = (net_profit_amt / total_buy) * 100
     else:
         net_profit_pct = 0.0
-    
+
     currency = "₩" if is_kr else "$"
-    
+
     return {
-        "pct": net_profit_pct,
-        "profit_amt": net_profit_amt,
-        "net_eval_amt": net_eval,
+        "pct": net_profit_pct,       # 총 수익률 (%)
+        "profit_amt": net_profit_amt,  # 총 순수익 (수수료·세금 차감 후)
+        "net_eval_amt": net_eval,      # 세후 총 평가금
         "currency": currency
     }
 
