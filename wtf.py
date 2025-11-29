@@ -655,7 +655,7 @@ with tab4:
             with tab_g2:
                 fig_dd = px.area(equity_df, x='date', y='drawdown', 
                                  title=None, height=350)
-                fig_dd.update_traces(line=dict(color='#EF553B'), fill_color='rgba(239, 85, 59, 0.2)')
+                fig_dd.update_traces(line=dict(color='#EF553B'), fillcolor='rgba(239, 85, 59, 0.2)')
                 fig_dd.update_layout(xaxis_title="", yaxis_title="낙폭 (%)", hovermode="x unified", yaxis_range=[min(mdd*1.2, -5), 1])
                 st.plotly_chart(fig_dd, use_container_width=True)
 
