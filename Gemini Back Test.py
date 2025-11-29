@@ -53,7 +53,6 @@ class IndicatorEngine:
     def calculate_rsi(series, period=2):
         """
         Connors의 2일 RSI 계산.
-        참고: [1, 18]
         """
         delta = series.diff()
         gain = (delta.where(delta > 0, 0)).fillna(0)
@@ -75,7 +74,6 @@ class IndicatorEngine:
     def calculate_mfi(high, low, close, volume, period=14):
         """
         Money Flow Index (거래량 가중 RSI).
-        참고: [2, 16, 19]
         """
         typical_price = (high + low + close) / 3
         money_flow = typical_price * volume
@@ -98,7 +96,6 @@ class IndicatorEngine:
     def calculate_adx(high, low, close, period=14):
         """
         ADX: 추세 강도 필터링.
-        참고: [20, 21, 22]
         """
         plus_dm = high.diff()
         minus_dm = low.diff()
@@ -199,7 +196,7 @@ class StrategyEngine:
         self.data_dict = data_dict
         self.initial_capital = initial_capital
         self.max_holding_days = max_holding_days
-        self.trades =  # 리스트 초기화 수정
+        self.trades =  # 수정됨: 명시적 리스트 초기화
         self.equity_curve = {}
 
     def run_backtest(self, start_date, end_date):
@@ -216,7 +213,7 @@ class StrategyEngine:
             # ---------------------------------------------------------
             # 1. 청산(Exit) 로직 처리
             # ---------------------------------------------------------
-            tickers_to_sell = # 리스트 초기화 수정
+            tickers_to_sell = # 수정됨: 명시적 리스트 초기화
             
             for ticker, pos in positions.items():
                 df = self.data_dict[ticker]
@@ -229,7 +226,7 @@ class StrategyEngine:
                 price = row['Close']
                 rsi = row
                 
-                # 청산 조건 [1, 7]
+                # 청산 조건
                 # A. 이익 실현: RSI(2) > 75 (과매도 해소 및 슈팅)
                 # B. 타임 컷: 10일 이상 보유 시 무조건 청산 (사용자 제약조건)
                 # C. 손절매 (옵션): 진입가 대비 -10% (안전장치)
@@ -273,7 +270,7 @@ class StrategyEngine:
             MAX_POSITIONS = 10
             available_slots = MAX_POSITIONS - len(positions)
             
-            candidates = # 리스트 초기화 수정
+            candidates = # 수정됨: 명시적 리스트 초기화
             
             if available_slots > 0:
                 for ticker, df in self.data_dict.items():
@@ -282,7 +279,7 @@ class StrategyEngine:
                     
                     row = df.loc[current_date]
                     
-                    # 진입 조건 [1, 3, 23, 24]
+                    # 진입 조건
                     # 1. 추세: 200일 이평선 위 (상승장)
                     # 2. 과매도: RSI(2) < 10
                     # 3. 국면: ADX > 20 (최소한의 변동성 존재)
@@ -302,7 +299,6 @@ class StrategyEngine:
             # ---------------------------------------------------------
             # 3. 자금 집행 (역변동성 가중 - Risk Parity)
             # ---------------------------------------------------------
-            # [5, 6, 15] 핵심 로직: 변동성이 낮은 종목에 더 많은 비중
             
             if candidates:
                 # 역변동성 점수(인덱스 1)가 높은 순(안정적인 순)으로 정렬하여 상위 종목 선정
@@ -320,13 +316,9 @@ class StrategyEngine:
                 for ticker, inv_vol, price in selected:
                     # 개별 종목 가중치 계산 (Risk Parity Weight)
                     # 전체 자산 대비 비중을 계산하되, 현재 가용 현금 범위 내에서 집행
-                    weight = inv_vol / total_inv_vol
                     
                     # 이번에 투입할 자금: 슬롯당 목표 금액이나 남은 현금 중 작은 것
                     position_value = min(target_cash_per_slot, cash / len(selected))
-                    
-                    # 역변동성 가중치를 추가 반영하고 싶다면 아래 주석 해제 (단, 슬롯 로직과 충돌 가능성 있음)
-                    # position_value = current_total_equity * (inv_vol / (total_existing_inv_vol + total_new_inv_vol))
                     
                     # 최소 거래 단위 확인 및 매수
                     if position_value > price:
