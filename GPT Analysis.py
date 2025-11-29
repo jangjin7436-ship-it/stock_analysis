@@ -41,7 +41,7 @@ def get_db():
 # ---------------------------------------------------------
 # 1. 설정 및 매핑
 # ---------------------------------------------------------
-st.set_page_config(page_title="AI 주식 스캐너 by NXO", page_icon="📈", layout="wide")
+st.set_page_config(page_title="AI 주식 스캐너", page_icon="📈", layout="wide")
 
 if 'scan_result_df' not in st.session_state:
     st.session_state['scan_result_df'] = None
@@ -462,7 +462,7 @@ def calculate_total_profit(ticker, avg_price, current_price, quantity):
 # ---------------------------------------------------------
 # 4. UI
 # ---------------------------------------------------------
-st.title("🎯 AI 주식 스캐너 by GPT")
+st.title("🎯 AI 주식 스캐너")
 
 tab1, tab2, tab3 = st.tabs(["🚀 전체 종목 스캐너", "💼 내 포트폴리오 (서버 저장)", "📘 알고리즘 백서"])
 
