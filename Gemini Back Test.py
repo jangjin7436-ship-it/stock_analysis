@@ -6,11 +6,9 @@ import plotly.express as px
 import plotly.graph_objects as go
 from concurrent.futures import ThreadPoolExecutor
 import time
-
 # =========================================================
 # 1. 데이터 로딩 함수 (auto_adjust=False 유지)
 # =========================================================
-
 @st.cache_data(show_spinner=False)
 def load_price_data(code: str, start_date: str):
     """
@@ -24,8 +22,6 @@ def load_price_data(code: str, start_date: str):
         return df
     except Exception:
         return pd.DataFrame()
-
-
 @st.cache_data(show_spinner=False)
 def load_fx_series(start_date: str):
     """
@@ -38,30 +34,6 @@ def load_fx_series(start_date: str):
         return ex_df['Close']
     except Exception:
         return pd.Series()
-
-# [신규 기능] 시장 상황 판단 함수 (마켓 필터)
-@st.cache_data(show_spinner=False)
-def get_market_regime(start_date):
-    """
-    시장 전체(SPY)의 추세를 확인하여 매매 허용 여부 결정
-    - SPY가 200일 이동평균선 위에 있으면 : 상승장 (Aggressive) -> 매수 비중 100%
-    - SPY가 200일 이동평균선 아래에 있으면 : 하락장 (Defensive) -> 신규 매수 금지
-    """
-    try:
-        # 200일 이동평균선 계산을 위해 시작일보다 1년 전 데이터부터 로딩
-        req_start = pd.to_datetime(start_date) - pd.Timedelta(days=365)
-        spy = yf.download("SPY", start=req_start, progress=False, auto_adjust=False)
-        
-        if isinstance(spy.columns, pd.MultiIndex):
-            spy.columns = spy.columns.get_level_values(0)
-        
-        spy['MA200'] = spy['Close'].rolling(200).mean()
-        # MA200보다 위에 있으면 True (상승장), 아니면 False (하락장)
-        regime = (spy['Close'] > spy['MA200'])
-        return regime
-    except:
-        return pd.Series(dtype=bool)
-
 TICKER_MAP = {
     "INTC": "인텔", "005290.KS": "동진쎄미켐", "SOXL": "반도체 3X(Bull)", 
     "316140.KS": "우리금융지주", "WDC": "웨스턴디지털", "NFLX": "넷플릭스", 
@@ -86,13 +58,11 @@ TICKER_MAP = {
     "FNGU": "FANG+ 3X(Bull)", "BULZ": "기술주 3X(Bull)", "TMF": "채권 3X(Bull)", 
     "TSLA": "테슬라", "AMD": "AMD", "BITX": "비트코인 2X", "TSLL": "테슬라 1.5X"
 }
-
 # =========================================================
-# 2. 지표 계산 로직 (ATR 추가 및 로직 개선)
+# 2. 지표 계산 로직 (ATR 추가 및 로직 개선, 추가 지표 포함)
 # =========================================================
-
 def calculate_indicators_for_backtest(df):
-    """지표 계산 최적화: ATR 및 추세 강도 지표 추가"""
+    """지표 계산 최적화: ATR 및 추세 강도 지표 추가, Stochastic, ADX, CCI 추가"""
     df = df.copy()
     
     # [유지] 실제 종가 사용
@@ -104,7 +74,6 @@ def calculate_indicators_for_backtest(df):
     df['MA20'] = df['Close_Calc'].rolling(20).mean()
     df['MA60'] = df['Close_Calc'].rolling(60).mean()
     df['MA120'] = df['Close_Calc'].rolling(120).mean()
-
     # [추가] 이격도 (Disparity): 1.1 이상이면 과열
     df['Disparity_20'] = df['Close_Calc'] / df['MA20']
     
@@ -144,23 +113,45 @@ def calculate_indicators_for_backtest(df):
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     df['ATR'] = tr.rolling(14).mean()
 
+    # [추가] Stochastic Oscillator
+    low_min = df['Low'].rolling(14).min()
+    high_max = df['High'].rolling(14).max()
+    df['Stoch_K'] = 100 * (df['Close_Calc'] - low_min) / (high_max - low_min)
+    df['Stoch_D'] = df['Stoch_K'].rolling(3).mean()
+
+    # [추가] ADX (Average Directional Index) for trend strength
+    plus_dm = df['High'] - df['High'].shift(1)
+    minus_dm = df['Low'].shift(1) - df['Low']
+    plus_dm = plus_dm.where(plus_dm > minus_dm, 0).where(plus_dm > 0, 0)
+    minus_dm = minus_dm.where(minus_dm > plus_dm, 0).where(minus_dm > 0, 0)
+    tr14 = tr.rolling(14).mean()
+    plus_di = 100 * (plus_dm.ewm(span=14, adjust=False).mean() / tr14)
+    minus_di = 100 * (minus_dm.ewm(span=14, adjust=False).mean() / tr14)
+    dx = (abs(plus_di - minus_di) / (plus_di + minus_di)) * 100
+    df['ADX'] = dx.ewm(span=14, adjust=False).mean()
+
+    # [추가] CCI (Commodity Channel Index)
+    typical_price = (df['High'] + df['Low'] + df['Close_Calc']) / 3
+    ma_tp = typical_price.rolling(20).mean()
+    mean_dev = typical_price.rolling(20).apply(lambda x: np.mean(np.abs(x - x.mean())))
+    df['CCI'] = (typical_price - ma_tp) / (0.015 * mean_dev)
+    
     # 5. 거래량
     if 'Volume' in df.columns:
         df['Vol_MA20'] = df['Volume'].rolling(20).mean()
         df['Vol_Ratio'] = df['Volume'] / df['Vol_MA20']
     else:
         df['Vol_Ratio'] = 1.0
-
     # 6. 변동성 (표준편차)
     df['STD20'] = std
     
     return df.dropna()
-
 def get_ai_score_row(row):
     """
-    [개선된 AI 점수 로직]
+    [개선된 AI 점수 로직 - 안정성 강화]
     기존: 돌파 매매 중심 (고점 매수 위험)
-    변경: 추세 내 눌림목(Dip Buying) 및 과열 방지 중심
+    변경: 추세 내 눌림목(Dip Buying) 및 과열 방지 중심, 추가 지표 활용으로 변동성 줄임
+    Stochastic, ADX, CCI 추가하여 단타 적합성 강화 (빠른 진입/청산 신호)
     """
     try:
         score = 50.0
@@ -168,32 +159,36 @@ def get_ai_score_row(row):
         ma5, ma10, ma20, ma60 = row['MA5'], row['MA10'], row['MA20'], row['MA60']
         rsi = row['RSI']
         atr = row['ATR']
+        stoch_k = row['Stoch_K']
+        stoch_d = row['Stoch_D']
+        adx = row['ADX']
+        cci = row['CCI']
         
-        # 1. 추세 판단 (장기 이평선 기울기가 중요)
-        # MA60이 우상향이면 기본 점수 부여 (상승장)
-        if row['MA60_Slope'] > 0:
-            score += 10.0
+        # 1. 추세 판단 (장기 이평선 기울기 + ADX로 강도 확인)
+        # MA60 우상향 + ADX > 25 (강한 추세)일 때 기본 점수 부여
+        if row['MA60_Slope'] > 0 and adx > 25:
+            score += 15.0
             if curr > ma60: score += 5.0
         else:
-            score -= 5.0
-
-        # 2. 진입 타이밍 (눌림목 우대)
-        # 상승 추세(MA20 우상향)인데 가격이 MA5 근처거나 살짝 아래일 때 점수 UP
+            score -= 10.0
+        
+        # 2. 진입 타이밍 (눌림목 우대, Stochastic 과매도 확인)
+        # 상승 추세(MA20 우상향)인데 가격이 MA5 근처거나 살짝 아래 + Stochastic K < 30
         if row['MA20_Slope'] > 0:
             if curr > ma20:
                 score += 5.0
-                # 골든크로스 초입이거나 눌림목일 때 가산점
-                if curr < ma5 * 1.01: 
-                    score += 5.0  # 눌림목 보너스
-            
-        # 3. 과열 방지 (이격도 필터)
-        # MA20 대비 10% 이상 급등한 상태면 진입 자제 (점수 대폭 삭감)
+                # 골든크로스 초입이거나 눌림목 + Stochastic 크로스오버
+                if curr < ma5 * 1.01 and stoch_k > stoch_d and stoch_k < 30: 
+                    score += 10.0  # 눌림목 + 과매도 반등 보너스
+        
+        # 3. 과열 방지 (이격도 + CCI 필터)
+        # MA20 대비 10% 이상 급등 or CCI > 100이면 진입 자제 (점수 대폭 삭감)
         disparity = row['Disparity_20']
-        if disparity > 1.10: 
-            score -= 20.0  # 고점 추격 매수 방지
-        elif disparity > 1.05:
-            score -= 5.0
-
+        if disparity > 1.10 or cci > 100: 
+            score -= 25.0  # 고점 추격 매수 방지
+        elif disparity > 1.05 or cci > 50:
+            score -= 10.0
+        
         # 4. 보조지표 혼합
         # MACD가 상승 반전할 때
         if row['MACD_Hist'] > row['Prev_MACD_Hist']:
@@ -201,25 +196,23 @@ def get_ai_score_row(row):
         
         # RSI: 40~60 사이의 안정적 구간 선호, 70 이상은 과열로 판단하여 감점
         if 40 <= rsi <= 60: score += 5.0
-        elif rsi > 70: score -= 10.0  # 과열 경고
-        elif rsi < 30: score += 5.0   # 과매도 반등 노리기
-
+        elif rsi > 70: score -= 15.0  # 과열 경고 강화
+        elif rsi < 30: score += 10.0   # 과매도 반등 노리기
+        
         # 볼린저 밴드 하단 터치 후 반등 시그널
         if curr <= row['Lower_Band'] * 1.02:
             score += 10.0 # 저점 매수 기회
-
-        # 거래량 실린 양봉
-        if row['Vol_Ratio'] >= 1.5 and curr > row['Open']:
-            score += 5.0
-
+        
+        # 거래량 실린 양봉 + ADX 강한 추세
+        if row['Vol_Ratio'] >= 1.5 and curr > row['Open'] and adx > 20:
+            score += 10.0
+        
         return max(0.0, min(100.0, score))
     except:
         return 0.0
-
 # =========================================================
-# 3. 백테스트 엔진 (ATR 기반 청산 + 마켓 필터 + 변동성 조절)
+# 3. 백테스트 엔진 (ATR 기반 청산 로직 적용, 단타 중심으로 보유 기간 제한)
 # =========================================================
-
 def prepare_stock_data(ticker_info, start_date):
     """개별 종목 데이터 준비"""
     code, name = ticker_info
@@ -227,7 +220,6 @@ def prepare_stock_data(ticker_info, start_date):
         df_raw = load_price_data(code, start_date)
         if df_raw is None or df_raw.empty or len(df_raw) < 120: # MA120 계산을 위해 데이터 확보 필요
             return None
-
         df = calculate_indicators_for_backtest(df_raw)
         df['AI_Score'] = df.apply(get_ai_score_row, axis=1)
         df['Ticker'] = code
@@ -236,16 +228,8 @@ def prepare_stock_data(ticker_info, start_date):
         return df[['Open', 'High', 'Low', 'Close_Calc', 'AI_Score', 'ATR', 'MA20', 'Vol_Ratio', 'Ticker', 'Name']]
     except Exception as e:
         return None
-
-
 def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
                            max_hold_days, exchange_data, use_compound, selection_mode):
-    
-    # ---------------------------------------------------------
-    # 0. 마켓 데이터(SPY) 로딩 (거시 경제 필터)
-    # ---------------------------------------------------------
-    market_regime_series = get_market_regime(start_date)
-
     # ---------------------------------------------------------
     # 1. 전 종목 데이터 준비
     # ---------------------------------------------------------
@@ -257,7 +241,6 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
             
     if not all_dfs:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), initial_capital
-
     # ---------------------------------------------------------
     # 2. Market Data 통합
     # ---------------------------------------------------------
@@ -269,7 +252,6 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
             market_data[date].append(row)
     
     sorted_dates = sorted(market_data.keys())
-
     # ---------------------------------------------------------
     # 3. 환율 데이터 준비
     # ---------------------------------------------------------
@@ -280,7 +262,6 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
         def get_rate(d):
             ts = pd.Timestamp(d)
             return rate_dict.get(ts, 1430.0)
-
     # ---------------------------------------------------------
     # 4. 시뮬레이션 상태 변수 초기화
     # ---------------------------------------------------------
@@ -289,28 +270,17 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
     trades_log = []
     equity_curve = []
     
-    # [설정] 안정성을 위해 TOP1 모드에서도 최소 3종목 분산 권장 (여기서는 그대로 유지하되 로직 보강)
     max_slots = 1 if selection_mode == 'TOP1' else 5 
-
+    # 단타 중심: max_hold_days를 10으로 고정 (약 2주 거래일)
+    max_hold_days = 10  # 사용자 쿼리에 따라 강제 설정
     # ---------------------------------------------------------
     # 5. 날짜별 루프 (백테스트 메인)
     # ---------------------------------------------------------
     for date in sorted_dates:
         daily_stocks = market_data[date]
         current_rate = get_rate(date)
-
-        # [중요] 오늘의 시장 상황 확인 (Market Regime)
-        # SPY 데이터가 있는 날짜면 확인, 없으면 보수적으로 전일 상태 유지 또는 True
-        is_bull_market = True
-        try:
-            ts_date = pd.Timestamp(date)
-            if ts_date in market_regime_series.index:
-                is_bull_market = market_regime_series.loc[ts_date]
-        except:
-            pass
-
         # =================================================
-        # A. 매도 로직 (Sell Check) - ATR + 마켓 필터 대응
+        # A. 매도 로직 (Sell Check) - ATR 기반 유동적 대응, 단타 강화 (빠른 청산)
         # =================================================
         sell_list = []
         for ticker in sorted(portfolio.keys()):
@@ -336,34 +306,28 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
             fee_sell = 0.003 if ".KS" in ticker else 0.001
             
             avg_price = info['avg_price']
-            buy_price_raw = info.get('buy_price_raw', avg_price/rate)
-
+            buy_price_raw = info.get('buy_price_raw', avg_price/rate) # 매수 당시 원본가
             held_days = (pd.Timestamp(date) - pd.Timestamp(info['buy_date'])).days
             
             should_sell = False
             sell_reason = ""
             final_sell_price = curr_close 
             final_sell_price_raw = raw_close
-
-            # --- [동적 손절/익절 로직] ---
-            # 하락장(SPY < 200MA)일 때는 더 타이트하게 관리
-            regime_penalty = 0.0 if is_bull_market else 0.5 
-            
-            atr_multiplier_stop = 2.0 - regime_penalty # 손절: 2 ATR (하락장은 1.5)
-            atr_multiplier_profit = 3.0 - regime_penalty # 익절: 3 ATR
-
+            # --- [동적 손절/익절 로직 - 단타 중심으로 타이트하게] ---
+            # ATR multiplier 줄여 빠른 청산 유도 (변동성 큼에도 불구하고 안정성 위해)
+            atr_multiplier_stop = 1.5  # 손절: 1.5 ATR (타이트)
+            atr_multiplier_profit = 2.0  # 익절 목표: 2 ATR (빠른 익절)
             stop_price_raw = buy_price_raw - (atr * atr_multiplier_stop)
-            # target_price_raw = buy_price_raw + (atr * atr_multiplier_profit)
-
+            target_price_raw = buy_price_raw + (atr * atr_multiplier_profit)
             # [시나리오 1] ATR 기반 손절 (Trailing Stop 포함)
+            # 최고가 갱신 시 손절 라인도 같이 올림 (수익 보전)
             current_max_raw = info.get('max_price_raw', buy_price_raw)
             if raw_high > current_max_raw:
                 portfolio[ticker]['max_price_raw'] = raw_high
-                # 고점 대비 하락 청산 기준
-                new_stop = raw_high - (atr * (2.5 - regime_penalty))
+                # 고점 대비 1.5 ATR 하락 시 익절/청산 (단타 강화)
+                new_stop = raw_high - (atr * 1.5)
                 if new_stop > stop_price_raw:
                     stop_price_raw = new_stop
-
             if not should_sell:
                 # 갭락 손절
                 if raw_open < stop_price_raw:
@@ -375,33 +339,27 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
                 elif raw_low < stop_price_raw:
                     should_sell = True
                     sell_reason = "📉 ATR손절/청산"
+                    # 슬리피지 고려: 손절가보다 살짝 아래에서 체결 가정
                     final_sell_price_raw = stop_price_raw * 0.995 
                     final_sell_price = final_sell_price_raw * rate
-
-            # [시나리오 2] 만기 및 스코어 청산
+            # [시나리오 2] 만기 및 스코어 청산 (단타: 10일 강제)
             if not should_sell:
-                limit_days = max_hold_days if max_hold_days > 0 else 20 
+                limit_days = max_hold_days if max_hold_days > 0 else 10 
                 
-                # 수익권인데 점수가 나빠지면 차익 실현
-                if raw_close > buy_price_raw * 1.05 and score < 45:
+                # 수익권인데 점수가 나빠지면 차익 실현 (타이트하게 3% 이상)
+                if raw_close > buy_price_raw * 1.03 and score < 50:
                     should_sell = True
                     sell_reason = "💰 점수하락익절"
                 
-                # 만기 청산
+                # 너무 오래 들고 있는데 수익이 안 나면 교체
                 elif held_days >= limit_days:
                     should_sell = True
                     sell_reason = f"⏱️ 만기청산({held_days}일)"
                 
                 # 급락 징후 (점수 폭락)
-                elif score < 30:
+                elif score < 35:
                     should_sell = True
-                    sell_reason = "점수급락(30↓)"
-                
-                # [추가] 시장이 하락세로 전환되었고 수익권이면 현금 확보 (Defensive)
-                elif not is_bull_market and raw_close > buy_price_raw * 1.02:
-                    should_sell = True
-                    sell_reason = "🚨 하락장대피"
-
+                    sell_reason = "점수급락(35↓)"
             if should_sell:
                 real_profit_pct = ((final_sell_price - avg_price) / avg_price) * 100
                 return_amt = info['shares'] * final_sell_price * (1 - fee_sell)
@@ -423,16 +381,10 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
         
         for t in sell_list: 
             del portfolio[t]
-
         # =================================================
-        # B. 신규 매수 (Buy Logic) - 마켓 필터 & 변동성 조절 적용
+        # B. 신규 매수 (Buy Logic) - 높은 점수 + 눌림목, 엄격한 필터
         # =================================================
-        
-        # [안정성 핵심] 하락장(SPY < 200MA)이면 신규 매수 금지 (Cash is King)
-        if not is_bull_market:
-            # 하락장에서는 현금 보유를 우선시하여 매수를 건너뜀
-            pass
-        elif len(portfolio) < max_slots:
+        if len(portfolio) < max_slots:
             candidates = []
             for row in daily_stocks:
                 ticker = row['Ticker']
@@ -442,14 +394,13 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
                 score = row['AI_Score']
                 price_raw = row['Close_Calc']
                 
-                # 필터링: 점수가 70점 이상이어야 함
-                if score >= 70:
+                # 필터링: 점수가 75점 이상이어야 함 (안정성 위해 기준 상향)
+                if score >= 75:
                     rate = 1.0 if ".KS" in ticker else current_rate
                     price_krw = price_raw * rate
                     
                     # 변동성 대비 거래량 파워 확인
                     vol_power = row.get('Vol_Ratio', 1.0)
-                    atr = row['ATR']
                     
                     candidates.append({
                         'ticker': ticker,
@@ -457,11 +408,9 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
                         'price_raw': price_raw,
                         'price_krw': price_krw,
                         'score': score,
-                        'atr': atr,
                         'vol_power': vol_power,
                         'reason': "AI추천(눌림목/추세)"
                     })
-
             # 점수 높은 순 -> 거래량 강도 순 정렬
             candidates.sort(key=lambda x: (x['score'], x['vol_power']), reverse=True)
             open_slots = max_slots - len(portfolio)
@@ -472,34 +421,13 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
                     break
                 
                 current_open_slots = max_slots - len(portfolio)
-                
-                # [안정성 핵심] 변동성 역가중(Risk Parity) 포지션 사이징
-                # 예산만 1/N 하는 것이 아니라, 변동성(ATR)이 큰 종목은 수량을 줄임
-                
-                # 1. 예산 기준 최대 수량 (기존 방식)
-                budget_per_slot = balance / current_open_slots
+                slot_budget = balance / current_open_slots
                 fee_buy = 0.00015 if ".KS" in target['ticker'] else 0.001
-                shares_by_budget = int(budget_per_slot / (target['price_krw'] * (1 + fee_buy)))
                 
-                # 2. 리스크 기준 적정 수량 (신규 방식)
-                # 계좌 전체 자산의 2%만 잃도록 설계 (손절폭 2ATR 기준)
-                total_equity = balance + sum([v['shares'] * v['avg_price'] for k,v in portfolio.items()])
-                risk_budget = total_equity * 0.02 # 트레이드 당 2% 리스크 허용
-                
-                rate = 1.0 if ".KS" in target['ticker'] else current_rate
-                stop_loss_amount_krw = target['atr'] * 2.0 * rate
-                
-                if stop_loss_amount_krw > 0:
-                    shares_by_risk = int(risk_budget / stop_loss_amount_krw)
-                else:
-                    shares_by_risk = 0
-                
-                # 두 기준 중 더 보수적인(작은) 수량 선택 -> 변동성 큰 종목은 자동으로 적게 매수됨
-                shares = min(shares_by_budget, shares_by_risk)
-
-                if shares > 0:
-                    cost = shares * target['price_krw'] * (1 + fee_buy)
-                    if balance >= cost:
+                if target['price_krw'] > 0:
+                    shares = int(slot_budget / (target['price_krw'] * (1 + fee_buy)))
+                    if shares > 0:
+                        cost = shares * target['price_krw'] * (1 + fee_buy)
                         balance -= cost
                         portfolio[target['ticker']] = {
                             'name': target['name'],
@@ -521,7 +449,6 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
                             'reason': target['reason'],
                             'balance': balance
                         })
-
         # =================================================
         # C. 자산 평가
         # =================================================
@@ -536,7 +463,6 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
                 current_equity += info['shares'] * info['avg_price']
         
         equity_curve.append({'date': date, 'equity': current_equity})
-
     # =================================================
     # D. 최종일 기준 보유 종목 리포트 생성 (Mark-to-Market)
     # =================================================
@@ -574,25 +500,21 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
                 '평가손익(%)': return_pct,
                 '평가금액': net_value
             })
-
     held_df = pd.DataFrame(held_stocks_list)
-
     return pd.DataFrame(trades_log), pd.DataFrame(equity_curve), held_df, balance
-                                
+                           
 # =========================================================
 # 4. UI 통합 (탭 추가)
 # =========================================================
-
 tab4 = st.tabs(["📊 전체 백테스트 시뮬레이션"])[0] 
-
 with tab4:
     st.markdown("### 🧪 포트폴리오 유니버스 백테스트")
-    st.caption("AI 전략 시뮬레이터 Final Ver. (ATR 기반 동적 손절/익절 + 이격도 과열 방지)")
+    st.caption("AI 전략 시뮬레이터 Final Ver. (ATR 기반 동적 손절/익절 + 이격도 과열 방지 + 단타 강화)")
     
     r1_c1, r1_c2, r1_c3 = st.columns(3)
     with r1_c1:
         bt_start_date = st.date_input("시작일", value=pd.to_datetime("2024-01-01"))
-        max_hold_days = st.slider("⏱️ 타임 컷 (일)", 0, 60, 20, help="매수 후 N일 지나면 강제 매도 (0이면 해제)")
+        max_hold_days = st.slider("⏱️ 타임 컷 (일)", 0, 60, 10, help="매수 후 N일 지나면 강제 매도 (0이면 해제) - 단타 중심 10일 추천")
     with r1_c2:
         initial_cap_input = st.number_input("💰 초기 자본금", value=10000000, step=1000000, format="%d")
         sel_mode = st.selectbox("🎯 종목 선정", ["조건 만족 전부 매수 (분산)", "점수 1등만 매수 (집중)"])
@@ -604,7 +526,6 @@ with tab4:
             exchange_arg_val = fixed_exchange_rate
         else:
             exchange_arg_val = "DYNAMIC"
-
     st.divider()
     
     c_strat, c_opt, c_btn = st.columns([2, 1, 1])
@@ -628,7 +549,6 @@ with tab4:
     with c_btn:
         st.write("")
         start_btn = st.button("🚀 시뮬레이션 시작", type="primary", use_container_width=True)
-
     # 실행 및 결과 저장
     if 'bt_result_trade' not in st.session_state:
         st.session_state['bt_result_trade'] = pd.DataFrame()
@@ -638,14 +558,12 @@ with tab4:
         st.session_state['bt_held_df'] = pd.DataFrame()
     if 'bt_final_cash' not in st.session_state:
         st.session_state['bt_final_cash'] = 0.0
-
     if start_btn:
         if exchange_arg_val == "DYNAMIC":
             with st.spinner("💱 환율 데이터 수집 중..."):
                 exchange_data_payload = load_fx_series(str(bt_start_date))
         else:
             exchange_data_payload = float(exchange_arg_val)
-
         with st.spinner(f"🔄 [{selected_strategy}] 전략으로 전체 시장 스캔 중..."):
             targets = list(TICKER_MAP.items())
             
@@ -660,18 +578,15 @@ with tab4:
             st.session_state['bt_final_cash'] = f_cash
             
             st.success("백테스트 완료! 결과를 확인하세요.")
-
     # 대시보드 출력
     trade_df = st.session_state['bt_result_trade']
     equity_df = st.session_state['bt_result_equity']
     held_df = st.session_state['bt_held_df']
     final_cash = st.session_state['bt_final_cash']
-
     if not trade_df.empty and not equity_df.empty:
             equity_df['max_equity'] = equity_df['equity'].cummax()
             equity_df['drawdown'] = (equity_df['equity'] - equity_df['max_equity']) / equity_df['max_equity'] * 100
             mdd = equity_df['drawdown'].min()
-
             final_equity = equity_df.iloc[-1]['equity']
             total_return = (final_equity - initial_cap_input) / initial_cap_input * 100
             profit_amt = final_equity - initial_cap_input
@@ -680,7 +595,6 @@ with tab4:
             win_count = len(sells[sells['profit'] > 0])
             total_sells = len(sells)
             win_rate = (win_count / total_sells * 100) if total_sells > 0 else 0.0
-
             # [섹션 A] 핵심 성과 지표
             st.markdown("#### 🚀 백테스트 요약 리포트")
             
@@ -696,7 +610,6 @@ with tab4:
                           "Risk Level", delta_color="off")
                 k5.metric("총 매매 횟수", f"{len(trade_df)//2}회", 
                           f"평균 {len(trade_df)//2 / len(equity_df) * 5:.1f}회/주")
-
             # 기말 자산 상세 현황
             st.subheader("💰 기말 보유 자산 현황")
             st.caption("백테스트 종료일 기준, 현금과 보유 중인 주식의 평가 가치입니다.")
@@ -711,7 +624,6 @@ with tab4:
                     st.metric("📦 보유 주식 평가액", f"{held_value_sum/10000:,.0f}만원")
                     st.markdown("---")
                     st.metric("합계 (최종 자산)", f"{(final_cash + held_value_sum)/10000:,.0f}만원")
-
             with c_table:
                 if not held_df.empty:
                     st.dataframe(
@@ -728,7 +640,6 @@ with tab4:
                     )
                 else:
                     st.info("보유 중인 주식이 없습니다. (100% 현금 보유)")
-
             # [섹션 B] 자산 성장 그래프
             st.markdown("#### 📈 자산 성장 & MDD 추이")
             tab_g1, tab_g2 = st.tabs(["💰 자산 커브 (Equity)", "💧 낙폭 (Drawdown)"])
@@ -741,7 +652,6 @@ with tab4:
                 yaxis=dict(showgrid=True, gridcolor='rgba(128,128,128,0.2)'),
                 hovermode="x unified"
             )
-
             with tab_g1:
                 fig = px.line(equity_df, x='date', y='equity', title=None, height=350)
                 fig.add_hline(y=initial_cap_input, line_dash="dash", line_color="gray", annotation_text="원금")
@@ -755,9 +665,7 @@ with tab4:
                 y_min = mdd * 1.2 if mdd < 0 else -5.0
                 fig_dd.update_layout(xaxis_title="", yaxis_title="낙폭 (%)", yaxis_range=[y_min, 1], **common_layout)
                 st.plotly_chart(fig_dd, use_container_width=True)
-
             st.divider()
-
             # [섹션 C] 매매 상세 분석
             c_left, c_right = st.columns([1, 1.5])
             
@@ -778,7 +686,6 @@ with tab4:
                         st.metric("수익률", f"{worst_trade['profit']:.2f}%", worst_trade['reason'], delta_color="inverse")
                 else:
                     st.info("매도 완료된 거래가 없습니다.")
-
             with c_right:
                 st.markdown("#### 🔍 종목별 타점 복기")
                 traded_tickers = trade_df['ticker'].unique()
@@ -795,7 +702,6 @@ with tab4:
                         if isinstance(chart_data.columns, pd.MultiIndex):
                             chart_data.columns = chart_data.columns.get_level_values(0)
                         chart_data = chart_data.loc[:, ~chart_data.columns.duplicated()]
-
                     if not chart_data.empty:
                         fig_d = go.Figure()
                         fig_d.add_trace(go.Scatter(x=chart_data.index, y=chart_data['Close'], 
@@ -827,9 +733,7 @@ with tab4:
                         st.warning("차트 데이터를 불러올 수 없습니다.")
                 else:
                     st.info("거래 내역이 없습니다.")
-
             st.divider()
-
             # [섹션 D] 전체 거래 일지
             st.subheader("📝 전체 거래 로그")
             
@@ -838,7 +742,6 @@ with tab4:
                 log_df['date'] = log_df['date'].dt.date
                 log_df = log_df[['date', 'name', 'type', 'price', 'shares', 'profit', 'score', 'reason']]
                 log_df.columns = ['날짜', '종목명', '구분', '가격', '수량', '수익률', 'AI점수', '매매사유']
-
                 st.dataframe(
                     log_df.sort_values('날짜', ascending=False),
                     hide_index=True,
