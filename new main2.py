@@ -523,6 +523,9 @@ with tab1:
 
                         final_price = float(df_indi['Close_Calc'].iloc[-1])
                         rsi_val = float(df_indi['RSI'].iloc[-1])
+                        # ★ 정렬을 위한 MACD Histogram 값 추출 (추가된 부분)
+                        macd_hist_val = float(df_indi['MACD_Hist'].iloc[-1])
+
                         name = TICKER_MAP.get(ticker_code, ticker_code)
                         is_kr = ticker_code.endswith(".KS") or ticker_code.endswith(".KQ")
                         sym = "₩" if is_kr else "$"
@@ -534,7 +537,8 @@ with tab1:
                             "현재가": fmt_price,
                             "RSI": rsi_val,
                             "AI 등급": cat,
-                            "핵심 요약": reasoning
+                            "핵심 요약": reasoning,
+                            "MACD_Hist": macd_hist_val  # 내부 정렬용 데이터
                         })
                     except: 
                         continue
@@ -542,6 +546,7 @@ with tab1:
                 
                 if scan_results:
                     df_res = pd.DataFrame(scan_results)
+                    # 기본 정렬: 점수 내림차순
                     df_res = df_res.sort_values('점수', ascending=False)
                     st.session_state['scan_result_df'] = df_res
                     st.success("스캔 완료! 70점 이상인 종목들을 확인하세요.")
@@ -550,16 +555,38 @@ with tab1:
                     st.error("데이터 수집 실패.")
     
     if st.session_state['scan_result_df'] is not None:
-        high_score_df = st.session_state['scan_result_df'][st.session_state['scan_result_df']['점수'] >= 70]
-        count = len(high_score_df)
+        # 기본 필터링: 70점 이상
+        base_df = st.session_state['scan_result_df'][st.session_state['scan_result_df']['점수'] >= 70]
+        
+        # ★ [NEW] 100점 만점 종목 과다 시 Top 5 추천 로직
+        perfect_candidates = base_df[base_df['점수'] >= 100]
+        
+        display_df = base_df # 기본적으로 전체 표시
+        
+        if len(perfect_candidates) > 5:
+            st.toast(f"💎 100점 만점 종목이 {len(perfect_candidates)}개 발견되었습니다!", icon="🔥")
+            st.info(f"💡 **AI 추천:** 100점 종목이 너무 많아, 상승 에너지(MACD 가속도)가 가장 폭발적인 **상위 5개**를 엄선했습니다.")
+            
+            # 1. 100점짜리 중 MACD_Hist(상승 에너지)가 높은 순으로 5개 자름
+            top5_perfect = perfect_candidates.sort_values(by='MACD_Hist', ascending=False).head(5)
+            
+            # 2. 100점 미만 70점 이상 종목들은 그대로 유지
+            others = base_df[base_df['점수'] < 100]
+            
+            # 3. 합쳐서 보여줄 데이터프레임 재구성
+            display_df = pd.concat([top5_perfect, others])
+            display_df = display_df.sort_values(by=['점수', 'MACD_Hist'], ascending=[False, False])
+            
+        
+        count = len(display_df)
         
         if count > 0:
-            st.info(f"✨ **매수 조건 만족 종목: {count}개** (AI 스나이퍼 기준 70점 이상)")
+            st.markdown(f"✨ **매수 추천 리스트 ({count}개)**")
         else:
             st.warning("현재 매수 조건을 만족하는 종목이 없습니다. (관망 권장)")
         
         st.dataframe(
-            st.session_state['scan_result_df'],
+            display_df,
             use_container_width=True,
             height=700,
             column_config={
@@ -569,6 +596,7 @@ with tab1:
                 "RSI": st.column_config.NumberColumn("RSI", format="%.1f"),
                 "AI 등급": st.column_config.TextColumn("AI 판단"),
                 "핵심 요약": st.column_config.TextColumn("분석 내용", width="large"),
+                "MACD_Hist": st.column_config.NumberColumn("모멘텀 에너지", format="%.2f"), # 정렬 기준 보여주기
             },
             hide_index=True
         )
