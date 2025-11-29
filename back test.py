@@ -154,16 +154,6 @@ def prepare_stock_data(ticker_info, start_date):
     except:
         return None
 
-이 에러는 Pandas의 Series 객체(데이터 한 행)를 if 문으로 직접 검사할 때 발생하는 아주 흔한 오류입니다.
-
-Python의 일반적인 객체와 달리, Pandas 데이터(stock_row)는 if stock_row:라고 쓰면 "이 데이터가 비어있는지 확인하라는 건지, 값이 True인지 확인하라는 건지 모르겠다"며 ValueError를 뿜어냅니다.
-
-따라서 if stock_row:를 if stock_row is not None: 으로 명확하게 바꿔주어야 합니다.
-
-해당 함수 run_portfolio_backtest 의 수정된 전체 코드를 드립니다. 기존 코드에서 이 함수 부분만 교체하시면 됩니다.
-
-Python
-
 def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode, max_hold_days, exchange_data, use_compound, selection_mode):
     """
     전체 종목을 날짜별로 순회하며 포트폴리오를 운용하는 시뮬레이션
