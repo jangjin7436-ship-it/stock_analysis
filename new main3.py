@@ -81,73 +81,70 @@ USER_WATCHLIST = list(TICKER_MAP.keys())
 # ---------------------------------------------------------
 @st.cache_data(ttl=60)
 def get_bulk_us_data(us_tickers):
-    """미국 주식 데이터 수집"""
+    """미국 주식 데이터 수집 (단일/다중 모두 동일 로직으로 처리)"""
     if not us_tickers:
         return {}, {}
 
     hist_map = {}
     realtime_map = {}
 
-    # 1개일 때
-    if len(us_tickers) == 1:
-        ticker = us_tickers[0]
-        try:
-            df_hist = yf.download(ticker, period="2y", interval="1d", progress=False, auto_adjust=True)
-            if not df_hist.empty:
-                if 'Close' in df_hist.columns:
-                    hist_map[ticker] = df_hist
-
-            df_real = yf.download(ticker, period="5d", interval="1m", progress=False, prepost=True)
-            if not df_real.empty:
-                if 'Close' in df_real.columns:
-                    last_p = float(df_real['Close'].iloc[-1])
-                    realtime_map[ticker] = last_p
-        except Exception:
-            pass
-        return hist_map, realtime_map
-
-    # 여러 개일 때 (Bulk)
     try:
+        # tickers가 1개여도 리스트로 주면 MultiIndex 구조가 나오므로
+        # 항상 같은 경로를 타게 한다.
         df_hist = yf.download(
             us_tickers,
             period="2y",
             interval="1d",
             progress=False,
-            group_by='ticker',
-            auto_adjust=True
+            group_by="ticker",
+            auto_adjust=True,
         )
         df_real = yf.download(
             us_tickers,
             period="5d",
             interval="1m",
             progress=False,
-            group_by='ticker',
-            prepost=True
+            group_by="ticker",
+            prepost=True,
         )
 
+        # 컬럼이 MultiIndex인지(여러 종목) 아닌지에 따라 안전하게 처리
+        hist_is_multi = isinstance(df_hist.columns, pd.MultiIndex)
+        real_is_multi = isinstance(df_real.columns, pd.MultiIndex)
+
         for t in us_tickers:
-            # History
+            # ---------- 일봉 히스토리 ----------
             try:
-                sub_df = df_hist[t]
+                sub_df = df_hist[t] if hist_is_multi else df_hist
                 if isinstance(sub_df, pd.DataFrame) and not sub_df.empty:
-                    sub_df = sub_df.dropna(how='all')
-                    if 'Close' in sub_df.columns:
+                    sub_df = sub_df.dropna(how="all")
+                    # Close 또는 Adj Close 중 하나만 있어도 히스토리로 인정
+                    if "Close" in sub_df.columns or "Adj Close" in sub_df.columns:
                         hist_map[t] = sub_df
             except Exception:
                 pass
 
-            # Realtime
+            # ---------- 실시간/최근 체결가 ----------
             try:
-                sub_real = df_real[t]
+                sub_real = df_real[t] if real_is_multi else df_real
                 if isinstance(sub_real, pd.DataFrame) and not sub_real.empty:
-                    sub_real = sub_real.dropna(how='all')
-                    if 'Close' in sub_real.columns:
-                        valid_closes = sub_real['Close'].dropna()
+                    sub_real = sub_real.dropna(how="all")
+
+                    price_series = None
+                    if "Close" in sub_real.columns:
+                        price_series = sub_real["Close"]
+                    elif "Adj Close" in sub_real.columns:
+                        price_series = sub_real["Adj Close"]
+
+                    if price_series is not None:
+                        valid_closes = price_series.dropna()
                         if not valid_closes.empty:
                             realtime_map[t] = float(valid_closes.iloc[-1])
             except Exception:
                 pass
+
     except Exception:
+        # yfinance 쪽 에러는 조용히 무시 (호출 쪽에서 로딩 실패 처리)
         pass
 
     return hist_map, realtime_map
