@@ -74,7 +74,7 @@ SEARCH_MAP = {f"{name} ({code})": code for code, name in TICKER_MAP.items()}
 USER_WATCHLIST = list(TICKER_MAP.keys())
 
 # ---------------------------------------------------------
-# 2. 데이터 수집 (수정됨: 단일/다중 종목 완벽 호환)
+# 2. 데이터 수집 (최적화: 단일/다중 종목 호환)
 # ---------------------------------------------------------
 @st.cache_data(ttl=60)
 def get_bulk_us_data(us_tickers):
@@ -199,12 +199,12 @@ def get_precise_data(tickers_list):
     return hist_map, realtime_map
 
 # ---------------------------------------------------------
-# 3. 분석 엔진 (AI Sniper Logic 적용)
+# 3. 분석 엔진 (AI Sniper Logic: 2주 스윙 최적화)
 # ---------------------------------------------------------
 
 def calculate_indicators(df, realtime_price=None):
     """
-    [최적화] 2주 스윙용 지표 계산 (MA10, 볼린저밴드, 거래량 추가)
+    [최적화] 2주 단기 스윙용 지표 (MA10, 볼린저밴드, 거래량 추가)
     """
     if df is None or len(df) < 60:
         return None
@@ -221,7 +221,7 @@ def calculate_indicators(df, realtime_price=None):
     if isinstance(close, pd.DataFrame):
         close = close.iloc[:, 0]
 
-    # 실시간 가격 주입 (스캐너 특화)
+    # 실시간 가격 주입
     if realtime_price is not None and realtime_price > 0:
         try:
             close.iloc[-1] = realtime_price
@@ -230,17 +230,16 @@ def calculate_indicators(df, realtime_price=None):
 
     df['Close_Calc'] = close
 
-    # 1. 이동평균 (MA10 추가)
+    # 1. 이동평균 (MA10 - 스윙 생명선 추가)
     df['MA5'] = df['Close_Calc'].rolling(5).mean()
-    df['MA10'] = df['Close_Calc'].rolling(10).mean() # 스윙 생명선
+    df['MA10'] = df['Close_Calc'].rolling(10).mean() 
     df['MA20'] = df['Close_Calc'].rolling(20).mean()
     df['MA60'] = df['Close_Calc'].rolling(60).mean()
     
-    # 2. 볼린저 밴드 (단기 변동성 돌파 확인용)
+    # 2. 볼린저 밴드 (변동성)
     std = df['Close_Calc'].rolling(20).std()
     df['Upper_Band'] = df['MA20'] + (std * 2)
     df['Lower_Band'] = df['MA20'] - (std * 2)
-    # 밴드폭(Band Width): 좁아졌다가 넓어질 때가 매수 타이밍
     df['Band_Width'] = (df['Upper_Band'] - df['Lower_Band']) / df['MA20']
     
     # 3. RSI
@@ -260,87 +259,73 @@ def calculate_indicators(df, realtime_price=None):
     df['MACD_Hist'] = df['MACD'] - df['Signal_Line']
     df['Prev_MACD_Hist'] = df['MACD_Hist'].shift(1)
     
-    # 5. 거래량 이평 (거래량 실린 상승인지 확인)
+    # 5. 거래량
     if 'Volume' in df.columns:
         df['Vol_MA20'] = df['Volume'].rolling(20).mean()
-        # 거래량 급증 여부
         df['Vol_Ratio'] = df['Volume'] / df['Vol_MA20']
     else:
         df['Vol_Ratio'] = 1.0 
 
-    # 6. 변동성 (표준편차)
     df['STD20'] = std
-    
     return df.dropna()
 
 def get_ai_score_row(row):
     """
-    [최적화] 2주 단기 스윙용 점수 산정 (Momentum + Volatility)
-    목표: 상승 초입 포착 (무릎에서 사서 어깨에서 팔기)
+    [AI 스나이퍼 스코어링]
+    - MA10 지지 & 모멘텀 가속 & 밴드 돌파 시 고득점
     """
     try:
-        score = 50.0 # 기본점
+        score = 50.0
         
         curr = row['Close_Calc']
         ma5, ma10, ma20, ma60 = row['MA5'], row['MA10'], row['MA20'], row['MA60']
         rsi = row['RSI']
         
-        # ---------------------------------------------------------
-        # 1. 추세 (Trend) - 단기 생명선(10일선) 중심
-        # ---------------------------------------------------------
-        # 2주 매매는 10일선이 꺾이면 끝난 것임.
+        # 1. 추세 (10일선 생명선)
         if curr > ma10:
             score += 15.0
-            # 정배열 보너스 (5 > 10 > 20)
-            if ma5 > ma10 > ma20:
+            if ma5 > ma10 > ma20: # 정배열
                 score += 5.0
         else:
-            score -= 10.0 # 10일선 아래는 탄력 둔화
+            score -= 10.0 # 탄력 둔화
             
-        # 장기 추세 필터 (60일선 위에 있어야 안전)
         if curr > ma60:
             score += 5.0
         else:
             score -= 5.0
 
-        # ---------------------------------------------------------
-        # 2. 모멘텀 (Momentum) - MACD & RSI
-        # ---------------------------------------------------------
-        # MACD 히스토그램이 '양수'이고 '어제보다 증가'했으면 상승 가속도 붙음
+        # 2. 모멘텀 (MACD 가속)
         if row['MACD_Hist'] > 0:
             score += 5.0
             if row['MACD_Hist'] > row['Prev_MACD_Hist']:
-                score += 5.0 # 가속도 보너스
-        
-        # 턴어라운드 감지: 음수에서 양수로 전환 직전 or 막 전환
+                score += 5.0 # 상승 가속
         elif row['MACD_Hist'] > row['Prev_MACD_Hist'] and row['MACD_Hist'] > -0.5:
-             score += 5.0 # 반등 시도 중
+             score += 5.0 # 반등 시도
 
-        # RSI: 50~70 구간이 스윙에 가장 좋음
+        # 3. RSI (스윙 적정 구간 50~70)
         if 50 <= rsi <= 70:
             score += 10.0
         elif rsi > 75:
-            score -= 5.0 # 과열 경고 (곧 조정 올 수 있음)
+            score -= 5.0 # 과열
         elif rsi < 35:
-            score += 5.0 # 기술적 반등 기대 (낙폭 과대)
+            score += 5.0 # 낙폭 과대
 
-        # ---------------------------------------------------------
-        # 3. 변동성 돌파 (Volatility Breakout) - 볼린저 밴드
-        # ---------------------------------------------------------
-        # 밴드 상단 돌파 시도 or 상단 타고 가는 중
+        # 4. 볼린저 밴드 (변동성)
         u_band = row['Upper_Band']
-        if curr >= u_band * 0.98: # 상단 근처
+        if curr >= u_band * 0.98: # 밴드 상단 돌파 시도
             score += 10.0
             
-        # 스퀴즈(Squeeze) 후 발산 체크
-        if row['Band_Width'] < 0.15 and ma5 > ma10: # 밴드폭 15% 미만
+        # 스퀴즈 후 발산
+        if row['Band_Width'] < 0.15 and ma5 > ma10:
             score += 5.0
 
-        # ---------------------------------------------------------
-        # 4. 수급 (Volume)
-        # ---------------------------------------------------------
+        # 5. 거래량
         if row['Vol_Ratio'] >= 1.2 and curr > row['MA5']:
              score += 5.0
+
+        # 6. 안정성 페널티 (변동성 클수록 감점)
+        vol_ratio = row['STD20'] / curr if curr > 0 else 0
+        score -= (vol_ratio * 100.0)
 
         return max(0.0, min(100.0, score))
     except:
@@ -348,10 +333,8 @@ def get_ai_score_row(row):
 
 def analyze_advanced_strategy(df):
     """
-    [AI 스나이퍼 모드]
-    - 매수: 70점 이상 (TOP Pick)
-    - 매도: 40점 미만 (추세 이탈)
-    - 익절/관망: RSI 과열 시 경고
+    [AI 스나이퍼 전략 등급 분류]
+    - 조건 만족 전부 매수 모드: 70점 이상이면 모두 '매수' 등급 부여
     """
     if df is None or df.empty:
         return "분석 불가", "gray", "데이터 부족", 0.0
@@ -372,40 +355,40 @@ def analyze_advanced_strategy(df):
 
     # 1. 10일선(생명선) 기준 판단
     if curr > ma10:
-        reasons.append("단기 강세(10일선 위)")
+        reasons.append("10일선 위(강세)")
     else:
-        reasons.append("단기 약세(10일선 붕괴)")
+        reasons.append("10일선 이탈(약세)")
 
-    # 2. 볼린저 밴드/추세
+    # 2. 밴드/추세
     if curr >= u_band * 0.99:
-        reasons.append("밴드 상단 돌파(급등)")
+        reasons.append("밴드 돌파(급등)")
     elif curr > ma60:
         reasons.append("장기 정배열")
     
-    # 3. RSI 상태
+    # 3. RSI
     if rsi > 75:
         reasons.append(f"RSI 과열({rsi:.0f})")
     elif rsi < 35:
-        reasons.append(f"과매도 반등기대({rsi:.0f})")
+        reasons.append(f"과매도({rsi:.0f})")
     
-    # 4. MACD 에너지
+    # 4. MACD
     if macd_hist > 0 and macd_hist > row['Prev_MACD_Hist']:
-        reasons.append("상승 에너지 가속")
+        reasons.append("에너지 가속")
 
     # -----------------------------------------------------
     # [스나이퍼 전략] 점수 구간 → 매수/매도 등급 매핑
     # -----------------------------------------------------
     if score >= 70:
-        # 스나이퍼 타점
-        cat = "🎯 스나이퍼 매수 (TOP Pick)"
-        col = "green"
-        if rsi > 75: # 점수는 높지만 너무 과열된 경우
+        # 70점 이상이면 무조건 매수 후보 (분산 투자 권장)
+        if rsi > 75:
             cat = "🔥 매수 주의 (과열권)"
             col = "orange"
             reasons.insert(0, "단기 고점 위험")
+        else:
+            cat = "🎯 스나이퍼 매수 (진입 타점)"
+            col = "green"
 
     elif score < 40:
-        # 손절/매도 타점
         cat = "💥 매도/손절 (추세 이탈)"
         col = "red"
         
@@ -451,7 +434,7 @@ tab1, tab2, tab3 = st.tabs(["🚀 AI 스나이퍼 스캔", "💼 내 포트폴�
 # TAB 1: 스캐너
 with tab1:
     st.markdown("### 📋 AI 스나이퍼 종목 발굴")
-    st.caption("2주 단기 스윙 전략 | 70점 이상 진입 | 10일선 기준 추세 매매")
+    st.caption("전략: 2주 단기 스윙 | 선정: 조건 만족 종목 전부 매수 (분산 투자 권장)")
 
     col_btn, col_info = st.columns([1, 4])
     with col_btn:
@@ -461,7 +444,7 @@ with tab1:
 
     if st.session_state['scan_result_df'] is None:
         if st.button("🔍 전체 유니버스 분석 시작"):
-            with st.spinner('AI 스나이퍼 알고리즘 가동 중... (데이터 수집 + 지표 미분)'):
+            with st.spinner('AI 스나이퍼 알고리즘 가동 중... (10일선/볼린저/모멘텀 분석)'):
                 raw_data_dict, realtime_map = get_precise_data(USER_WATCHLIST)
                 scan_results = []
                 progress_bar = st.progress(0)
@@ -504,19 +487,23 @@ with tab1:
                 
                 if scan_results:
                     df_res = pd.DataFrame(scan_results)
-                    # ★ 점수 1등이 맨 위로 오게 내림차순 정렬
+                    # 점수 내림차순 정렬 (사용자가 보기 편하게)
                     df_res = df_res.sort_values('점수', ascending=False)
                     st.session_state['scan_result_df'] = df_res
-                    st.success("스캔 완료! 점수 1위 종목을 확인하세요.")
+                    st.success("스캔 완료! 70점 이상인 종목들을 확인하세요.")
                     st.rerun()
                 else:
                     st.error("데이터 수집 실패.")
     
     if st.session_state['scan_result_df'] is not None:
-        # 1등 종목 하이라이트
-        top_pick = st.session_state['scan_result_df'].iloc[0]
-        if top_pick['점수'] >= 70:
-            st.info(f"🏆 **오늘의 원픽(TOP 1): {top_pick['종목명']}** (점수: {top_pick['점수']}점)")
+        # 70점 이상 종목 개수 파악
+        high_score_df = st.session_state['scan_result_df'][st.session_state['scan_result_df']['점수'] >= 70]
+        count = len(high_score_df)
+        
+        if count > 0:
+            st.info(f"✨ **매수 조건 만족 종목: {count}개** (AI 스나이퍼 기준 70점 이상)")
+        else:
+            st.warning("현재 매수 조건을 만족하는 종목이 없습니다. (관망 권장)")
         
         st.dataframe(
             st.session_state['scan_result_df'],
@@ -634,7 +621,6 @@ with tab2:
                 curr = 0
                 df_indi = None
                 
-                # 데이터 유효성 검사 및 추출
                 if tk in raw_data_dict:
                     df_tk = raw_data_dict[tk].dropna(how='all')
                     if not df_tk.empty:
@@ -643,7 +629,6 @@ with tab2:
                 
                 if df_indi is not None:
                     curr = float(df_indi['Close_Calc'].iloc[-1])
-                    # AI 스나이퍼 분석 적용
                     cat, col_name, reasoning, score = analyze_advanced_strategy(df_indi)
                 else:
                     cat, col_name, reasoning, score = "데이터 로딩 중", "gray", "잠시 후 다시 시도", 0
@@ -664,7 +649,7 @@ with tab2:
                         "currency": "$" if not tk.endswith(".KS") else "₩", "score": 0
                     })
             
-            # 점수 기준 정렬
+            # 점수 순으로 정렬
             display_list.sort(key=lambda x: x['score'], reverse=True)
 
             for item in display_list:
@@ -714,7 +699,7 @@ with tab3:
     
     st.subheader("1. 🎯 점수 & 등급 가이드")
     score_guide_data = [
-        {"점수": "70점 이상", "등급": "🎯 스나이퍼 매수", "설명": "10일선 지지 + 거래량 실린 상승 + 밴드 돌파. 강력 진입 신호."},
+        {"점수": "70점 이상", "등급": "🎯 스나이퍼 매수", "설명": "10일선 지지 + 거래량 실린 상승 + 밴드 돌파. 분산 매수 추천."},
         {"점수": "50~69점", "등급": "👀 관망 (Hold)", "설명": "추세는 살아있으나 모멘텀이 약함. 기존 보유자는 홀딩, 신규는 대기."},
         {"점수": "40점 미만", "등급": "💥 매도/손절", "설명": "10일선 붕괴 또는 추세 이탈. 리스크 관리(손절) 필수."},
         {"특이사항": "RSI > 75", "등급": "🔥 과열 경고", "설명": "단기 급등으로 인한 조정 가능성. 분할 익절 권장."}
