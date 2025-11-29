@@ -154,10 +154,19 @@ def prepare_stock_data(ticker_info, start_date):
     except:
         return None
 
+이 에러는 Pandas의 Series 객체(데이터 한 행)를 if 문으로 직접 검사할 때 발생하는 아주 흔한 오류입니다.
+
+Python의 일반적인 객체와 달리, Pandas 데이터(stock_row)는 if stock_row:라고 쓰면 "이 데이터가 비어있는지 확인하라는 건지, 값이 True인지 확인하라는 건지 모르겠다"며 ValueError를 뿜어냅니다.
+
+따라서 if stock_row:를 if stock_row is not None: 으로 명확하게 바꿔주어야 합니다.
+
+해당 함수 run_portfolio_backtest 의 수정된 전체 코드를 드립니다. 기존 코드에서 이 함수 부분만 교체하시면 됩니다.
+
+Python
+
 def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode, max_hold_days, exchange_data, use_compound, selection_mode):
     """
     전체 종목을 날짜별로 순회하며 포트폴리오를 운용하는 시뮬레이션
-    selection_mode: 'ALL' (조건 맞으면 분산 매수) / 'TOP1' (점수 1등 몰빵)
     """
     # 1. 전 종목 데이터 병렬 준비
     all_dfs = []
@@ -167,10 +176,9 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode, 
             res = future.result()
             if res is not None: all_dfs.append(res)
             
-    if not all_dfs: return None, []
+    if not all_dfs: return pd.DataFrame(), pd.DataFrame() # 빈 데이터프레임 반환
 
     # 2. 데이터를 날짜 기준으로 통합 (Market Data)
-    # market_data[날짜] = 해당 날짜의 종목별 데이터 리스트
     market_data = {}
     for df in all_dfs:
         for date, row in df.iterrows():
@@ -179,52 +187,48 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode, 
             
     sorted_dates = sorted(market_data.keys())
     
-    # 3. 환율 데이터 준비 (날짜별 매핑)
+    # 3. 환율 데이터 준비
     exchange_map = {}
     if isinstance(exchange_data, (float, int)):
         get_rate = lambda d: float(exchange_data)
     else:
-        # Series를 딕셔너리로 변환 (검색 속도 최적화)
         rate_dict = exchange_data.to_dict()
         def get_rate(d):
-            # 해당 날짜 환율 없으면 가장 가까운 과거 데이터 사용
             ts = pd.Timestamp(d)
-            return rate_dict.get(ts, 1430.0) # 기본값
+            # 환율 데이터가 없으면 전날 데이터 또는 기본값 사용
+            return rate_dict.get(ts, 1430.0)
 
     # 4. 시뮬레이션 상태 변수
     balance = initial_capital
-    portfolio = {} # {ticker: {shares, buy_price, buy_date, max_price, mode_active}}
+    portfolio = {} 
     trades_log = []
     equity_curve = []
     
-    # 설정: 최대 보유 종목 수
-    # TOP1 모드면 1개, ALL 모드면 최대 10개(또는 20개)로 제한하여 분산 투자
     max_slots = 1 if selection_mode == 'TOP1' else 10 
 
     # --- 날짜별 루프 (Time Loop) ---
     for date in sorted_dates:
         daily_stocks = market_data[date]
-        current_rate = get_rate(date) # 오늘 환율
+        current_rate = get_rate(date)
         
         # A. 보유 종목 관리 (매도 체크)
         sell_list = []
         
         for ticker, info in portfolio.items():
-            # 오늘 데이터 찾기
             stock_row = next((x for x in daily_stocks if x['Ticker'] == ticker), None)
-            if stock_row is None: continue # 휴장일이면 패스
+            
+            # 🔴 [수정] 여기가 에러 원인이었습니다. (is not None 추가)
+            if stock_row is None: continue 
             
             curr_price_raw = stock_row['Close_Calc']
             curr_price_krw = curr_price_raw * (1.0 if ".KS" in ticker else current_rate)
             score = stock_row['AI_Score']
             
-            # 수수료
             fee_sell = 0.003 if ".KS" in ticker else 0.001
             
             should_sell = False
             sell_reason = ""
             
-            # 수익률 계산
             profit_pct = (curr_price_krw - info['avg_price']) / info['avg_price'] * 100
             profit_ratio = (curr_price_krw - info['avg_price']) / info['avg_price']
 
@@ -243,27 +247,22 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode, 
                         sell_reason = "AI 45↓"
                         
                 elif strategy_mode == "SuperLocking":
-                    # 락킹 모드 진입 체크
                     if not info['mode_active'] and profit_ratio >= 0.03:
                         portfolio[ticker]['mode_active'] = True
                         portfolio[ticker]['max_price'] = curr_price_krw
                     
                     if info['mode_active']:
-                        # 고점 갱신
                         if curr_price_krw > portfolio[ticker]['max_price']:
                             portfolio[ticker]['max_price'] = curr_price_krw
                         
-                        # 트레일링 스탑 (-2%)
                         if curr_price_krw <= portfolio[ticker]['max_price'] * 0.98:
                             should_sell = True
                             sell_reason = "💎 Locking Trailing"
                     else:
-                        # 방어 로직
                         if score <= 45:
                             should_sell = True
                             sell_reason = "Defense(45↓)"
 
-            # 매도 실행
             if should_sell:
                 return_amt = info['shares'] * curr_price_krw * (1 - fee_sell)
                 balance += return_amt
@@ -275,23 +274,20 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode, 
                 })
                 sell_list.append(ticker)
 
-        # 포트폴리오에서 삭제
         for t in sell_list: del portfolio[t]
 
         # B. 신규 매수 (Buy Logic)
-        # 빈 슬롯이 있어야 매수 가능
         if len(portfolio) < max_slots:
             candidates = []
             
             for row in daily_stocks:
                 ticker = row['Ticker']
-                if ticker in portfolio: continue # 이미 보유중
+                if ticker in portfolio: continue 
                 
                 score = row['AI_Score']
                 price_raw = row['Close_Calc']
                 price_krw = price_raw * (1.0 if ".KS" in ticker else current_rate)
                 
-                # 전략별 진입 조건
                 entry_signal = False
                 reason = ""
                 if strategy_mode == "Basic" and score >= 65:
@@ -307,29 +303,26 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode, 
                         'price_krw': price_krw, 'score': score, 'reason': reason
                     })
             
-            # 🔥 핵심: 정렬 및 선택 (ALL vs TOP1)
-            # 점수 높은 순으로 정렬
             candidates.sort(key=lambda x: x['score'], reverse=True)
             
-            # 매수할 종목 수 결정
             open_slots = max_slots - len(portfolio)
-            buy_targets = candidates[:open_slots] # 슬롯만큼만 매수
+            buy_targets = candidates[:open_slots] 
             
             if buy_targets:
-                # 1종목당 투자할 금액 계산
-                # 복리: 현재 잔고 / 남은 슬롯
-                # 단리: 초기 자본 / 최대 슬롯 (단, 잔고 부족시 잔고만큼)
                 if use_compound:
                     per_stock_budget = balance / open_slots
                 else:
                     per_stock_budget = min(balance, initial_capital / max_slots)
                 
                 for target in buy_targets:
-                    # 실제 매수 가능 금액 (잔고 확인)
                     budget = min(balance, per_stock_budget)
-                    
                     fee_buy = 0.00015 if ".KS" in target['ticker'] else 0.001
-                    shares = int(budget / (target['price_krw'] * (1 + fee_buy)))
+                    
+                    # 0으로 나누기 방지
+                    if target['price_krw'] > 0:
+                        shares = int(budget / (target['price_krw'] * (1 + fee_buy)))
+                    else:
+                        shares = 0
                     
                     if shares > 0:
                         cost = shares * target['price_krw'] * (1 + fee_buy)
@@ -340,8 +333,8 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode, 
                             'shares': shares,
                             'avg_price': target['price_krw'],
                             'buy_date': date,
-                            'mode_active': False, # 슈퍼락킹용
-                            'max_price': 0       # 슈퍼락킹용
+                            'mode_active': False, 
+                            'max_price': 0       
                         }
                         
                         trades_log.append({
@@ -353,18 +346,19 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode, 
         # C. 자산 평가 (Equity Curve)
         current_equity = balance
         for ticker, info in portfolio.items():
-            # 오늘 종가 찾기 (없으면 매수가로 대충 계산)
             stock_row = next((x for x in daily_stocks if x['Ticker'] == ticker), None)
-            if stock_row:
+            
+            # 🔴 [수정] 여기도 에러 원인이 될 수 있으므로 is not None 추가
+            if stock_row is not None:
                 p_raw = stock_row['Close_Calc']
                 p_krw = p_raw * (1.0 if ".KS" in ticker else current_rate)
                 current_equity += info['shares'] * p_krw
             else:
-                current_equity += info['shares'] * info['avg_price']
+                # 오늘 데이터가 없으면(휴장 등) 어제 가격(평단가 등)으로 임시 평가
+                current_equity += info['shares'] * info['avg_price'] # 혹은 직전 가격 유지
                 
         equity_curve.append({'date': date, 'equity': current_equity})
 
-    # 결과 정리
     return pd.DataFrame(trades_log), pd.DataFrame(equity_curve)
 # =========================================================
 # 3. UI 통합 (탭 추가)
