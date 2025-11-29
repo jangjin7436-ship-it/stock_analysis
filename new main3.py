@@ -389,4 +389,476 @@ def calculate_indicators(df, realtime_price=None):
 def analyze_advanced_strategy(df):
     """
     스캐너/포트폴리오용 AI 해석 엔진
-    - 백테스트의 AI_Score/필터를_
+    - 백테스트의 AI_Score/필터를 그대로 사용
+    - 매매 전략은 'AI 스나이퍼'
+    - 종목 선정은 '조건 만족 전부 매수' 가정
+    """
+    if df is None or df.empty:
+        return "분석 불가", "gray", "데이터 부족", 0.0
+
+    try:
+        row = df.iloc[-1]
+        score = float(row.get('AI_Score', get_ai_score_row(row)))
+        curr = float(row['Close_Calc'])
+        ma20 = float(row['MA20'])
+        ma60 = float(row['MA60'])
+        rsi = float(row['RSI'])
+        macd = float(row['MACD'])
+        sig = float(row['Signal_Line'])
+        hist = float(row['MACD_Hist'])
+        ret5 = float(row.get('Ret5', 0.0))
+    except Exception:
+        return "오류", "gray", "계산 실패", 0.0
+
+    reasons = []
+
+    # 1) 추세 설명
+    if curr > ma60 and ma20 > ma60:
+        reasons.append("상승 추세(20·60일선 위 정배열)")
+    elif curr > ma60:
+        reasons.append("60일선 위지만 20일선이 약함")
+    else:
+        reasons.append("60일선 아래(조정/하락 구간)")
+
+    # 2) 20일선과의 거리(눌림/과열)
+    dist_ma20 = (curr - ma20) / ma20 if ma20 > 0 else 0.0
+    if curr > ma60 and -0.03 <= dist_ma20 <= 0.03:
+        reasons.append(f"20일선 근처 눌림({dist_ma20 * 100:.1f}%)")
+    elif dist_ma20 > 0.08:
+        reasons.append("20일선 대비 단기 과열(8%↑)")
+    elif dist_ma20 < -0.05:
+        reasons.append("20일선 아래 깊은 조정")
+
+    # 3) RSI 상태
+    if rsi < 30:
+        reasons.append(f"RSI 과매도({rsi:.1f})")
+    elif rsi > 70:
+        reasons.append(f"RSI 과매수({rsi:.1f})")
+    elif 40 <= rsi <= 60:
+        reasons.append(f"안정적 RSI({rsi:.1f})")
+
+    # --- 스나이퍼 진입 기준 (백테스트와 동일) ---
+    trend_ok = (curr > ma60) and (ma20 > ma60)
+    pullback_ok = (-0.03 <= dist_ma20 <= 0.03)
+    rsi_ok = (35 <= rsi <= 65)
+    macd_ok = (macd > sig and hist > 0)
+    base_entry = trend_ok and pullback_ok and rsi_ok and macd_ok
+
+    entry_signal = base_entry and score >= 70 and ret5 >= -0.02
+
+    # --- 점수 구간별 해석 (스나이퍼 기준) ---
+    if entry_signal:
+        cat = "🚀 AI 스나이퍼 매수 신호 (조건 만족 전부 매수)"
+        col = "green"
+    else:
+        if score < 45:
+            cat = "💥 스나이퍼 매도/회피 구간 (추세 이탈)"
+            col = "red"
+        elif score < 60:
+            cat = "👀 관망 구간 (약한 추세, 보유자 점검)"
+            col = "orange" if score < 50 else "gray"
+        elif score < 70:
+            cat = "📈 상승 추세지만 스나이퍼 진입 조건 미충족"
+            col = "blue"
+        else:  # score >= 70 이지만 base_entry 조건이 일부 부족
+            cat = "📈 강한 종목 (추세 양호, 이상적 눌림 대기)"
+            col = "blue"
+
+    reasoning = " / ".join(reasons[:3]) if reasons else "지표 정보 부족"
+
+    return cat, col, reasoning, round(score, 3)
+
+
+def calculate_total_profit(ticker, avg_price, current_price, quantity):
+    is_kr = ticker.endswith(".KS") or ticker.endswith(".KQ")
+    qty, avg, curr = float(quantity), float(avg_price), float(current_price)
+
+    total_buy = avg * qty
+    gross_eval = curr * qty
+
+    fee_rate = 0.000295 if is_kr else 0.001965
+    tax_rate = 0.0015 if is_kr else 0.0
+
+    sell_fee = gross_eval * fee_rate
+    sell_tax = gross_eval * tax_rate
+    net_eval = gross_eval - sell_fee - sell_tax
+    net_profit = net_eval - total_buy
+    pct = (net_profit / total_buy) * 100 if total_buy > 0 else 0.0
+
+    return {
+        "pct": pct,
+        "profit_amt": net_profit,
+        "net_eval_amt": net_eval,
+        "currency": "₩" if is_kr else "$",
+    }
+
+
+# ---------------------------------------------------------
+# 4. UI
+# ---------------------------------------------------------
+st.title("📈 AI 주식 스캐너 & 포트폴리오 Pro")
+
+tab1, tab2, tab3 = st.tabs(["🚀 전체 종목 스캐너", "💼 내 포트폴리오 (서버 저장)", "📘 알고리즘 백서"])
+
+# TAB 1: 스캐너
+with tab1:
+    st.markdown("### 📋 AI 정밀 스캐너")
+    st.caption("초정밀 실시간/AfterMarket 데이터 기반 AI 분석 (AI 스나이퍼 기준)")
+
+    col_btn, col_info = st.columns([1, 4])
+    with col_btn:
+        if st.button("🔄 분석 새로고침", type="primary"):
+            st.session_state['scan_result_df'] = None
+            st.rerun()
+
+    if st.session_state['scan_result_df'] is None:
+        if st.button("🔍 전체 리스트 정밀 분석 시작"):
+            with st.spinner('초정밀 데이터 수집 및 분석 중...'):
+                raw_data_dict, realtime_map = get_precise_data(USER_WATCHLIST)
+                scan_results = []
+                progress_bar = st.progress(0)
+
+                for i, ticker_code in enumerate(USER_WATCHLIST):
+                    if ticker_code not in raw_data_dict:
+                        continue
+                    try:
+                        df_tk = raw_data_dict[ticker_code].dropna(how='all')
+                        if df_tk.empty:
+                            continue
+
+                        curr_price = realtime_map.get(ticker_code)
+                        df_indi = calculate_indicators(df_tk, realtime_price=curr_price)
+
+                        if df_indi is None or df_indi.empty:
+                            continue
+
+                        # 🔥 백테스트와 동일한 AI_Score/스나이퍼 기준으로 매수/매도 해석
+                        cat, col_name, reasoning, score = analyze_advanced_strategy(df_indi)
+
+                        final_price = float(df_indi['Close_Calc'].iloc[-1])
+                        rsi_val = float(df_indi['RSI'].iloc[-1])
+                        name = TICKER_MAP.get(ticker_code, ticker_code)
+                        is_kr = ticker_code.endswith(".KS") or ticker_code.endswith(".KQ")
+                        sym = "₩" if is_kr else "$"
+                        fmt_price = f"{sym}{final_price:,.0f}" if is_kr else f"{sym}{final_price:,.2f}"
+
+                        scan_results.append({
+                            "종목명": f"{name} ({ticker_code})",
+                            "점수": score,
+                            "현재가": fmt_price,
+                            "RSI": rsi_val,
+                            "AI 등급": cat,
+                            "핵심 요약": reasoning,
+                        })
+                    except Exception:
+                        continue
+                    progress_bar.progress((i + 1) / len(USER_WATCHLIST))
+
+                if scan_results:
+                    df_res = pd.DataFrame(scan_results)
+                    df_res = df_res.sort_values('점수', ascending=False)
+                    st.session_state['scan_result_df'] = df_res
+                    st.success("완료! (결과는 '분석 새로고침' 전까지 고정됩니다)")
+                    st.rerun()
+                else:
+                    st.error("데이터 수집 실패.")
+    if st.session_state['scan_result_df'] is not None:
+        st.dataframe(
+            st.session_state['scan_result_df'],
+            use_container_width=True,
+            height=700,
+            column_config={
+                "종목명": st.column_config.TextColumn("종목명 (코드)", width="medium"),
+                "점수": st.column_config.ProgressColumn("AI 점수", format="%.1f점", min_value=0, max_value=100),
+                "현재가": st.column_config.TextColumn("현재가"),
+                "RSI": st.column_config.NumberColumn("RSI", format="%.1f"),
+                "AI 등급": st.column_config.TextColumn("AI 판단"),
+                "핵심 요약": st.column_config.TextColumn("분석 내용", width="large"),
+            },
+            hide_index=True,
+        )
+
+# TAB 2: 포트폴리오
+with tab2:
+    st.markdown("### ☁️ 내 자산 포트폴리오")
+    st.caption("네이버페이(국내) / 1분봉(해외) 실시간 기반 | 세후 순수익 계산 + AI 스나이퍼 진단")
+
+    db = get_db()
+    if not db:
+        st.warning("⚠️ Firebase 설정 필요")
+    else:
+        col_u1, col_u2 = st.columns([1, 3])
+        with col_u1:
+            user_id = st.text_input("닉네임", value="장동진")
+        doc_ref = db.collection('portfolios').document(user_id)
+        try:
+            doc = doc_ref.get()
+            pf_data = doc.to_dict().get('stocks', []) if doc.exists else []
+        except Exception:
+            pf_data = []
+
+        with st.container():
+            st.markdown("#### ➕ 종목 추가")
+            c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
+            with c1:
+                selected_item = st.selectbox("종목 검색", ["선택하세요"] + SEARCH_LIST)
+            with c2:
+                input_price = st.number_input("내 평단가", min_value=0.0, format="%.2f")
+            with c3:
+                input_qty = st.number_input("보유 수량(주)", min_value=0, value=1)
+            with c4:
+                st.write("")
+                st.write("")
+                if st.button("추가하기", type="primary"):
+                    if selected_item != "선택하세요":
+                        target_code = SEARCH_MAP[selected_item]
+                        new_pf_data = [p for p in pf_data if p['ticker'] != target_code]
+                        new_pf_data.append({
+                            "ticker": target_code,
+                            "price": input_price,
+                            "qty": input_qty,
+                        })
+                        doc_ref.set({'stocks': new_pf_data})
+                        st.success("추가 완료!")
+                        time.sleep(0.5)
+                        st.rerun()
+
+        st.divider()
+
+        if pf_data:
+            # 수정 섹션
+            st.markdown("#### ✏️ 보유 종목 정보 수정")
+            edit_options = [f"{TICKER_MAP.get(p['ticker'], p['ticker'])} ({p['ticker']})" for p in pf_data]
+            selected_edit = st.selectbox("수정할 종목 선택", options=["선택하세요"] + edit_options, key="edit_select")
+
+            if selected_edit != "선택하세요":
+                edit_ticker = selected_edit.split("(")[-1].rstrip(")")
+                target = next((p for p in pf_data if p["ticker"] == edit_ticker), None)
+                if target:
+                    new_avg = st.number_input(
+                        "새 평단가",
+                        min_value=0.0,
+                        value=float(target["price"]),
+                        format="%.4f",
+                        key="edit_avg_price",
+                    )
+                    new_qty = st.number_input(
+                        "새 보유 수량(주)",
+                        min_value=0,
+                        value=int(target.get("qty", 1)),
+                        key="edit_qty",
+                    )
+
+                    if st.button("변경 내용 저장", type="primary", key="edit_save"):
+                        new_pf_data = []
+                        for p in pf_data:
+                            if p["ticker"] == edit_ticker:
+                                new_pf_data.append({"ticker": edit_ticker, "price": new_avg, "qty": new_qty})
+                            else:
+                                new_pf_data.append(p)
+                        doc_ref.set({"stocks": new_pf_data})
+                        st.success("수정 완료!")
+                        time.sleep(0.5)
+                        st.rerun()
+
+            st.divider()
+
+        if pf_data:
+            st.subheader(f"{user_id}님의 보유 종목 진단 (AI 스나이퍼 기준)")
+            my_tickers = [p['ticker'] for p in pf_data]
+            with st.spinner("초정밀 실시간 데이터 수집 중..."):
+                raw_data_dict, realtime_map = get_precise_data(my_tickers)
+
+            display_list = []
+            for item in pf_data:
+                tk = item['ticker']
+                avg = item['price']
+                qty = item.get('qty', 1)
+                name = TICKER_MAP.get(tk, tk)
+
+                curr = 0.0
+                df_indi = None
+
+                # 데이터 유효성 검사 및 추출
+                if tk in raw_data_dict:
+                    df_tk = raw_data_dict[tk].dropna(how='all')
+                    if not df_tk.empty:
+                        curr_price = realtime_map.get(tk)
+                        df_indi = calculate_indicators(df_tk, realtime_price=curr_price)
+
+                if df_indi is not None and not df_indi.empty:
+                    curr = float(df_indi['Close_Calc'].iloc[-1])
+
+                # 🔥 여기서도 백테스트와 동일한 AI_Score/스나이퍼 기준 사용
+                if df_indi is not None and not df_indi.empty:
+                    cat, col_name, reasoning, score = analyze_advanced_strategy(df_indi)
+                else:
+                    cat, col_name, reasoning, score = "데이터 로딩 중", "gray", "잠시 후 다시 시도", 0.0
+
+                if curr > 0:
+                    res = calculate_total_profit(tk, avg, curr, qty)
+                    display_list.append({
+                        "name": name,
+                        "tk": tk,
+                        "avg": avg,
+                        "curr": curr,
+                        "qty": qty,
+                        "cat": cat,
+                        "col_name": col_name,
+                        "reasoning": reasoning,
+                        "profit_pct": res['pct'],
+                        "profit_amt": res['profit_amt'],
+                        "eval_amt": res['net_eval_amt'],
+                        "currency": res['currency'],
+                        "score": score,
+                    })
+                else:
+                    display_list.append({
+                        "name": name,
+                        "tk": tk,
+                        "avg": avg,
+                        "curr": avg,
+                        "qty": qty,
+                        "cat": "로딩 실패",
+                        "col_name": "gray",
+                        "reasoning": "데이터 수신 불가",
+                        "profit_pct": 0.0,
+                        "profit_amt": 0.0,
+                        "eval_amt": 0.0,
+                        "currency": "₩" if tk.endswith(".KS") or tk.endswith(".KQ") else "$",
+                        "score": 0.0,
+                    })
+
+            # 점수 기준 정렬 (백테스트와 동일한 스코어 기반)
+            display_list.sort(key=lambda x: x['score'], reverse=True)
+
+            for item in display_list:
+                with st.container():
+                    c1, c2, c3 = st.columns([1.5, 1.5, 4])
+                    sym = item['currency']
+                    safe_sym = sym if sym != "$" else "&#36;"
+
+                    with c1:
+                        st.markdown(f"### {item['name']}")
+                        st.caption(f"{item['tk']} | 보유: {item['qty']}주")
+
+                    with c2:
+                        fmt_curr = f"{item['curr']:,.0f}" if item['currency'] == "₩" else f"{item['curr']:,.2f}"
+                        fmt_avg = f"{item['avg']:,.0f}" if item['currency'] == "₩" else f"{item['avg']:,.2f}"
+                        fmt_eval = f"{item['eval_amt']:,.0f}" if item['currency'] == "₩" else f"{item['eval_amt']:,.2f}"
+
+                        st.metric(
+                            "총 순수익 (수수료·세금 차감 후)",
+                            f"{item['profit_pct']:.2f}%",
+                            delta=f"{sym}{item['profit_amt']:,.0f}" if sym == "₩"
+                            else f"{sym}{item['profit_amt']:,.2f}",
+                        )
+                        st.markdown(f"**세후 총 평가금:** {safe_sym}{fmt_eval}", unsafe_allow_html=True)
+                        st.markdown(
+                            f"<small style='color: gray'>평단: {safe_sym}{fmt_avg} / 현재: {safe_sym}{fmt_curr}</small>",
+                            unsafe_allow_html=True,
+                        )
+
+                    with c3:
+                        st.markdown(f"**AI 점수: {item['score']:.1f}점**")
+                        st.markdown(f"**판단:** :{item['col_name']}[{item['cat']}]")
+                        st.info(f"💡 {item['reasoning']}")
+                    st.divider()
+
+            if st.button("🗑️ 포트폴리오 전체 삭제"):
+                doc_ref.delete()
+                st.rerun()
+
+# TAB 3: 알고리즘 백서
+with tab3:
+    st.markdown("## 📘 AI 투자 전략 알고리즘 백서 (Whitepaper v2.0)")
+    st.markdown("""
+본 서비스에 탑재된 AI 알고리즘은 월가(Wall St)의 퀀트 트레이딩에서 검증된 **'추세 추종(Trend Following)'** 전략과  
+단기 과매도 구간을 포착하는 **'평균 회귀(Mean Reversion)'** 이론을 정밀하게 결합한 하이브리드 모델입니다.
+
+모든 점수는 **0점(강력 매도) ~ 100점(강력 매수)** 사이의 실수(float)로 계산되며,  
+단순한 조건 매칭이 아닌 **지표의 강도(Strength)와 이격도(Divergence)**를 미분적으로 분석하여 산출됩니다.
+
+현재 실전 스캐너/포트폴리오 진단 엔진은 **AI 스나이퍼 전략**을 기준으로 매수/매도 구간을 해석합니다.
+""")
+
+    st.divider()
+
+    st.subheader("1. 🎯 AI 종합 점수 가이드 (Scoring Guide)")
+    score_guide_data = [
+        {"점수 구간": "80점 ~ 100점", "등급": "🚀 강력 매수 (Strong Buy)", "설명": "추세, 눌림, 모멘텀이 모두 이상적인 상태. AI 스나이퍼 관점에서 최상급 진입 후보."},
+        {"점수 구간": "70점 ~ 80점", "등급": "📈 매수 우위 (Buy)", "설명": "상승 추세가 확연하며, 스나이퍼 진입 조건에 근접한 구간. 눌림 상태에 따라 전체 매수 트리거 가능."},
+        {"점수 구간": "60점 ~ 70점", "등급": "👍 강한 종목 (Strong Trend)", "설명": "추세는 강하지만 눌림·RSI 조건이 덜 맞을 수 있음. 기존 보유자는 홀딩, 신규 진입은 보수적 접근 권장."},
+        {"점수 구간": "45점 ~ 60점", "등급": "👀 관망 (Hold/Neutral)", "설명": "방향성이 뚜렷하지 않거나, 상승 후 쉬어가는 구간. 스나이퍼 기준으로는 대기/관망 영역."},
+        {"점수 구간": "0점 ~ 45점", "등급": "💥 매도/회피 (Exit/Avoid)", "설명": "역배열 또는 추세 이탈 가능성이 큰 구간. 스나이퍼 전략에서는 비중 축소 또는 관망 권장."},
+    ]
+    st.table(score_guide_data)
+
+    st.header("2. 🧠 핵심 평가 로직 (5-Factor Deep Dive)")
+    st.markdown("AI는 다음 5가지 핵심 요소를 수치화하여 미세한 점수 차이를 만들어냅니다.")
+
+    with st.expander("① 추세 (Trend Hierarchy) - 주가의 '생명선'", expanded=True):
+        st.markdown("""
+**"추세는 당신의 친구입니다 (Trend is your friend)."**
+
+AI는 이동평균선(Moving Average)의 배열 상태를 통해 주가의 현재 위치를 파악합니다.
+
+* **장기 추세 (60일선):** 주가의 '계절'을 의미합니다. 60일선 위에 있다는 것은 현재가 '여름(상승장)'임을 뜻합니다.  
+* **20·60일선 정배열:** `MA20 > MA60` 이면서 가격이 60일선 위에 있을 때, 상승 추세가 살아있는 것으로 판단하여 가산점을 부여합니다.  
+* **5·20·60 정배열:** `MA5 > MA20 > MA60` 인 경우, 단기·중기·장기 추세가 모두 한 방향으로 정렬된 것으로 보고 추가 가산점을 부여합니다.  
+* **역배열 감점:** 반대로 모든 이동평균선 아래에 주가가 위치하면 '하락장'으로 간주하여 강한 페널티를 줍니다.
+""")
+
+    with st.expander("② 황금 눌림목 (The Golden Dip) - 고수익의 비밀", expanded=True):
+        st.markdown("""
+**"무릎에 사서 어깨에 팔아라."**
+
+가장 높은 점수가 부여되는 핵심 구간입니다. 상승 추세(60일선 위)에 있는 종목이  
+일시적인 조정으로 **20일 이동평균선(생명선)** 근처까지 눌렸을 때를 포착합니다.
+
+* **초정밀 거리 계산:** 현재 주가와 20일선 사이의 거리가 `-2% ~ +3%` 이내에 있을 때 가장 높은 가산점(+20점)을 줍니다.  
+* **살짝 깊은 눌림(-5% ~ -2%):** 기술적 반등 가능성이 커지는 구간으로, 소폭의 추가 점수를 부여합니다.  
+* **과열 경고 (20일선 대비 +8%↑):** 단기 급등으로 해석하여 점수를 강하게 깎습니다.  
+* 스나이퍼 전략의 실제 진입은 **"상승 추세 + 20일선 ±3% 이내"** 조건을 동시에 만족할 때만 활성화됩니다.
+""")
+
+    with st.expander("③ RSI (상대강도지수) - 투자 심리 역이용", expanded=True):
+        st.markdown("""
+**"공포에 사고 탐욕에 팔아라."**
+
+RSI는 현재 시장의 과열/침체 정도를 0~100 사이 숫자로 나타냅니다.
+
+* **안정적 상승 (RSI 40~60):** 가장 건강한 상승 구간으로 판단되어 가산점이 부여됩니다.  
+* **완만한 눌림 (RSI 30~40):** 과도한 공포는 아니지만, 조정 국면으로 해석하여 소폭 가산합니다.  
+* **살짝 과열 (RSI 60~70):** 추세는 좋지만 단기 상단부에 근접해 있는 상황으로, 적당한 가산점을 유지합니다.  
+* **과매도/과매수 극단 (RSI <25 또는 >75):** 급락/급등 구간으로, 추세 붕괴 또는 과열 위험 구간으로 인식하여 감점합니다.  
+
+스나이퍼 전략에서는 **RSI 35~65** 구간을 선호하며, 이 범위를 벗어나면 진입 신호를 보수적으로 봅니다.
+""")
+
+    with st.expander("④ MACD & 모멘텀 - 상승의 속도", expanded=True):
+        st.markdown("""
+이동평균선이 '방향'을 알려준다면, MACD는 '속도'를 알려줍니다.
+
+* **MACD > Signal & Histogram > 0:** 상승 에너지가 켜진 상태로, AI 점수를 추가로 끌어올립니다.  
+* **Histogram 증가:** 바로 전날보다 막대 높이가 커지고 있다면, 상승 가속도가 붙는 중으로 해석하여 가산점을 줍니다.  
+* **스나이퍼 진입 필수 조건:** MACD가 시그널 위에 있고, 히스토그램이 양수일 때만 진입 후보로 인정합니다.  
+* **단기 모멘텀 (Ret5):** 최근 5일 수익률이 -2% 이하로 너무 약하면 스나이퍼 진입을 보류합니다.
+""")
+
+    with st.expander("⑤ 변동성 (Volatility) - 위험 관리", expanded=True):
+        st.markdown("""
+변동성이 너무 큰 종목은 '도박'에 가깝습니다.
+
+* **20일 표준편차 / 현재가 비율(STD20 / Price)** 을 통해 일간 등락 폭을 추정합니다.  
+* **1.5% ~ 5% 사이:** 이상적인 스윙 변동성 구간으로 보고 가산점을 부여합니다.  
+* **5% 이상:** 급등락이 심한 종목으로 간주하여 강한 감점을 적용, 리스크를 통제합니다.  
+* **너무 안 움직이는 종목:** 변동성이 지나치게 낮아도 기회 비용 측면에서 소폭 감점합니다.
+""")
+
+    st.divider()
+    st.info(
+        "💡 **Tip:** 본 알고리즘은 '상승 추세가 살아있는 종목'이 '20일선 근처로 눌렸을 때'를 포착하여, "
+        "**AI 스나이퍼 전략(조건 만족 전부 매수 & 보수적 손절)** 기준으로 해석합니다. "
+        "점수가 높더라도 본인의 투자 원칙과 병행하여 사용하시기 바랍니다."
+    )
