@@ -76,10 +76,10 @@ SEARCH_MAP = {f"{name} ({code})": code for code, name in TICKER_MAP.items()}
 USER_WATCHLIST = list(TICKER_MAP.keys())
 
 # ---------------------------------------------------------
-# 2. 데이터 수집 (네이버 금융 크롤링 + YF Fast Info)
+# 2. 데이터 수집 (After Market / Realtime)
 # ---------------------------------------------------------
 def fetch_kr_realtime(ticker):
-    """한국 주식 실시간 가격 크롤링 (네이버 금융)"""
+    """한국 주식: 네이버 금융 실시간 크롤링"""
     try:
         code = ticker.split('.')[0]
         url = f"https://finance.naver.com/item/sise.naver?code={code}"
@@ -89,69 +89,82 @@ def fetch_kr_realtime(ticker):
         price_str = soup.select_one('#_nowVal').text.replace(',', '')
         return (ticker, float(price_str))
     except:
-        try:
-            df = fdr.DataReader(ticker.split('.')[0], '2023-01-01')
-            if not df.empty:
-                return (ticker, float(df['Close'].iloc[-1]))
-        except:
-            pass
         return (ticker, None)
 
 def fetch_us_realtime(ticker):
-    """미국 주식: 실시간/애프터마켓 가격 (fast_info)"""
+    """
+    미국 주식: 정규장/프리장/애프터마켓 가격 (우선순위 로직)
+    """
     try:
-        price = yf.Ticker(ticker).fast_info['last_price']
+        # yfinance info 객체를 통해 정밀 데이터 조회
+        t = yf.Ticker(ticker)
+        # fast_info는 빠르지만 postMarket 정보가 없을 수 있음 -> info 사용 (느려도 정확)
+        # 하지만 스피드를 위해 fast_info + info 조합 고려
+        # 여기서는 정확도를 위해 info를 호출하되, 없으면 fast_info last_price 사용
+        
+        # info 호출은 네트워크 비용이 큼. 꼭 필요한 포트폴리오 탭에서만 사용하도록 설계
+        # 병렬 처리 안에서 호출되므로 괜찮음
+        
+        info = t.info
+        
+        # 1순위: Post Market Price (애프터마켓)
+        price = info.get('postMarketPrice')
+        
+        # 2순위: Regular Market Price (정규장 종가/현재가)
+        if price is None:
+            price = info.get('regularMarketPrice')
+            
+        # 3순위: Current Price (일반 현재가)
+        if price is None:
+            price = info.get('currentPrice')
+            
+        # 최후의 수단: fast_info
+        if price is None:
+            price = t.fast_info.get('last_price')
+            
         return (ticker, price)
     except:
         return (ticker, None)
 
 def fetch_history_data(ticker):
-    """지표 분석용 과거 데이터 (2년치) - 안전한 데이터 평탄화 적용"""
+    """지표 분석용 과거 데이터 (2년치)"""
     try:
         if ticker.endswith('.KS') or ticker.endswith('.KQ'):
             df = fdr.DataReader(ticker.split('.')[0], '2023-01-01')
         else:
             df = yf.download(ticker, period="2y", progress=False)
-            
-            # [안전장치 1] MultiIndex 평탄화 (값 손실 없이 구조만 단순화)
             if isinstance(df.columns, pd.MultiIndex):
-                # 레벨 1(Ticker)이 있다면 제거, 없다면 레벨 0 유지
-                try:
-                    df.columns = df.columns.droplevel(1)
-                except:
-                    pass
-            
-            # [안전장치 2] 중복 컬럼 제거 (Close가 두 개 생기는 버그 방지)
+                try: df.columns = df.columns.droplevel(1)
+                except: pass
             df = df.loc[:, ~df.columns.duplicated()]
-
-            # [안전장치 3] 컬럼명 표준화
             if 'Close' not in df.columns and 'Adj Close' in df.columns:
                 df['Close'] = df['Adj Close']
-                
         return (ticker, df)
     except:
         return (ticker, None)
 
-@st.cache_data(ttl=5) # 5초 캐시
+@st.cache_data(ttl=0) # 캐시 없음 (항상 최신)
 def get_hybrid_data_v3(tickers_list):
-    """실시간 가격(크롤링/FastInfo) + 과거 차트 데이터 병합"""
     kr_tickers = [t for t in tickers_list if t.endswith('.KS') or t.endswith('.KQ')]
     us_tickers = [t for t in tickers_list if t not in kr_tickers]
     
     final_dfs = {} 
+    realtime_map = {}
 
     with concurrent.futures.ThreadPoolExecutor() as executor:
+        # 1. 실시간 가격 (KR: 크롤링, US: Info 정밀조회)
         future_realtime = []
         for t in kr_tickers:
             future_realtime.append(executor.submit(fetch_kr_realtime, t))
         for t in us_tickers:
             future_realtime.append(executor.submit(fetch_us_realtime, t))
             
+        # 2. 히스토리
         future_history = []
         for t in tickers_list:
             future_history.append(executor.submit(fetch_history_data, t))
             
-        realtime_map = {}
+        # 수집
         for f in concurrent.futures.as_completed(future_realtime):
             tk, price = f.result()
             if price is not None: realtime_map[tk] = price
@@ -161,18 +174,17 @@ def get_hybrid_data_v3(tickers_list):
             tk, df = f.result()
             if df is not None and not df.empty: history_map[tk] = df
 
+    # 병합
     for t in tickers_list:
         if t in history_map:
             df = history_map[t].copy()
-            
-            # 분석 전 데이터 컬럼 재확인
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
                 
             if t in realtime_map:
                 latest_price = realtime_map[t]
                 if 'Close' in df.columns:
-                    # 마지막 종가를 실시간 가격으로 덮어씀 (분석 정확도 향상)
+                    # 마지막 종가를 실시간(애프터마켓) 가격으로 교체
                     df.iloc[-1, df.columns.get_loc('Close')] = latest_price
             final_dfs[t] = df
 
@@ -182,7 +194,6 @@ def calculate_indicators(df):
     if len(df) < 60: return None
     df = df.copy()
     
-    # [안전장치 4] Series인지 DataFrame인지 확인하여 단일 컬럼 보장
     if isinstance(df, pd.DataFrame) and 'Close' in df.columns:
         if isinstance(df['Close'], pd.DataFrame):
             close_series = df['Close'].iloc[:, 0]
@@ -228,7 +239,10 @@ def calculate_total_profit(ticker, avg_price, current_price, quantity):
     total_buy = avg_price * quantity
     raw_eval = current_price * quantity
     total_fee = raw_eval * fee_tax_rate
+    
+    # 세후 총 평가금 (예상 수령액)
     net_eval = raw_eval - total_fee
+    
     net_profit_amt = net_eval - total_buy
     
     if total_buy > 0:
@@ -245,13 +259,9 @@ def calculate_total_profit(ticker, avg_price, current_price, quantity):
         "currency": currency
     }
 
-# ---------------------------------------------------------
-# 3. 전략 분석 (안전한 타입 변환 적용)
-# ---------------------------------------------------------
 def analyze_advanced_strategy(df):
     if df is None or df.empty: return "분석 불가", "gray", "데이터 부족", 0
     
-    # [안전장치 5] float() 강제 형변환으로 모호성 제거 (ValueError 해결)
     try:
         curr = float(df['Close_Calc'].iloc[-1])
         ma20 = float(df['MA20'].iloc[-1])
@@ -476,7 +486,7 @@ with tab2:
         if pf_data:
             st.subheader(f"{user_id}님의 보유 종목 진단")
             my_tickers = [p['ticker'] for p in pf_data]
-            with st.spinner("실시간 시세 조회 중... (국내:네이버크롤링, 해외:YF)"):
+            with st.spinner("실시간 시세 조회 중... (국내:네이버크롤링, 해외:YF Info)"):
                 raw_data_dict, _ = get_hybrid_data_v3(my_tickers)
             
             display_list = []
@@ -526,21 +536,28 @@ with tab2:
             for item in display_list:
                 with st.container():
                     c1, c2, c3 = st.columns([1.5, 1.5, 4])
-                    sym = item['currency'] # 역슬래시 제거
+                    sym = item['currency'] # 역슬래시 완전히 제거
                     
                     with c1:
                         st.markdown(f"### {item['name']}")
                         st.caption(f"{item['tk']} | 보유: {item['qty']}주")
                         
                     with c2:
-                        fmt_curr = f"{item['curr']:,.0f}" if item['currency'] == "₩" else f"{item['curr']:,.2f}"
-                        fmt_avg = f"{item['avg']:,.0f}" if item['currency'] == "₩" else f"{item['avg']:,.2f}"
-                        fmt_profit = f"{item['profit_amt']:,.0f}" if item['currency'] == "₩" else f"{item['profit_amt']:,.2f}"
-                        fmt_eval = f"{item['eval_amt']:,.0f}" if item['currency'] == "₩" else f"{item['eval_amt']:,.2f}"
+                        # 폰트 깨짐 방지를 위해 포맷팅 명확화
+                        if sym == "₩":
+                            fmt_curr = f"{item['curr']:,.0f}"
+                            fmt_avg = f"{item['avg']:,.0f}"
+                            fmt_profit = f"{item['profit_amt']:,.0f}"
+                            fmt_eval = f"{item['eval_amt']:,.0f}"
+                        else:
+                            fmt_curr = f"{item['curr']:,.2f}"
+                            fmt_avg = f"{item['avg']:,.2f}"
+                            fmt_profit = f"{item['profit_amt']:,.2f}"
+                            fmt_eval = f"{item['eval_amt']:,.2f}"
                         
                         st.metric("총 순수익 (수수료 제)", f"{item['profit_pct']:.2f}%", delta=f"{sym}{fmt_profit}")
                         
-                        st.markdown(f"**세후 총 평가금:** {sym}{fmt_eval}")
+                        st.markdown(f"**세후 총 평가금(예상 수령액):** {sym}{fmt_eval}")
                         st.markdown(f"<small style='color: gray'>평단: {sym}{fmt_avg} / 현재: {sym}{fmt_curr}</small>", unsafe_allow_html=True)
                         
                     with c3:
@@ -556,21 +573,11 @@ with tab2:
 with tab3:
     st.markdown("## 📘 AI 투자 전략 알고리즘 상세 백서 (Whitepaper)")
     st.markdown("단순한 지표 합산이 아닌, **'수익은 길게, 손실은 짧게'** 가져가는 프로 트레이더의 로직을 구현했습니다.")
-    
     st.divider()
-    
-    st.header("1. 🧠 핵심 평가 로직 (5-Factor Model)")
-    with st.expander("① 추세 (Trend)", expanded=True):
-        st.markdown("* **60일선/20일선:** 주가가 이 위에 있으면 상승장으로 봅니다. (+15점)")
-    with st.expander("② 지지 & 저점 (Support)", expanded=True):
-        st.markdown("* **황금 눌림목:** 상승 추세 중 20일선 근접 시 가장 강력한 매수 신호입니다. (+25점)")
-    
-    st.divider()
-    
-    st.header("2. 🚦 AI 판단 등급표")
-    grade_data = {
-        "점수": ["80~100", "60~79", "41~59", "21~40", "0~20"],
-        "등급": ["🚀 강력 매수", "📈 매수", "👀 관망", "📉 매도", "💥 강력 매도"],
-        "설명": ["모든 지표가 상승. 적극 매수", "상승 추세 혹은 반등 시작", "방향성 탐색 중", "하락 반전 혹은 과열", "하락 가속화. 위험"]
-    }
-    st.table(pd.DataFrame(grade_data))
+    st.subheader("1. 💯 점수 산정 로직 (Total 100점)")
+    score_table = pd.DataFrame({
+        "평가 요소": ["추세 (Trend)", "지지 (Support)", "모멘텀 (Momentum)", "거래량 (Volume)", "리스크 (Risk)"],
+        "내용": ["60일선/20일선 위에 있는가?", "싸게 살 수 있는 자리인가? (눌림목/볼린저 하단)", "상승 에너지가 강한가? (MACD)", "세력이 들어왔는가?", "너무 비싸진 않은가? (과열)"],
+        "배점": ["±15~25점", "+15~25점 (가산점)", "±15점", "+10점", "±10~20점"]
+    })
+    st.table(score_table)
