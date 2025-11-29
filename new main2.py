@@ -537,24 +537,14 @@ with tab1:
             # 기본 필터링: 70점 이상
             base_df = st.session_state['scan_result_df'][st.session_state['scan_result_df']['점수'] >= 70]
             
-            # ★ 100점 만점 종목 과다 시 Top 5 추천 로직
-            perfect_candidates = base_df[base_df['점수'] >= 100]
+            # 1. 점수(내림차순) 우선, 동점일 경우 Vol_Ratio(내림차순) 정렬
+            # 이렇게 하면 100점 종목들이 가장 위에 오고, 그 안에서도 거래량 비율이 높은 순서로 정렬됨
+            display_df = base_df.sort_values(by=['점수', 'Vol_Ratio'], ascending=[False, False])
             
-            display_df = base_df # 기본값
-            
-            if len(perfect_candidates) > 5:
-                st.toast(f"💎 100점 만점 종목이 {len(perfect_candidates)}개 발견되었습니다!", icon="🔥")
-                st.info(f"💡 **AI 추천:** 100점 종목이 너무 많아, 거래량 급증(Volume Ratio)이 가장 강력한 **상위 5개**를 엄선했습니다.")
-                
-                # 1. 100점짜리 중 Vol_Ratio(거래량 비율)가 높은 순으로 5개 선정
-                top5_perfect = perfect_candidates.sort_values(by='Vol_Ratio', ascending=False).head(5)
-                
-                # 2. 100점 미만 70점 이상 종목들은 그대로 유지
-                others = base_df[base_df['점수'] < 100]
-                
-                # 3. 데이터프레임 재구성
-                display_df = pd.concat([top5_perfect, others])
-                display_df = display_df.sort_values(by=['점수', 'Vol_Ratio'], ascending=[False, False])
+            perfect_count = len(display_df[display_df['점수'] >= 100])
+            if perfect_count > 5:
+                 st.toast(f"💎 100점 만점 종목이 {perfect_count}개 발견되었습니다!", icon="🔥")
+                 st.info(f"💡 **AI 추천:** 100점 종목이 많아, **거래량 급증(Volume Ratio)** 순으로 정렬하여 상위에 배치했습니다. (전체 목록 표시 중)")
             
             count = len(display_df)
             
