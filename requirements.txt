@@ -3,4 +3,7 @@ pandas
 numpy
 plotly
 yfinance
+finance-datareader
+bs4
+lxml
 firebase-admin
