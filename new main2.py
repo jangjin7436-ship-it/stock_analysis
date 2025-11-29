@@ -189,7 +189,7 @@ def get_precise_data(tickers_list):
     return hist_map, realtime_map
 
 # ---------------------------------------------------------
-# 3. 분석 엔진 (오류 수정 및 스나이퍼 로직 적용)
+# 3. 분석 엔진
 # ---------------------------------------------------------
 
 def calculate_indicators(df, realtime_price=None):
@@ -326,7 +326,6 @@ def get_ai_score_row(row):
 def analyze_advanced_strategy(df):
     """
     [AI 스나이퍼 매수 진입 판단]
-    - 70점 이상이면 매수
     """
     if df is None or df.empty:
         return "분석 불가", "gray", "데이터 부족", 0.0
@@ -378,47 +377,31 @@ def analyze_advanced_strategy(df):
     return cat, col, reasoning, round(score, 3)
 
 # ---------------------------------------------------------
-# ★ [NEW] AI 스나이퍼 전용 매도/홀딩 판단 로직
+# 매도/홀딩 판단 로직
 # ---------------------------------------------------------
 def get_sell_advice(df, buy_price, buy_date_str):
-    """
-    [AI 스나이퍼 매도 전략 구현]
-    1. 손절 (Stop Loss): -3.0% 이하 시 즉시 매도
-    2. 타임컷 (Time Cut): 14일 경과 시 무조건 매도
-    3. 트레일링 스탑 (Trailing Stop):
-       - 최고 수익률이 +5% 미만일 땐 홀딩 (작은 흔들림 무시)
-       - 최고 수익률이 +5% 이상 도달 시 발동 -> 고점 대비 -3% 하락 시 익절
-    4. 추세 이탈: AI 점수 40점 미만 시 매도
-    """
     if df is None or df.empty:
         return "분석 대기", "gray", "데이터 부족"
 
     try:
-        # 1. 현재 데이터 추출
         row = df.iloc[-1]
-        curr_price = get_scalar(row['Close_Calc']) # 현재가
-        score = get_ai_score_row(row) # 현재 AI 점수
+        curr_price = get_scalar(row['Close_Calc']) 
+        score = get_ai_score_row(row) 
         
-        # 2. 보유 기간 및 '매수 이후 최고가' 계산
         buy_date = pd.to_datetime(buy_date_str).date()
         today = datetime.date.today()
         held_days = (today - buy_date).days
         
-        # 매수일 이후의 데이터만 필터링하여 '보유 기간 중 최고가' 찾기
-        # df의 인덱스는 datetime이어야 함
         df_held = df[df.index.date >= buy_date]
         
         if not df_held.empty:
-            # 보수적으로 고가(High)가 아닌 종가(Close) 기준 최고가 사용 (꼬리 매도 방지)
             max_price_since_buy = df_held['Close_Calc'].max()
         else:
-            max_price_since_buy = curr_price # 데이터 없으면 현재가가 최고가
+            max_price_since_buy = curr_price 
 
-        # 3. 수익률 지표 계산
         cur_profit_pct = (curr_price - buy_price) / buy_price * 100
         max_profit_pct = (max_price_since_buy - buy_price) / buy_price * 100
         
-        # 고점 대비 하락률 (Drawdown)
         if max_price_since_buy > 0:
             drawdown_from_peak = (curr_price - max_price_since_buy) / max_price_since_buy
         else:
@@ -427,35 +410,22 @@ def get_sell_advice(df, buy_price, buy_date_str):
     except Exception as e:
         return "계산 오류", "gray", f"날짜/가격 정보 확인 필요 ({e})"
 
-    # =========================================================
-    # [판단 로직] 우선순위 순서대로 검사
-    # =========================================================
-
-    # 1. ⚡ 칼손절 (Stop Loss): -3% (계좌 방어 최우선)
+    # 판단 로직
     if cur_profit_pct <= -3.0:
         return "⚡ 칼손절 (-3%)", "red", f"손절 원칙 도달(현재 {cur_profit_pct:.1f}%). 즉시 자르세요."
 
-    # 2. ⏱️ 타임컷 (Time Cut): 14일 (무조건 탈출)
     if held_days >= 14:
         return "⏱️ 타임컷 매도", "orange", f"보유 14일 경과(현재 {held_days}일). 원칙대로 전량 매도."
 
-    # 3. 📉 트레일링 스탑 (Trailing Stop) - 수익 극대화 로직
-    # 조건 A: 수익이 한 번이라도 +5%를 넘었는가?
     if max_profit_pct >= 5.0:
-        # 조건 B: 고점 대비 -3% 이상 빠졌는가?
         if drawdown_from_peak <= -0.03:
             return "📉 트레일링 익절", "orange", f"최고점({max_profit_pct:.1f}%) 찍고 -3% 하락. 이익 확정하세요."
         else:
-            # 5%는 넘었지만 아직 추세가 안 꺾임 -> 더 길게 먹기 위해 홀딩
             return "💎 슈퍼 홀딩 (Riding)", "green", f"수익 극대화 중! (현재 +{cur_profit_pct:.1f}% / 고점 대비 {drawdown_from_peak*100:.1f}%)"
 
-    # 4. 📉 추세 이탈 (Trend Break)
-    # 수익도 별로 없는데(-3% ~ +5% 사이), 점수가 40점 밑으로 박살나면 매도
     if score < 40:
         return "📉 추세 이탈", "red", f"AI 점수 급락({score:.0f}점). 상승 동력 상실."
 
-    # 5. 기본 상태: 홀딩 (Waiting)
-    # 아직 +5% 목표 달성 전이고, 손절가 위에서 버티는 구간
     return "⏳ 홀딩 (Waiting)", "blue", f"목표 +5% 대기 중. (현재 {cur_profit_pct:.1f}% / 보유 {held_days}일)"
 
 def calculate_total_profit(ticker, avg_price, current_price, quantity):
@@ -523,7 +493,7 @@ with tab1:
 
                         final_price = float(df_indi['Close_Calc'].iloc[-1])
                         rsi_val = float(df_indi['RSI'].iloc[-1])
-                        # ★ 정렬을 위한 MACD Histogram 값 추출 (추가된 부분)
+                        # ★ 정렬용 모멘텀 데이터
                         macd_hist_val = float(df_indi['MACD_Hist'].iloc[-1])
 
                         name = TICKER_MAP.get(ticker_code, ticker_code)
@@ -538,7 +508,7 @@ with tab1:
                             "RSI": rsi_val,
                             "AI 등급": cat,
                             "핵심 요약": reasoning,
-                            "MACD_Hist": macd_hist_val  # 내부 정렬용 데이터
+                            "MACD_Hist": macd_hist_val  # 필수 추가
                         })
                     except: 
                         continue
@@ -546,7 +516,6 @@ with tab1:
                 
                 if scan_results:
                     df_res = pd.DataFrame(scan_results)
-                    # 기본 정렬: 점수 내림차순
                     df_res = df_res.sort_values('점수', ascending=False)
                     st.session_state['scan_result_df'] = df_res
                     st.success("스캔 완료! 70점 이상인 종목들을 확인하세요.")
@@ -555,51 +524,58 @@ with tab1:
                     st.error("데이터 수집 실패.")
     
     if st.session_state['scan_result_df'] is not None:
-        # 기본 필터링: 70점 이상
-        base_df = st.session_state['scan_result_df'][st.session_state['scan_result_df']['점수'] >= 70]
+        # ★ [오류 수정 핵심] 기존 세션 데이터에 MACD_Hist가 없는 경우 자동 재설정
+        if 'MACD_Hist' not in st.session_state['scan_result_df'].columns:
+            st.warning("⚠️ 데이터 업데이트가 필요하여 재스캔을 준비합니다...")
+            st.session_state['scan_result_df'] = None
+            time.sleep(1)
+            st.rerun()
         
-        # ★ [NEW] 100점 만점 종목 과다 시 Top 5 추천 로직
-        perfect_candidates = base_df[base_df['점수'] >= 100]
-        
-        display_df = base_df # 기본적으로 전체 표시
-        
-        if len(perfect_candidates) > 5:
-            st.toast(f"💎 100점 만점 종목이 {len(perfect_candidates)}개 발견되었습니다!", icon="🔥")
-            st.info(f"💡 **AI 추천:** 100점 종목이 너무 많아, 상승 에너지(MACD 가속도)가 가장 폭발적인 **상위 5개**를 엄선했습니다.")
-            
-            # 1. 100점짜리 중 MACD_Hist(상승 에너지)가 높은 순으로 5개 자름
-            top5_perfect = perfect_candidates.sort_values(by='MACD_Hist', ascending=False).head(5)
-            
-            # 2. 100점 미만 70점 이상 종목들은 그대로 유지
-            others = base_df[base_df['점수'] < 100]
-            
-            # 3. 합쳐서 보여줄 데이터프레임 재구성
-            display_df = pd.concat([top5_perfect, others])
-            display_df = display_df.sort_values(by=['점수', 'MACD_Hist'], ascending=[False, False])
-            
-        
-        count = len(display_df)
-        
-        if count > 0:
-            st.markdown(f"✨ **매수 추천 리스트 ({count}개)**")
         else:
-            st.warning("현재 매수 조건을 만족하는 종목이 없습니다. (관망 권장)")
-        
-        st.dataframe(
-            display_df,
-            use_container_width=True,
-            height=700,
-            column_config={
-                "종목명": st.column_config.TextColumn("종목명 (코드)", width="medium"),
-                "점수": st.column_config.ProgressColumn("AI 점수", format="%.1f점", min_value=0, max_value=100),
-                "현재가": st.column_config.TextColumn("현재가"), 
-                "RSI": st.column_config.NumberColumn("RSI", format="%.1f"),
-                "AI 등급": st.column_config.TextColumn("AI 판단"),
-                "핵심 요약": st.column_config.TextColumn("분석 내용", width="large"),
-                "MACD_Hist": st.column_config.NumberColumn("모멘텀 에너지", format="%.2f"), # 정렬 기준 보여주기
-            },
-            hide_index=True
-        )
+            # 기본 필터링: 70점 이상
+            base_df = st.session_state['scan_result_df'][st.session_state['scan_result_df']['점수'] >= 70]
+            
+            # ★ 100점 만점 종목 과다 시 Top 5 추천 로직
+            perfect_candidates = base_df[base_df['점수'] >= 100]
+            
+            display_df = base_df # 기본값
+            
+            if len(perfect_candidates) > 5:
+                st.toast(f"💎 100점 만점 종목이 {len(perfect_candidates)}개 발견되었습니다!", icon="🔥")
+                st.info(f"💡 **AI 추천:** 100점 종목이 너무 많아, 상승 에너지(MACD 가속도)가 가장 폭발적인 **상위 5개**를 엄선했습니다.")
+                
+                # 1. 100점짜리 중 MACD_Hist(상승 에너지)가 높은 순으로 5개 선정
+                top5_perfect = perfect_candidates.sort_values(by='MACD_Hist', ascending=False).head(5)
+                
+                # 2. 100점 미만 70점 이상 종목들은 그대로 유지
+                others = base_df[base_df['점수'] < 100]
+                
+                # 3. 데이터프레임 재구성
+                display_df = pd.concat([top5_perfect, others])
+                display_df = display_df.sort_values(by=['점수', 'MACD_Hist'], ascending=[False, False])
+            
+            count = len(display_df)
+            
+            if count > 0:
+                st.markdown(f"✨ **매수 추천 리스트 ({count}개)**")
+            else:
+                st.warning("현재 매수 조건을 만족하는 종목이 없습니다. (관망 권장)")
+            
+            st.dataframe(
+                display_df,
+                use_container_width=True,
+                height=700,
+                column_config={
+                    "종목명": st.column_config.TextColumn("종목명 (코드)", width="medium"),
+                    "점수": st.column_config.ProgressColumn("AI 점수", format="%.1f점", min_value=0, max_value=100),
+                    "현재가": st.column_config.TextColumn("현재가"), 
+                    "RSI": st.column_config.NumberColumn("RSI", format="%.1f"),
+                    "AI 등급": st.column_config.TextColumn("AI 판단"),
+                    "핵심 요약": st.column_config.TextColumn("분석 내용", width="large"),
+                    "MACD_Hist": st.column_config.NumberColumn("에너지(Momentum)", format="%.2f"),
+                },
+                hide_index=True
+            )
 
 # TAB 2: 포트폴리오
 with tab2:
@@ -710,7 +686,6 @@ with tab2:
                 
                 if df_indi is not None:
                     curr = float(df_indi['Close_Calc'].iloc[-1])
-                    # ★ 매도 조언 함수 호출
                     action, color, advice = get_sell_advice(df_indi, avg, b_date)
                 else:
                     action, color, advice = "데이터 로딩 중", "gray", "잠시 후 다시 시도"
@@ -731,7 +706,6 @@ with tab2:
                         "currency": "$" if not tk.endswith(".KS") else "₩"
                     })
             
-            # Action 급한 순서로 정렬 (매도 > 관망)
             priority = {"⚡ 칼손절 (-3%)": 0, "⏱️ 타임컷 매도": 1, "📉 트레일링 익절": 2, "📉 추세 이탈": 3, "💎 슈퍼 홀딩 (Riding)": 4, "⏳ 홀딩 (Waiting)": 5}
             display_list.sort(key=lambda x: priority.get(x['action'], 99))
 
@@ -760,7 +734,6 @@ with tab2:
                         )
                         
                     with c3:
-                        # 매도 액션 강조
                         st.markdown(f"##### AI 추천: :{item['color']}[{item['action']}]")
                         st.info(f"{item['advice']}")
                         
