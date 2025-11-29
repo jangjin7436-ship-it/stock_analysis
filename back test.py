@@ -1,28 +1,28 @@
 import streamlit as st
-import yfinance as yf
 import pandas as pd
+import yfinance as yf
 import numpy as np
+import plotly.express as px
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+from concurrent.futures import ThreadPoolExecutor
 
-# ---------------------------------------------------------
-# [기존 코드 재사용] 지표 계산 함수
-# ---------------------------------------------------------
+# =========================================================
+# 1. 백테스트용 로직 분리 (기존 로직을 Row 단위로 변환)
+# =========================================================
+
 def calculate_indicators_for_backtest(df):
-    """
-    백테스트용 지표 계산 (기존 로직과 동일하되 전체 DF 반환)
-    """
+    """지표 계산 (기존 함수 재활용 및 최적화)"""
     df = df.copy()
     
-    # 수정 종가 사용
+    # 수정 종가 사용 (yfinance 데이터 대응)
     col = 'Adj Close' if 'Adj Close' in df.columns else 'Close'
     df['Close_Calc'] = df[col]
 
-    # 이동평균
+    # 기술적 지표 계산
     df['MA5'] = df['Close_Calc'].rolling(5).mean()
     df['MA20'] = df['Close_Calc'].rolling(20).mean()
     df['MA60'] = df['Close_Calc'].rolling(60).mean()
-
+    
     # RSI
     delta = df['Close_Calc'].diff()
     gain = delta.where(delta > 0, 0)
@@ -37,26 +37,19 @@ def calculate_indicators_for_backtest(df):
     exp26 = df['Close_Calc'].ewm(span=26, adjust=False).mean()
     df['MACD'] = exp12 - exp26
     df['Signal_Line'] = df['MACD'].ewm(span=9, adjust=False).mean()
-    
-    # MACD 히스토그램 및 전일 대비 증감 (로직 구현을 위해 shift 사용)
     df['MACD_Hist'] = df['MACD'] - df['Signal_Line']
-    df['Prev_MACD_Hist'] = df['MACD_Hist'].shift(1) # 전일 히스토그램
-
-    # 볼린저밴드 관련 (STD20)
+    
+    # 전일 히스토그램 (상승 반전 확인용)
+    df['Prev_MACD_Hist'] = df['MACD_Hist'].shift(1)
+    
+    # 변동성 및 모멘텀
     df['STD20'] = df['Close_Calc'].rolling(20).std()
     
-    # 모멘텀
-    df['MOM10'] = df['Close_Calc'].pct_change(10)
-
     return df.dropna()
 
-# ---------------------------------------------------------
-# [핵심] 점수 계산 로직 (Row-by-Row 적용을 위해 변환)
-# ---------------------------------------------------------
-def get_score_from_row(row):
+def get_ai_score_row(row):
     """
-    DataFrame의 한 행(row)을 받아 점수를 반환하는 함수
-    (사용자의 analyze_advanced_strategy 로직을 행 단위로 분해)
+    한 행(하루치 데이터)에 대해 AI 점수(0~100)를 계산
     """
     try:
         curr = row['Close_Calc']
@@ -65,221 +58,277 @@ def get_score_from_row(row):
         macd, sig = row['MACD'], row['Signal_Line']
         std20 = row['STD20']
         
-        # 🟢 기본 점수
         score = 50.0
 
-        # 1. 추세 (Trend)
+        # 1. 추세
         if curr > ma60:
             score += 10
-            divergence_60 = (curr - ma60) / ma60
-            if 0 < divergence_60 < 0.15:
-                score += divergence_60 * 33
-            else:
-                score += 2
+            div = (curr - ma60) / ma60
+            score += (div * 33) if 0 < div < 0.15 else 2
         else:
-            score -= 20 # 역배열 감점
-
-        if ma5 > ma20 > ma60: score += 10 # 정배열
+            score -= 20
+        
+        if ma5 > ma20 > ma60: score += 10
         elif ma20 > ma60: score += 5
 
-        # 2. 위치 & 눌림목
-        dist_ma20 = (curr - ma20) / ma20
-        abs_dist = abs(dist_ma20)
-
-        if curr > ma60 and abs_dist <= 0.03: # 황금 눌림목
-            proximity_score = 20 * (1 - (abs_dist / 0.03))
-            score += proximity_score
-        elif curr > ma60 and 0.03 < dist_ma20 <= 0.08:
+        # 2. 눌림목
+        dist = (curr - ma20) / ma20
+        abs_dist = abs(dist)
+        if curr > ma60 and abs_dist <= 0.03:
+            score += 20 * (1 - (abs_dist / 0.03))
+        elif curr > ma60 and 0.03 < dist <= 0.08:
             score += 5
-        elif dist_ma20 > 0.10: # 과열
+        elif dist > 0.10: # 과열
             score -= 15
-
+            
         # 3. RSI
-        if 40 <= rsi <= 60:
-            score += 10 + ((rsi - 40) * 0.1)
-        elif 30 <= rsi < 40:
-            score += 5 + ((40 - rsi) * 0.5)
-        elif 60 < rsi <= 70:
-            score += 8
-        elif rsi < 30: # 과매도
-            score += 15
-        elif rsi > 70: # 과매수
-            score -= 15
-
+        if 40 <= rsi <= 60: score += 10 + ((rsi-40)*0.1)
+        elif rsi < 30: score += 15
+        elif rsi > 70: score -= 15
+        elif 60 < rsi <= 70: score += 8
+        
         # 4. MACD
-        macd_hist = row['MACD_Hist']
         if macd > sig:
             score += 5
-            hist_bonus = min(5.0, (macd_hist / curr) * 1000) if curr > 0 else 0
-            score += hist_bonus
-            # 상승 에너지 확대 (전일 대비 히스토그램 증가)
-            if macd_hist > 0 and macd_hist > row['Prev_MACD_Hist']:
-                score += 2 # 가산점 (임의 부여)
+            if row['MACD_Hist'] > 0 and row['MACD_Hist'] > row['Prev_MACD_Hist']:
+                score += 2
         else:
             score -= 5
-
+            
         # 5. 변동성 페널티
         vol_ratio = std20 / curr if curr > 0 else 0
-        if vol_ratio > 0.05:
-            score -= (vol_ratio * 100)
-
+        if vol_ratio > 0.05: score -= (vol_ratio * 100)
+        
         return max(0.0, min(100.0, score))
     except:
         return 0.0
 
-# ---------------------------------------------------------
-# [백테스트] 시뮬레이션 엔진
-# ---------------------------------------------------------
-def run_backtest(ticker, period="1y", initial_capital=10000000):
-    # 1. 데이터 다운로드
+# =========================================================
+# 2. 개별 종목 백테스트 엔진
+# =========================================================
+def run_single_stock_backtest(ticker, name, start_date="2023-01-01", initial_capital=1000000, strategy_mode="Basic"):
+    """
+    strategy_mode: "Basic" (기본 65/45) 또는 "SuperLocking" (슈퍼 락킹)
+    """
     try:
-        df = yf.download(ticker, period=period, progress=False, auto_adjust=True)
-        if df.empty: return None, "데이터 없음"
-        
-        # MultiIndex 컬럼 평탄화 (yfinance 최신버전 이슈 대응)
+        # 데이터 수집
+        df = yf.download(ticker, start=start_date, progress=False, auto_adjust=True)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
+            
+        if len(df) < 60: return None
+
+        # 지표 및 AI 점수 계산
+        df = calculate_indicators_for_backtest(df)
+        df['AI_Score'] = df.apply(get_ai_score_row, axis=1)
+
+        # 시뮬레이션 변수
+        balance = initial_capital
+        shares = 0
+        avg_price = 0
+        trades = []
+        
+        # 슈퍼 락킹 모드 전용 변수
+        locking_mode = False  # 모드 발동 여부
+        max_price_in_mode = 0 # 모드 진입 후 최고가
+        
+        # 수수료 설정
+        fee_buy = 0.00015 if ".KS" in ticker else 0.001
+        fee_sell = 0.003 if ".KS" in ticker else 0.001
+
+        for date, row in df.iterrows():
+            price = row['Close_Calc']
+            score = row['AI_Score']
+            
+            # -----------------------------------------------
+            # [전략 1] 기본 AI 전략 (Basic)
+            # -----------------------------------------------
+            if strategy_mode == "Basic":
+                # 매수: 65점 이상 & 미보유
+                if score >= 65 and shares == 0:
+                    can_buy = int(balance / (price * (1 + fee_buy)))
+                    if can_buy > 0:
+                        shares = can_buy
+                        balance -= shares * price * (1 + fee_buy)
+                        avg_price = price
+                        trades.append({'date': date, 'type': 'buy', 'price': price, 'score': score, 'reason': 'AI 65↑'})
+
+                # 매도: 45점 이하 & 보유 중
+                elif score <= 45 and shares > 0:
+                    return_amt = shares * price * (1 - fee_sell)
+                    balance += return_amt
+                    profit_pct = (price - avg_price) / avg_price * 100
+                    trades.append({'date': date, 'type': 'sell', 'price': price, 'score': score, 'profit': profit_pct, 'reason': 'AI 45↓'})
+                    shares = 0
+                    avg_price = 0
+
+            # -----------------------------------------------
+            # [전략 2] 슈퍼 락킹 전략 (SuperLocking)
+            # -----------------------------------------------
+            elif strategy_mode == "SuperLocking":
+                # A. 매수: 80점 이상 (강력 매수) & 미보유
+                if score >= 80 and shares == 0:
+                    can_buy = int(balance / (price * (1 + fee_buy)))
+                    if can_buy > 0:
+                        shares = can_buy
+                        balance -= shares * price * (1 + fee_buy)
+                        avg_price = price
+                        
+                        # 모드 초기화
+                        locking_mode = False
+                        max_price_in_mode = 0
+                        trades.append({'date': date, 'type': 'buy', 'price': price, 'score': score, 'reason': 'Strong Buy(80↑)'})
+                
+                # B. 보유 중 관리
+                elif shares > 0:
+                    curr_return = (price - avg_price) / avg_price
+                    
+                    # 1. 락킹 모드 발동 체크 (평단 대비 +3% 이상)
+                    if not locking_mode and curr_return >= 0.03:
+                        locking_mode = True
+                        max_price_in_mode = price # 발동 시점 가격을 일단 최고가로 설정
+                    
+                    # 2. 모드 상태별 로직
+                    if locking_mode:
+                        # 모드 ON: 고점 갱신 확인
+                        if price > max_price_in_mode:
+                            max_price_in_mode = price
+                        
+                        # 모드 ON: 고점 대비 -2% 하락 시 매도 (익절)
+                        threshold_price = max_price_in_mode * 0.98
+                        if price <= threshold_price:
+                            return_amt = shares * price * (1 - fee_sell)
+                            balance += return_amt
+                            profit_pct = (price - avg_price) / avg_price * 100
+                            trades.append({'date': date, 'type': 'sell', 'price': price, 'score': score, 'profit': profit_pct, 'reason': '💎 Locking Trailing'})
+                            shares = 0
+                            locking_mode = False
+                            
+                    else:
+                        # 모드 OFF (아직 +3% 못감): AI 점수 45 이하면 방어적 매도 (손절/본전)
+                        # *주의: 3% 가기 전에 폭락하면 팔아야 하므로 최소한의 안전장치
+                        if score <= 45:
+                            return_amt = shares * price * (1 - fee_sell)
+                            balance += return_amt
+                            profit_pct = (price - avg_price) / avg_price * 100
+                            trades.append({'date': date, 'type': 'sell', 'price': price, 'score': score, 'profit': profit_pct, 'reason': 'Defense(45↓)'})
+                            shares = 0
+
+        # 최종 평가금 계산
+        final_price = df['Close_Calc'].iloc[-1]
+        final_equity = balance + (shares * final_price)
+        total_return = (final_equity - initial_capital) / initial_capital * 100
+        
+        return {
+            "ticker": ticker,
+            "name": name,
+            "total_return": total_return,
+            "final_equity": final_equity,
+            "trade_count": len(trades) // 2,
+            "trades": trades,
+            "win_rate": np.mean([t['profit'] > 0 for t in trades if 'profit' in t]) * 100 if trades else 0
+        }
     except Exception as e:
-        return None, f"다운로드 오류: {e}"
+        return None
 
-    # 2. 지표 계산
-    df = calculate_indicators_for_backtest(df)
-    if len(df) < 60: return None, "데이터 부족 (최소 60일 이상 필요)"
+# =========================================================
+# 3. UI 통합 (탭 추가)
+# =========================================================
+# (기존 코드의 tab1, tab2, tab3 정의 아래에 tab4를 추가한다고 가정)
 
-    # 3. AI 점수 과거 데이터 생성 (apply 사용)
-    #    lambda를 사용하여 각 행(row)에 대해 점수 계산 로직 수행
-    df['AI_Score'] = df.apply(lambda row: get_score_from_row(row), axis=1)
+tab4 = st.tabs(["📊 전체 백테스트 시뮬레이션"])[0] # 기존 tabs 리스트에 추가 필요
 
-    # 4. 매매 시뮬레이션
-    balance = initial_capital
-    shares = 0
-    avg_price = 0
-    trades = []
-    equity_curve = []
+with tab4:
+    st.markdown("### 🧪 포트폴리오 유니버스 백테스트")
+    st.caption("과거 데이터 기반 전략 시뮬레이션")
     
-    # 수수료 설정 (국내/해외 구분)
-    is_kr = ticker.endswith(".KS") or ticker.endswith(".KQ")
-    fee_buy = 0.00015 if is_kr else 0.001  # 매수 수수료 (가정)
-    fee_sell = 0.003 if is_kr else 0.001   # 매도 수수료+세금 (가정)
-
-    for date, row in df.iterrows():
-        price = row['Close_Calc']
-        score = row['AI_Score']
+    # 설정 UI
+    col_set1, col_set2, col_set3 = st.columns([1, 1, 2])
+    with col_set1:
+        bt_start_date = st.date_input("시작일", value=pd.to_datetime("2024-01-01"))
+    with col_set2:
+        # 🌟 전략 선택 라디오 버튼
+        selected_strategy = st.radio(
+            "⚔️ 전략 선택", 
+            ["기본 (Basic)", "슈퍼 락킹 (SuperLocking)"],
+            captions=["매수 65↑ / 매도 45↓", "매수 80↑ / +3%후 고점대비 -2% 매도"]
+        )
+        # 문자열 매핑
+        strat_code = "Basic" if "기본" in selected_strategy else "SuperLocking"
         
-        # 전략 로직
-        # 매수: 점수 >= 65 (매수 우위) AND 미보유
-        if score >= 65 and shares == 0:
-            can_buy_qty = int(balance / (price * (1 + fee_buy)))
-            if can_buy_qty > 0:
-                shares = can_buy_qty
-                buy_cost = shares * price * (1 + fee_buy)
-                balance -= buy_cost
-                avg_price = price
-                trades.append({
-                    "Date": date, "Type": "Buy", "Price": price, 
-                    "Score": score, "Balance": balance
-                })
+    with col_set3:
+        st.write("")
+        st.write("")
+        start_btn = st.button("🚀 시뮬레이션 시작", type="primary", use_container_width=True)
 
-        # 매도: 점수 <= 45 (관망/매도) AND 보유 중
-        elif score <= 45 and shares > 0:
-            sell_amount = shares * price * (1 - fee_sell)
-            balance += sell_amount
-            
-            # 수익률 계산
-            profit = (price - avg_price) / avg_price * 100
-            trades.append({
-                "Date": date, "Type": "Sell", "Price": price, 
-                "Score": score, "Profit_Pct": profit, "Balance": balance
-            })
-            shares = 0
-            avg_price = 0
-
-        # 자산 평가액 기록 (현금 + 주식평가액)
-        current_equity = balance + (shares * price)
-        equity_curve.append(current_equity)
-
-    df['Equity'] = equity_curve
-    return df, trades
-
-# ---------------------------------------------------------
-# UI 부분 (백테스트 탭)
-# ---------------------------------------------------------
-st.title("🧪 알고리즘 백테스트 (Backtest)")
-st.caption("현재 AI 알고리즘을 과거 데이터에 적용하여 수익률을 검증합니다.")
-
-col1, col2, col3 = st.columns([1, 1, 1])
-with col1:
-    bt_ticker = st.text_input("종목 코드 입력", value="NVDA")
-with col2:
-    bt_period = st.selectbox("기간 설정", ["6mo", "1y", "2y", "5y"], index=1)
-with col3:
-    st.write("")
-    st.write("")
-    run_btn = st.button("🚀 백테스트 실행", type="primary")
-
-if run_btn:
-    with st.spinner(f"{bt_ticker} 과거 데이터 분석 중..."):
-        df_res, trades = run_backtest(bt_ticker, bt_period)
+    if start_btn:
+        results = []
+        progress_text = st.empty()
+        bar = st.progress(0)
         
-        if df_res is None:
-            st.error(trades) # 에러 메시지 출력
-        else:
-            # 결과 계산
-            initial_cap = 10000000
-            final_cap = df_res['Equity'].iloc[-1]
-            total_return = ((final_cap - initial_cap) / initial_cap) * 100
+        targets = list(TICKER_MAP.items())
+        total_stocks = len(targets)
+        
+        # 병렬 처리 실행 (전략 모드 전달)
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {
+                executor.submit(
+                    run_single_stock_backtest, 
+                    code, 
+                    name, 
+                    str(bt_start_date), 
+                    1000000, 
+                    strat_code  # 🌟 선택된 전략 전달
+                ): code for code, name in targets
+            }
             
-            # 벤치마크 (Buy & Hold) 수익률
-            start_price = df_res['Close_Calc'].iloc[0]
-            end_price = df_res['Close_Calc'].iloc[-1]
-            buy_hold_return = ((end_price - start_price) / start_price) * 100
+            completed = 0
+            for future in futures:
+                res = future.result()
+                if res: results.append(res)
+                completed += 1
+                bar.progress(completed / total_stocks)
+                progress_text.text(f"[{selected_strategy}] 분석 중... ({completed}/{total_stocks})")
 
-            # --- 결과 요약 표시 ---
-            st.divider()
+        bar.empty()
+        progress_text.empty()
+        
+        if results:
+            df_res = pd.DataFrame(results)
+            avg_return = df_res['total_return'].mean()
+            win_rate_avg = df_res['win_rate'].mean()
+            total_profit_sum = df_res['final_equity'].sum() - (1000000 * len(df_res))
+            
+            st.success(f"✅ {selected_strategy} 백테스트 완료!")
+            
+            # 결과 표시 (기존과 동일)
             m1, m2, m3, m4 = st.columns(4)
-            m1.metric("AI 전략 수익률", f"{total_return:.2f}%", delta_color="normal")
-            m2.metric("존버(Buy&Hold) 수익률", f"{buy_hold_return:.2f}%")
-            m3.metric("총 거래 횟수", f"{len([t for t in trades if t['Type']=='Sell'])}회")
-            m4.metric("최종 자산", f"{final_cap:,.0f}")
-
-            # --- 차트 그리기 (Plotly) ---
-            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
-                                vertical_spacing=0.05, row_heights=[0.7, 0.3])
-
-            # 1. 주가 및 매매 포인트
-            fig.add_trace(go.Scatter(x=df_res.index, y=df_res['Close_Calc'], name="주가", line=dict(color='gray', width=1)), row=1, col=1)
+            m1.metric("평균 수익률", f"{avg_return:.2f}%", delta_color="normal")
+            m2.metric("평균 승률", f"{win_rate_avg:.1f}%")
+            m3.metric("총 종목 수", f"{len(df_res)}개")
+            m4.metric("총 수익금", f"{total_profit_sum:,.0f}원")
             
-            # 매수/매도 마커
-            buy_dates = [t['Date'] for t in trades if t['Type'] == 'Buy']
-            buy_prices = [t['Price'] for t in trades if t['Type'] == 'Buy']
-            sell_dates = [t['Date'] for t in trades if t['Type'] == 'Sell']
-            sell_prices = [t['Price'] for t in trades if t['Type'] == 'Sell']
-
-            fig.add_trace(go.Scatter(x=buy_dates, y=buy_prices, mode='markers', name='매수 (Score>=65)',
-                                     marker=dict(symbol='triangle-up', color='red', size=12)), row=1, col=1)
-            fig.add_trace(go.Scatter(x=sell_dates, y=sell_prices, mode='markers', name='매도 (Score<=45)',
-                                     marker=dict(symbol='triangle-down', color='blue', size=12)), row=1, col=1)
-
-            # 2. AI 점수 흐름
-            fig.add_trace(go.Scatter(x=df_res.index, y=df_res['AI_Score'], name="AI 점수", 
-                                     line=dict(color='purple', width=1.5)), row=2, col=1)
+            st.divider()
             
-            # 기준선 (65점, 45점)
-            fig.add_hline(y=65, line_dash="dot", annotation_text="매수 기준(65)", row=2, col=1, line_color="red")
-            fig.add_hline(y=45, line_dash="dot", annotation_text="매도 기준(45)", row=2, col=1, line_color="blue")
-
-            fig.update_layout(height=600, title_text=f"{bt_ticker} AI 알고리즘 백테스트 결과")
+            c_best, c_worst = st.columns(2)
+            with c_best:
+                st.subheader("🏆 수익률 Top 5")
+                top5 = df_res.sort_values('total_return', ascending=False).head(5)
+                for _, r in top5.iterrows():
+                    st.write(f"**{r['name']}**: +{r['total_return']:.1f}% ({r['trade_count']}회)")
+            
+            with c_worst:
+                st.subheader("💀 수익률 Worst 5")
+                worst5 = df_res.sort_values('total_return', ascending=True).head(5)
+                for _, r in worst5.iterrows():
+                    st.write(f"**{r['name']}**: {r['total_return']:.1f}% ({r['trade_count']}회)")
+            
+            st.markdown("#### 📄 상세 내역")
+            st.dataframe(df_res[['name', 'total_return', 'win_rate', 'trade_count', 'final_equity']], use_container_width=True)
+            
+            # 히스토그램
+            fig = px.histogram(df_res, x="total_return", nbins=20, title=f"[{selected_strategy}] 수익률 분포")
+            fig.add_vline(x=avg_return, line_dash="dash", line_color="red")
             st.plotly_chart(fig, use_container_width=True)
-
-            # --- 거래 기록 로그 ---
-            with st.expander("📄 상세 거래 기록 보기"):
-                trade_df = pd.DataFrame(trades)
-                if not trade_df.empty:
-                    trade_df['Date'] = trade_df['Date'].dt.date
-                    trade_df['Profit_Pct'] = trade_df['Profit_Pct'].fillna(0).map(lambda x: f"{x:.2f}%" if x != 0 else "-")
-                    trade_df['Price'] = trade_df['Price'].map(lambda x: f"{x:,.2f}")
-                    trade_df['Balance'] = trade_df['Balance'].map(lambda x: f"{x:,.0f}")
-                    trade_df['Score'] = trade_df['Score'].map(lambda x: f"{x:.1f}")
-                    st.dataframe(trade_df, use_container_width=True)
-                else:
-                    st.write("거래 내역이 없습니다.")
+        else:
+            st.error("결과 없음")
