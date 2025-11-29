@@ -74,11 +74,10 @@ SEARCH_MAP = {f"{name} ({code})": code for code, name in TICKER_MAP.items()}
 USER_WATCHLIST = list(TICKER_MAP.keys())
 
 # ---------------------------------------------------------
-# 2. 데이터 수집 (최적화: 단일/다중 종목 호환)
+# 2. 데이터 수집
 # ---------------------------------------------------------
 @st.cache_data(ttl=60)
 def get_bulk_us_data(us_tickers):
-    """미국 주식 데이터 수집"""
     if not us_tickers:
         return {}, {}
     
@@ -109,7 +108,6 @@ def get_bulk_us_data(us_tickers):
         df_real = yf.download(us_tickers, period="5d", interval="1m", progress=False, group_by='ticker', prepost=True)
 
         for t in us_tickers:
-            # History
             try:
                 sub_df = df_hist[t]
                 if isinstance(sub_df, pd.DataFrame) and not sub_df.empty:
@@ -119,7 +117,6 @@ def get_bulk_us_data(us_tickers):
             except: 
                 pass
 
-            # Realtime
             try:
                 sub_real = df_real[t]
                 if isinstance(sub_real, pd.DataFrame) and not sub_real.empty:
@@ -136,7 +133,6 @@ def get_bulk_us_data(us_tickers):
     return hist_map, realtime_map
 
 def fetch_kr_polling(ticker):
-    """국내 주식 실시간 (네이버)"""
     code = ticker.split('.')[0]
     try:
         url = f"https://polling.finance.naver.com/api/realtime/domestic/stock/{code}"
@@ -165,17 +161,14 @@ def fetch_kr_history(ticker):
 
 @st.cache_data(ttl=0)
 def get_precise_data(tickers_list):
-    """통합 데이터 수집기"""
     if not tickers_list:
         return {}, {}
         
     kr_tickers = [t for t in tickers_list if t.endswith('.KS') or t.endswith('.KQ')]
     us_tickers = [t for t in tickers_list if t not in kr_tickers]
 
-    # 1. 미국 주식
     hist_map, realtime_map = get_bulk_us_data(us_tickers)
 
-    # 2. 국내 주식
     with concurrent.futures.ThreadPoolExecutor() as executor:
         fut_real = [executor.submit(fetch_kr_polling, t) for t in kr_tickers]
         fut_hist = [executor.submit(fetch_kr_history, t) for t in kr_tickers]
@@ -183,47 +176,37 @@ def get_precise_data(tickers_list):
         for f in concurrent.futures.as_completed(fut_real):
             try:
                 tk, p = f.result()
-                if p: 
-                    realtime_map[tk] = p
-            except: 
-                pass
+                if p: realtime_map[tk] = p
+            except: pass
             
         for f in concurrent.futures.as_completed(fut_hist):
             try:
                 tk, df = f.result()
                 if df is not None and not df.empty:
                     hist_map[tk] = df
-            except: 
-                pass
+            except: pass
 
     return hist_map, realtime_map
 
 # ---------------------------------------------------------
-# 3. 분석 엔진 (수정됨: Series/Scalar 차원 오류 완벽 해결)
+# 3. 분석 엔진 (오류 수정 및 스나이퍼 로직 적용)
 # ---------------------------------------------------------
 
 def calculate_indicators(df, realtime_price=None):
-    """
-    [수정] 데이터 차원 오류 방지 로직 추가
-    """
     if df is None or len(df) < 60:
         return None
 
     df = df.copy()
-
-    # [핵심 1] 중복된 컬럼명 제거 (yfinance 버그 방지)
-    df = df.loc[:, ~df.columns.duplicated()]
     
-    # [핵심 2] 인덱스 중복 제거
+    # [차원 오류 방지] 중복 제거 및 시리즈 변환
+    df = df.loc[:, ~df.columns.duplicated()]
     df = df[~df.index.duplicated(keep='last')]
 
-    # 컬럼 통일
     if 'Close' not in df.columns and 'Adj Close' in df.columns:
         df['Close'] = df['Adj Close']
     if 'Close' not in df.columns:
         return None
 
-    # [핵심 3] Close가 DataFrame(2차원)인 경우 Series(1차원)로 강제 변환
     close = df['Close']
     if isinstance(close, pd.DataFrame):
         close = close.iloc[:, 0]
@@ -237,19 +220,17 @@ def calculate_indicators(df, realtime_price=None):
 
     df['Close_Calc'] = close
 
-    # 1. 이동평균
+    # 지표 계산
     df['MA5'] = df['Close_Calc'].rolling(5).mean()
     df['MA10'] = df['Close_Calc'].rolling(10).mean() 
     df['MA20'] = df['Close_Calc'].rolling(20).mean()
     df['MA60'] = df['Close_Calc'].rolling(60).mean()
     
-    # 2. 볼린저 밴드
     std = df['Close_Calc'].rolling(20).std()
     df['Upper_Band'] = df['MA20'] + (std * 2)
     df['Lower_Band'] = df['MA20'] - (std * 2)
     df['Band_Width'] = (df['Upper_Band'] - df['Lower_Band']) / df['MA20']
     
-    # 3. RSI
     delta = df['Close_Calc'].diff()
     gain = delta.where(delta > 0, 0)
     loss = -delta.where(delta < 0, 0)
@@ -258,7 +239,6 @@ def calculate_indicators(df, realtime_price=None):
     rs = avg_gain / avg_loss
     df['RSI'] = 100 - (100 / (1 + rs))
     
-    # 4. MACD
     exp12 = df['Close_Calc'].ewm(span=12, adjust=False).mean()
     exp26 = df['Close_Calc'].ewm(span=26, adjust=False).mean()
     df['MACD'] = exp12 - exp26
@@ -266,15 +246,11 @@ def calculate_indicators(df, realtime_price=None):
     df['MACD_Hist'] = df['MACD'] - df['Signal_Line']
     df['Prev_MACD_Hist'] = df['MACD_Hist'].shift(1)
     
-    # 5. 거래량 (오류 방지 처리 포함)
     if 'Volume' in df.columns:
         vol = df['Volume']
         if isinstance(vol, pd.DataFrame):
             vol = vol.iloc[:, 0]
-            
         df['Vol_MA20'] = vol.rolling(20).mean()
-        
-        # 0으로 나누기 방지
         denom = df['Vol_MA20'].replace(0, np.nan)
         df['Vol_Ratio'] = vol / denom
         df['Vol_Ratio'] = df['Vol_Ratio'].fillna(0)
@@ -282,14 +258,10 @@ def calculate_indicators(df, realtime_price=None):
         df['Vol_Ratio'] = 1.0 
 
     df['STD20'] = std
-    
-    # [핵심 4] 최종 결과에서도 중복 컬럼 한번 더 제거
+    # 최종 결과 중복 컬럼 제거
     return df.loc[:, ~df.columns.duplicated()].dropna()
 
 def get_scalar(val):
-    """
-    [헬퍼 함수] Series나 DataFrame 값을 안전하게 float으로 변환
-    """
     try:
         if isinstance(val, (pd.Series, pd.DataFrame)):
             if val.empty: return 0.0
@@ -299,13 +271,9 @@ def get_scalar(val):
         return 0.0
 
 def get_ai_score_row(row):
-    """
-    [AI 스나이퍼 스코어링]
-    - 안전한 값 추출(get_scalar) 적용
-    """
+    """AI 스나이퍼 스코어링"""
     try:
         score = 50.0
-        
         curr = get_scalar(row['Close_Calc'])
         ma5  = get_scalar(row['MA5'])
         ma10 = get_scalar(row['MA10'])
@@ -319,48 +287,35 @@ def get_ai_score_row(row):
         vol_ratio = get_scalar(row['Vol_Ratio'])
         std20     = get_scalar(row['STD20'])
         
-        # 1. 추세 (10일선 생명선)
+        # 1. 추세
         if curr > ma10:
             score += 15.0
-            if ma5 > ma10 > ma20: # 정배열
-                score += 5.0
+            if ma5 > ma10 > ma20: score += 5.0
         else:
-            score -= 10.0 # 탄력 둔화
-            
-        if curr > ma60:
-            score += 5.0
-        else:
-            score -= 5.0
+            score -= 10.0
+        if curr > ma60: score += 5.0
+        else: score -= 5.0
 
-        # 2. 모멘텀 (MACD 가속)
+        # 2. 모멘텀
         if macd_hist > 0:
             score += 5.0
-            if macd_hist > prev_hist:
-                score += 5.0 # 상승 가속
+            if macd_hist > prev_hist: score += 5.0
         elif macd_hist > prev_hist and macd_hist > -0.5:
-             score += 5.0 # 반등 시도
-
-        # 3. RSI (스윙 적정 구간 50~70)
-        if 50 <= rsi <= 70:
-            score += 10.0
-        elif rsi > 75:
-            score -= 5.0 # 과열
-        elif rsi < 35:
-            score += 5.0 # 낙폭 과대
-
-        # 4. 볼린저 밴드 (변동성)
-        if curr >= u_band * 0.98: # 밴드 상단 돌파 시도
-            score += 10.0
-            
-        # 스퀴즈 후 발산
-        if band_width < 0.15 and ma5 > ma10:
-            score += 5.0
-
-        # 5. 거래량
-        if vol_ratio >= 1.2 and curr > ma5:
              score += 5.0
 
-        # 6. 안정성 페널티 (변동성 클수록 감점)
+        # 3. RSI
+        if 50 <= rsi <= 70: score += 10.0
+        elif rsi > 75: score -= 5.0
+        elif rsi < 35: score += 5.0
+
+        # 4. 볼린저 밴드
+        if curr >= u_band * 0.98: score += 10.0
+        if band_width < 0.15 and ma5 > ma10: score += 5.0
+
+        # 5. 거래량
+        if vol_ratio >= 1.2 and curr > ma5: score += 5.0
+
+        # 6. 안정성
         v_ratio = std20 / curr if curr > 0 else 0
         score -= (v_ratio * 100.0)
 
@@ -370,17 +325,16 @@ def get_ai_score_row(row):
 
 def analyze_advanced_strategy(df):
     """
-    [AI 스나이퍼 전략 등급 분류]
-    - 안전한 값 추출 적용
+    [AI 스나이퍼 매수 진입 판단]
+    - 70점 이상이면 매수
     """
     if df is None or df.empty:
         return "분석 불가", "gray", "데이터 부족", 0.0
 
     try:
         row = df.iloc[-1]
-        score = get_ai_score_row(row) # 이미 float 반환
+        score = get_ai_score_row(row)
         
-        # 안전한 값 추출
         curr = get_scalar(row['Close_Calc'])
         ma10 = get_scalar(row['MA10'])
         ma60 = get_scalar(row['MA60'])
@@ -393,32 +347,15 @@ def analyze_advanced_strategy(df):
         return "오류", "gray", "계산 실패", 0.0
 
     reasons = []
+    if curr > ma10: reasons.append("10일선 위")
+    else: reasons.append("10일선 이탈")
+    if curr >= u_band * 0.99: reasons.append("밴드 돌파")
+    elif curr > ma60: reasons.append("정배열")
+    if rsi > 75: reasons.append("과열권")
+    elif rsi < 35: reasons.append("과매도")
+    if macd_hist > 0 and macd_hist > prev_hist: reasons.append("에너지 가속")
 
-    # 1. 10일선(생명선) 기준 판단
-    if curr > ma10:
-        reasons.append("10일선 위(강세)")
-    else:
-        reasons.append("10일선 이탈(약세)")
-
-    # 2. 밴드/추세
-    if curr >= u_band * 0.99:
-        reasons.append("밴드 돌파(급등)")
-    elif curr > ma60:
-        reasons.append("장기 정배열")
-    
-    # 3. RSI
-    if rsi > 75:
-        reasons.append(f"RSI 과열({rsi:.0f})")
-    elif rsi < 35:
-        reasons.append(f"과매도({rsi:.0f})")
-    
-    # 4. MACD
-    if macd_hist > 0 and macd_hist > prev_hist:
-        reasons.append("에너지 가속")
-
-    # -----------------------------------------------------
-    # [스나이퍼 전략] 점수 구간 → 매수/매도 등급 매핑
-    # -----------------------------------------------------
+    # 등급 산정
     if score >= 70:
         if rsi > 75:
             cat = "🔥 매수 주의 (과열권)"
@@ -427,21 +364,99 @@ def analyze_advanced_strategy(df):
         else:
             cat = "🎯 스나이퍼 매수 (진입 타점)"
             col = "green"
-
     elif score < 40:
         cat = "💥 매도/손절 (추세 이탈)"
         col = "red"
-        
     elif 40 <= score < 50:
         cat = "📉 비중 축소 (약세)"
         col = "orange"
-        
-    else: # 50 ~ 69
+    else: 
         cat = "👀 관망 (Hold)"
         col = "blue"
 
     reasoning = " / ".join(reasons[:3])
     return cat, col, reasoning, round(score, 3)
+
+# ---------------------------------------------------------
+# ★ [NEW] AI 스나이퍼 전용 매도/홀딩 판단 로직
+# ---------------------------------------------------------
+def get_sell_advice(df, buy_price, buy_date_str):
+    """
+    [AI 스나이퍼 매도 전략 구현]
+    1. 손절 (Stop Loss): -3.0% 이하 시 즉시 매도
+    2. 타임컷 (Time Cut): 14일 경과 시 무조건 매도
+    3. 트레일링 스탑 (Trailing Stop):
+       - 최고 수익률이 +5% 미만일 땐 홀딩 (작은 흔들림 무시)
+       - 최고 수익률이 +5% 이상 도달 시 발동 -> 고점 대비 -3% 하락 시 익절
+    4. 추세 이탈: AI 점수 40점 미만 시 매도
+    """
+    if df is None or df.empty:
+        return "분석 대기", "gray", "데이터 부족"
+
+    try:
+        # 1. 현재 데이터 추출
+        row = df.iloc[-1]
+        curr_price = get_scalar(row['Close_Calc']) # 현재가
+        score = get_ai_score_row(row) # 현재 AI 점수
+        
+        # 2. 보유 기간 및 '매수 이후 최고가' 계산
+        buy_date = pd.to_datetime(buy_date_str).date()
+        today = datetime.date.today()
+        held_days = (today - buy_date).days
+        
+        # 매수일 이후의 데이터만 필터링하여 '보유 기간 중 최고가' 찾기
+        # df의 인덱스는 datetime이어야 함
+        df_held = df[df.index.date >= buy_date]
+        
+        if not df_held.empty:
+            # 보수적으로 고가(High)가 아닌 종가(Close) 기준 최고가 사용 (꼬리 매도 방지)
+            max_price_since_buy = df_held['Close_Calc'].max()
+        else:
+            max_price_since_buy = curr_price # 데이터 없으면 현재가가 최고가
+
+        # 3. 수익률 지표 계산
+        cur_profit_pct = (curr_price - buy_price) / buy_price * 100
+        max_profit_pct = (max_price_since_buy - buy_price) / buy_price * 100
+        
+        # 고점 대비 하락률 (Drawdown)
+        if max_price_since_buy > 0:
+            drawdown_from_peak = (curr_price - max_price_since_buy) / max_price_since_buy
+        else:
+            drawdown_from_peak = 0.0
+
+    except Exception as e:
+        return "계산 오류", "gray", f"날짜/가격 정보 확인 필요 ({e})"
+
+    # =========================================================
+    # [판단 로직] 우선순위 순서대로 검사
+    # =========================================================
+
+    # 1. ⚡ 칼손절 (Stop Loss): -3% (계좌 방어 최우선)
+    if cur_profit_pct <= -3.0:
+        return "⚡ 칼손절 (-3%)", "red", f"손절 원칙 도달(현재 {cur_profit_pct:.1f}%). 즉시 자르세요."
+
+    # 2. ⏱️ 타임컷 (Time Cut): 14일 (무조건 탈출)
+    if held_days >= 14:
+        return "⏱️ 타임컷 매도", "orange", f"보유 14일 경과(현재 {held_days}일). 원칙대로 전량 매도."
+
+    # 3. 📉 트레일링 스탑 (Trailing Stop) - 수익 극대화 로직
+    # 조건 A: 수익이 한 번이라도 +5%를 넘었는가?
+    if max_profit_pct >= 5.0:
+        # 조건 B: 고점 대비 -3% 이상 빠졌는가?
+        if drawdown_from_peak <= -0.03:
+            return "📉 트레일링 익절", "orange", f"최고점({max_profit_pct:.1f}%) 찍고 -3% 하락. 이익 확정하세요."
+        else:
+            # 5%는 넘었지만 아직 추세가 안 꺾임 -> 더 길게 먹기 위해 홀딩
+            return "💎 슈퍼 홀딩 (Riding)", "green", f"수익 극대화 중! (현재 +{cur_profit_pct:.1f}% / 고점 대비 {drawdown_from_peak*100:.1f}%)"
+
+    # 4. 📉 추세 이탈 (Trend Break)
+    # 수익도 별로 없는데(-3% ~ +5% 사이), 점수가 40점 밑으로 박살나면 매도
+    if score < 40:
+        return "📉 추세 이탈", "red", f"AI 점수 급락({score:.0f}점). 상승 동력 상실."
+
+    # 5. 기본 상태: 홀딩 (Waiting)
+    # 아직 +5% 목표 달성 전이고, 손절가 위에서 버티는 구간
+    return "⏳ 홀딩 (Waiting)", "blue", f"목표 +5% 대기 중. (현재 {cur_profit_pct:.1f}% / 보유 {held_days}일)"
 
 def calculate_total_profit(ticker, avg_price, current_price, quantity):
     is_kr = ticker.endswith(".KS") or ticker.endswith(".KQ")
@@ -469,12 +484,12 @@ def calculate_total_profit(ticker, avg_price, current_price, quantity):
 # ---------------------------------------------------------
 st.title("🎯 AI 스나이퍼 스캐너 Pro")
 
-tab1, tab2, tab3 = st.tabs(["🚀 AI 스나이퍼 스캔", "💼 내 포트폴리오", "📘 전략 백서"])
+tab1, tab2, tab3 = st.tabs(["🚀 AI 스나이퍼 스캔", "💼 내 포트폴리오(매도 알림)", "📘 전략 백서"])
 
 # TAB 1: 스캐너
 with tab1:
     st.markdown("### 📋 AI 스나이퍼 종목 발굴")
-    st.caption("전략: 2주 단기 스윙 | 선정: 조건 만족 종목 전부 매수 (분산 투자 권장)")
+    st.caption("전략: 2주 단기 스윙 | 선정: 조건 만족(70점↑) 종목 전부 매수 (분산 투자 권장)")
 
     col_btn, col_info = st.columns([1, 4])
     with col_btn:
@@ -527,7 +542,6 @@ with tab1:
                 
                 if scan_results:
                     df_res = pd.DataFrame(scan_results)
-                    # 점수 내림차순 정렬 (사용자가 보기 편하게)
                     df_res = df_res.sort_values('점수', ascending=False)
                     st.session_state['scan_result_df'] = df_res
                     st.success("스캔 완료! 70점 이상인 종목들을 확인하세요.")
@@ -536,7 +550,6 @@ with tab1:
                     st.error("데이터 수집 실패.")
     
     if st.session_state['scan_result_df'] is not None:
-        # 70점 이상 종목 개수 파악
         high_score_df = st.session_state['scan_result_df'][st.session_state['scan_result_df']['점수'] >= 70]
         count = len(high_score_df)
         
@@ -562,8 +575,8 @@ with tab1:
 
 # TAB 2: 포트폴리오
 with tab2:
-    st.markdown("### ☁️ 내 자산 포트폴리오")
-    st.caption("네이버페이(국내) / 1분봉(해외) 실시간 기반 | 세후 순수익 계산")
+    st.markdown("### ☁️ 내 자산 포트폴리오 (매도 알리미)")
+    st.caption("AI 스나이퍼 규칙: 2주 타임컷 / -3% 손절 / +5% 후 트레일링 익절")
     
     db = get_db()
     if not db:
@@ -580,75 +593,74 @@ with tab2:
             pf_data = []
 
         with st.container():
-            st.markdown("#### ➕ 종목 추가")
-            c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
+            st.markdown("#### ➕ 종목 추가 (매수일 필수)")
+            c1, c2, c3, c4 = st.columns([1.5, 1, 1, 1])
             with c1:
                 selected_item = st.selectbox("종목 검색", ["선택하세요"] + SEARCH_LIST)
             with c2:
-                input_price = st.number_input("내 평단가", min_value=0.0, format="%.2f")
+                input_price = st.number_input("매수 단가", min_value=0.0, format="%.2f")
             with c3:
-                input_qty = st.number_input("보유 수량(주)", min_value=0, value=1)
+                input_date = st.date_input("매수 날짜", datetime.date.today())
             with c4:
-                st.write("")
-                st.write("")
-                if st.button("추가하기", type="primary"):
-                    if selected_item != "선택하세요":
-                        target_code = SEARCH_MAP[selected_item]
-                        new_pf_data = [p for p in pf_data if p['ticker'] != target_code]
-                        new_pf_data.append({
-                            "ticker": target_code, 
-                            "price": input_price,
-                            "qty": input_qty
-                        })
-                        doc_ref.set({'stocks': new_pf_data})
-                        st.success("추가 완료!")
-                        time.sleep(0.5)
-                        st.rerun()
+                input_qty = st.number_input("수량", min_value=1, value=1)
+            
+            if st.button("포트폴리오에 추가", type="primary"):
+                if selected_item != "선택하세요":
+                    target_code = SEARCH_MAP[selected_item]
+                    new_pf_data = [p for p in pf_data if p['ticker'] != target_code]
+                    new_pf_data.append({
+                        "ticker": target_code, 
+                        "price": input_price,
+                        "qty": input_qty,
+                        "date": str(input_date) 
+                    })
+                    doc_ref.set({'stocks': new_pf_data})
+                    st.success("추가 완료!")
+                    time.sleep(0.5)
+                    st.rerun()
 
         st.divider()
 
         if pf_data:
             # 수정 섹션
-            st.markdown("#### ✏️ 보유 종목 정보 수정")
-            edit_options = [f"{TICKER_MAP.get(p['ticker'], p['ticker'])} ({p['ticker']})" for p in pf_data]
-            selected_edit = st.selectbox("수정할 종목 선택", options=["선택하세요"] + edit_options, key="edit_select")
+            with st.expander("✏️ 종목 수정/삭제"):
+                edit_options = [f"{TICKER_MAP.get(p['ticker'], p['ticker'])} ({p['ticker']})" for p in pf_data]
+                selected_edit = st.selectbox("수정할 종목", options=["선택하세요"] + edit_options)
 
-            if selected_edit != "선택하세요":
-                edit_ticker = selected_edit.split("(")[-1].rstrip(")")
-                target = next((p for p in pf_data if p["ticker"] == edit_ticker), None)
-                if target:
-                    new_avg = st.number_input(
-                        "새 평단가", 
-                        min_value=0.0, 
-                        value=float(target["price"]), 
-                        format="%.4f", 
-                        key="edit_avg_price"
-                    )
-                    new_qty = st.number_input(
-                        "새 보유 수량(주)", 
-                        min_value=0, 
-                        value=int(target.get("qty", 1)), 
-                        key="edit_qty"
-                    )
+                if selected_edit != "선택하세요":
+                    edit_ticker = selected_edit.split("(")[-1].rstrip(")")
+                    target = next((p for p in pf_data if p["ticker"] == edit_ticker), None)
+                    if target:
+                        c_e1, c_e2, c_e3 = st.columns(3)
+                        with c_e1:
+                            new_avg = st.number_input("수정 단가", value=float(target["price"]), format="%.2f")
+                        with c_e2:
+                            try:
+                                def_date = pd.to_datetime(target.get("date", str(datetime.date.today()))).date()
+                            except:
+                                def_date = datetime.date.today()
+                            new_date_val = st.date_input("수정 매수일", value=def_date)
+                        with c_e3:
+                            new_qty_val = st.number_input("수정 수량", value=int(target.get("qty", 1)))
 
-                    if st.button("변경 내용 저장", type="primary", key="edit_save"):
-                        new_pf_data = []
-                        for p in pf_data:
-                            if p["ticker"] == edit_ticker:
-                                new_pf_data.append({"ticker": edit_ticker, "price": new_avg, "qty": new_qty})
-                            else:
-                                new_pf_data.append(p)
-                        doc_ref.set({"stocks": new_pf_data})
-                        st.success("수정 완료!")
-                        time.sleep(0.5)
-                        st.rerun()
-
-            st.divider()
+                        if st.button("변경 저장", type="primary"):
+                            new_pf_data = []
+                            for p in pf_data:
+                                if p["ticker"] == edit_ticker:
+                                    new_pf_data.append({
+                                        "ticker": edit_ticker, "price": new_avg, 
+                                        "qty": new_qty_val, "date": str(new_date_val)
+                                    })
+                                else:
+                                    new_pf_data.append(p)
+                            doc_ref.set({"stocks": new_pf_data})
+                            st.rerun()
         
-        if pf_data:
-            st.subheader(f"{user_id}님의 보유 종목 진단")
+            st.divider()
+            
+            st.subheader(f"📊 {user_id}님의 포트폴리오 진단")
             my_tickers = [p['ticker'] for p in pf_data]
-            with st.spinner("초정밀 실시간 데이터 수집 중..."):
+            with st.spinner("AI가 스나이퍼 규칙을 대입 중..."):
                 raw_data_dict, realtime_map = get_precise_data(my_tickers)
             
             display_list = []
@@ -656,6 +668,7 @@ with tab2:
                 tk = item['ticker']
                 avg = item['price']
                 qty = item.get('qty', 1)
+                b_date = item.get('date', str(datetime.date.today()))
                 name = TICKER_MAP.get(tk, tk)
                 
                 curr = 0
@@ -669,28 +682,30 @@ with tab2:
                 
                 if df_indi is not None:
                     curr = float(df_indi['Close_Calc'].iloc[-1])
-                    cat, col_name, reasoning, score = analyze_advanced_strategy(df_indi)
+                    # ★ 매도 조언 함수 호출
+                    action, color, advice = get_sell_advice(df_indi, avg, b_date)
                 else:
-                    cat, col_name, reasoning, score = "데이터 로딩 중", "gray", "잠시 후 다시 시도", 0
+                    action, color, advice = "데이터 로딩 중", "gray", "잠시 후 다시 시도"
 
                 if curr > 0:
                     res = calculate_total_profit(tk, avg, curr, qty)
                     display_list.append({
                         "name": name, "tk": tk, "avg": avg, "curr": curr, "qty": qty,
-                        "cat": cat, "col_name": col_name, "reasoning": reasoning,
+                        "action": action, "color": color, "advice": advice,
                         "profit_pct": res['pct'], "profit_amt": res['profit_amt'],
-                        "eval_amt": res['net_eval_amt'], "currency": res['currency'], "score": score
+                        "eval_amt": res['net_eval_amt'], "currency": res['currency']
                     })
                 else:
                     display_list.append({
                         "name": name, "tk": tk, "avg": avg, "curr": avg, "qty": qty,
-                        "cat": "로딩 실패", "col_name": "gray", "reasoning": "데이터 수신 불가",
+                        "action": "로딩 실패", "color": "gray", "advice": "데이터 없음",
                         "profit_pct": 0.0, "profit_amt": 0.0, "eval_amt": 0.0,
-                        "currency": "$" if not tk.endswith(".KS") else "₩", "score": 0
+                        "currency": "$" if not tk.endswith(".KS") else "₩"
                     })
             
-            # 점수 순으로 정렬
-            display_list.sort(key=lambda x: x['score'], reverse=True)
+            # Action 급한 순서로 정렬 (매도 > 관망)
+            priority = {"⚡ 칼손절 (-3%)": 0, "⏱️ 타임컷 매도": 1, "📉 트레일링 익절": 2, "📉 추세 이탈": 3, "💎 슈퍼 홀딩 (Riding)": 4, "⏳ 홀딩 (Waiting)": 5}
+            display_list.sort(key=lambda x: priority.get(x['action'], 99))
 
             for item in display_list:
                 with st.container():
@@ -705,23 +720,22 @@ with tab2:
                     with c2:
                         fmt_curr = f"{item['curr']:,.0f}" if item['currency'] == "₩" else f"{item['curr']:,.2f}"
                         fmt_avg  = f"{item['avg']:,.0f}"  if item['currency'] == "₩" else f"{item['avg']:,.2f}"
-                        fmt_eval = f"{item['eval_amt']:,.0f}"   if item['currency'] == "₩" else f"{item['eval_amt']:,.2f}"
                         
                         st.metric(
-                            "총 순수익 (수수료 제)", 
+                            "수익률", 
                             f"{item['profit_pct']:.2f}%", 
                             delta=f"{sym}{item['profit_amt']:,.0f}" if sym=="₩" else f"{sym}{item['profit_amt']:,.2f}"
                         )
-                        st.markdown(f"**세후 총 평가금:** {safe_sym}{fmt_eval}", unsafe_allow_html=True)
                         st.markdown(
                             f"<small style='color: gray'>평단: {safe_sym}{fmt_avg} / 현재: {safe_sym}{fmt_curr}</small>",
                             unsafe_allow_html=True
                         )
                         
                     with c3:
-                        st.markdown(f"**AI 점수: {item['score']}점**")
-                        st.markdown(f"**판단:** :{item['col_name']}[{item['cat']}]")
-                        st.info(f"💡 {item['reasoning']}")
+                        # 매도 액션 강조
+                        st.markdown(f"##### AI 추천: :{item['color']}[{item['action']}]")
+                        st.info(f"{item['advice']}")
+                        
                     st.divider()
 
             if st.button("🗑️ 포트폴리오 전체 삭제"):
@@ -730,41 +744,25 @@ with tab2:
 
 with tab3:
     st.markdown("## 📘 AI 스나이퍼 전략 백서 (Sniper Mode v2.0)")
-    st.markdown("""
-    **'2주 단기 스윙'**에 최적화된 AI 스나이퍼 전략은 지지부진한 흐름을 배제하고, 
-    **상승 탄력(Momentum)이 붙는 시점**과 **변동성이 폭발(Volatility Breakout)하는 시점**을 정밀 타격합니다.
+    
+    st.info("""
+    **핵심 철학:** "손실은 짧게, 수익은 길게 (Cut losses short, Let profits run)"
     """)
     
-    st.divider()
-    
-    st.subheader("1. 🎯 점수 & 등급 가이드")
-    score_guide_data = [
-        {"점수": "70점 이상", "등급": "🎯 스나이퍼 매수", "설명": "10일선 지지 + 거래량 실린 상승 + 밴드 돌파. 분산 매수 추천."},
-        {"점수": "50~69점", "등급": "👀 관망 (Hold)", "설명": "추세는 살아있으나 모멘텀이 약함. 기존 보유자는 홀딩, 신규는 대기."},
-        {"점수": "40점 미만", "등급": "💥 매도/손절", "설명": "10일선 붕괴 또는 추세 이탈. 리스크 관리(손절) 필수."},
-        {"특이사항": "RSI > 75", "등급": "🔥 과열 경고", "설명": "단기 급등으로 인한 조정 가능성. 분할 익절 권장."}
-    ]
-    st.table(score_guide_data)
-
-    st.header("2. 🧠 스나이퍼 핵심 3요소")
-    
-    with st.expander("① 10일선 생명선 매매 (Trend Line)", expanded=True):
+    with st.expander("⚔️ 매매 규칙 (Rules of Engagement)", expanded=True):
         st.markdown("""
-        스윙 트레이딩에서 20일선은 너무 느리고, 5일선은 너무 빠릅니다.
-        **10일 이동평균선**은 2주간의 평균 가격으로, 단기 추세의 '생명선'입니다.
-        * 주가가 10일선 위에 있어야만 점수를 부여하며, 깨지는 순간 매도 신호로 간주합니다.
+        1.  **진입 (Entry):** AI 점수 **70점 이상** (확실한 추세만 탑승)
+        2.  **손절 (Stop Loss):** **-3%** 도달 시 즉시 매도 (계좌 방어 최우선)
+        3.  **타임컷 (Time Cut):** 매수 후 **14일(2주)** 경과 시 조건 없이 매도 (기회비용 확보)
+        4.  **익절 (Take Profit):** **트레일링 스탑** 적용
+            * 수익률 +5% 미만: 잔파동 무시하고 홀딩
+            * 수익률 **+5% 돌파 후**: 고점 대비 **-3%** 하락 시 전량 매도
         """)
 
-    with st.expander("② 볼린저 밴드 스퀴즈 & 돌파 (Volatility)", expanded=True):
-        st.markdown("""
-        주가는 '휴식(수렴)' 후에 '폭발(발산)'합니다.
-        * **스퀴즈(Squeeze):** 볼린저 밴드 폭이 좁아지며 에너지를 응축하는 구간에 가산점을 줍니다.
-        * **돌파(Breakout):** 밴드 상단을 강하게 돌파할 때 추격 매수 신호를 포착합니다.
-        """)
-
-    with st.expander("③ MACD 가속도 (Momentum Acceleration)", expanded=True):
-        st.markdown("""
-        단순히 MACD가 양수라고 좋은 것이 아닙니다.
-        * 어제보다 오늘의 막대(Histogram)가 더 커져야 **'상승 가속도'**가 붙은 것입니다.
-        * 상승 힘이 줄어들면(막대가 작아지면) 선제적으로 점수를 차감하여 고점 판독을 돕습니다.
-        """)
+    st.header("🧠 스나이퍼 핵심 3요소")
+    with st.expander("① 10일선 생명선 매매", expanded=True):
+        st.markdown("스윙에서 20일선은 느리고 5일선은 빠릅니다. **10일선**을 생명선으로 삼아 추세를 추적합니다.")
+    with st.expander("② 볼린저 밴드 스퀴즈 & 돌파", expanded=True):
+        st.markdown("에너지가 응축(스퀴즈)된 후 폭발(돌파)하는 시점을 노립니다.")
+    with st.expander("③ MACD 가속도", expanded=True):
+        st.markdown("단순 양수가 아니라, 상승 에너지가 '가속'되는 구간에 높은 점수를 부여합니다.")
