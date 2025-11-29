@@ -41,7 +41,11 @@ def get_db():
 # ---------------------------------------------------------
 st.set_page_config(page_title="AI 주식 스캐너 Pro", page_icon="📈", layout="wide")
 
-# 종목 코드와 한글명 매핑 (사용자 요청 리스트 기반)
+# 세션 상태 초기화 (탭 이동 시 데이터 유지용)
+if 'scan_result_df' not in st.session_state:
+    st.session_state['scan_result_df'] = None
+
+# 종목 코드와 한글명 매핑
 TICKER_MAP = {
     "INTC": "인텔 (Intel)", "005290.KS": "동진쎄미켐", "SOXL": "반도체 3X(Bull)", 
     "316140.KS": "우리금융지주", "WDC": "웨스턴디지털", "NFLX": "넷플릭스", 
@@ -67,18 +71,11 @@ TICKER_MAP = {
     "TSLA": "테슬라", "AMD": "AMD", "BITX": "비트코인 2X", "TSLL": "테슬라 1.5X"
 }
 
-USER_WATCHLIST = list(TICKER_MAP.keys()) # 키 값들을 감시 리스트로 사용
+# 검색용 리스트 생성 (예: "삼성전자 (005930.KS)")
+SEARCH_LIST = [f"{name} ({code})" for code, name in TICKER_MAP.items()]
+SEARCH_MAP = {f"{name} ({code})": code for code, name in TICKER_MAP.items()}
 
-def format_ticker(ticker):
-    """입력된 코드를 포맷팅하고 이름을 반환"""
-    ticker = ticker.strip().upper()
-    # 숫자만 있는 경우 .KS 붙임
-    if ticker.isdigit():
-        ticker = f"{ticker}.KS"
-    
-    # 이름 찾기
-    name = TICKER_MAP.get(ticker, ticker) # 없으면 티커 그대로
-    return ticker, name
+USER_WATCHLIST = list(TICKER_MAP.keys())
 
 # ---------------------------------------------------------
 # 2. 데이터 로드 및 지표 계산
@@ -86,7 +83,6 @@ def format_ticker(ticker):
 @st.cache_data(ttl=3600)
 def get_bulk_data(tickers_list):
     """데이터 다운로드 (2년치)"""
-    # 딕셔너리 키(Formatted Ticker)를 그대로 사용
     data = yf.download(tickers_list, period="2y", group_by='ticker', threads=True)
     return data
 
@@ -114,6 +110,30 @@ def calculate_indicators(df):
     
     return df.dropna()
 
+def calculate_net_profit(ticker, avg_price, current_price):
+    """
+    토스 증권 수수료 반영 수익률 계산
+    - 국내(KR): 매도 수수료 0.015% + 증권거래세 0.18% (총 약 0.195%)
+    - 해외(US): 매도 수수료 0.1%
+    """
+    is_kr = ticker.endswith(".KS") or ticker.endswith(".KQ")
+    
+    if is_kr:
+        sell_fee_rate = 0.00015 + 0.0018  # 0.195%
+    else:
+        sell_fee_rate = 0.001  # 0.1%
+        
+    # 매수 수수료는 평단가에 이미 포함되어 있다고 가정 (보통 앱이 그렇게 보여줌)
+    # 매도 시 수수료 차감 후 금액
+    net_sell_price = current_price * (1 - sell_fee_rate)
+    
+    profit_amt = net_sell_price - avg_price
+    profit_pct = (profit_amt / avg_price) * 100
+    
+    currency = "₩" if is_kr else "$"
+    
+    return profit_pct, profit_amt, currency
+
 # ---------------------------------------------------------
 # 3. 고도화된 전략 분석 (다양한 추천 & 이유)
 # ---------------------------------------------------------
@@ -136,58 +156,47 @@ def analyze_advanced_strategy(df):
     dead_cross = (macd < sig) and (prev_macd >= prev_sig)
     oversold = rsi < 35
     overbought = rsi > 70
-    dip_buy = trend_up and (curr <= ma20 * 1.02) and (curr >= ma20 * 0.98) # 상승세 중 눌림목
+    dip_buy = trend_up and (curr <= ma20 * 1.02) and (curr >= ma20 * 0.98) 
 
     reasons = []
     
-    # 1. 등급 및 코멘트 결정
     category = "중립/관망 (Hold)"
-    color = "gray" # default
+    color = "gray" 
 
-    # A. 강력 매수 (Strong Buy)
-    # 조건: 장기 상승 추세 + 눌림목 지지 or 골든크로스 + 과열 아님
     if trend_up and (dip_buy or (golden_cross and not overbought)):
         category = "🚀 강력 매수 (Strong Buy)"
-        color = "#00C853" # 진한 녹색
-        if dip_buy: reasons.append("상승 추세 속 '눌림목' 지지 구간")
-        if golden_cross: reasons.append("MACD 골든크로스로 상승 탄력 강화")
+        color = "#00C853" 
+        if dip_buy: reasons.append("상승 추세 속 '눌림목' 지지")
+        if golden_cross: reasons.append("MACD 골든크로스")
 
-    # B. 매수 (Buy)
-    # 조건: 추세가 좋거나, 과매도권에서의 기술적 반등
     elif (trend_up and above_ma20) or (oversold and curr > ma20 * 0.95):
         category = "📈 매수 (Buy)"
-        color = "#2962FF" # 파란색
-        if trend_up and above_ma20: reasons.append("정배열 상승 추세 유지 중")
-        if oversold: reasons.append(f"RSI {rsi:.0f}로 과매도 구간, 기술적 반등 기대")
+        color = "#2962FF" 
+        if trend_up and above_ma20: reasons.append("정배열 상승 지속")
+        if oversold: reasons.append(f"과매도(RSI {rsi:.0f}), 반등 기대")
 
-    # C. 매도 (Sell)
-    # 조건: 하락 추세 전환 or 심각한 과열
     elif (not trend_up and not above_ma20) or (overbought and dead_cross):
         category = "📉 매도 (Sell)"
-        color = "#FF5252" # 붉은색
-        if not trend_up: reasons.append("60일선 하회로 중기 추세 꺾임")
-        if overbought: reasons.append(f"RSI {rsi:.0f}로 과열, 차익실현 매물 주의")
-        if dead_cross: reasons.append("MACD 데드크로스 발생 (조정 신호)")
+        color = "#FF5252" 
+        if not trend_up: reasons.append("추세 이탈")
+        if overbought: reasons.append(f"과열(RSI {rsi:.0f})")
+        if dead_cross: reasons.append("데드크로스")
 
-    # D. 강력 매도 (Strong Sell)
-    # 조건: 역배열 + 데드크로스
     elif not trend_up and curr < ma20 and dead_cross:
         category = "💥 강력 매도 (Strong Sell)"
-        color = "#D50000" # 진한 빨강
-        reasons.append("역배열 하락 추세 + 하락 모멘텀 가속화")
+        color = "#D50000" 
+        reasons.append("하락 가속화")
 
-    # E. 관망 (Neutral)
     else:
         category = "👀 관망 (Neutral)"
-        color = "#757575" # 회색
-        if overbought: reasons.append("추세는 좋으나 과열권, 신규 진입 자제")
-        elif not trend_up and above_ma20: reasons.append("단기 반등 중이나 장기 추세 확인 필요")
-        else: reasons.append("뚜렷한 방향성 없음, 횡보세")
+        color = "#757575" 
+        if overbought: reasons.append("과열권 관망")
+        elif not trend_up and above_ma20: reasons.append("단기 반등 중")
+        else: reasons.append("횡보세")
 
-    # 이유가 비어있으면 기본 코멘트
     if not reasons:
-        if rsi > 50: reasons.append("특이 신호 부재, 추세 지속 여부 관찰")
-        else: reasons.append("거래량 및 모멘텀 부족")
+        if rsi > 50: reasons.append("추세 관찰 필요")
+        else: reasons.append("모멘텀 부족")
 
     return category, color, ", ".join(reasons)
 
@@ -201,87 +210,86 @@ tab1, tab2 = st.tabs(["🚀 전체 종목 스캐너", "💼 내 포트폴리오 
 # === TAB 1: 스캐너 ===
 with tab1:
     st.markdown("### 📋 시장 전체 스캔 및 AI 분석")
-    st.caption("사용자님이 지정한 관심 종목 전체를 실시간으로 분석하여 투자 기회를 포착합니다.")
+    st.caption("관심 종목 전체를 분석합니다. 탭을 이동해도 결과는 유지됩니다.")
 
-    if st.button("🔍 전체 리스트 정밀 분석 시작", type="primary"):
-        with st.spinner('AI가 차트 패턴과 보조지표를 분석 중입니다...'):
-            # USER_WATCHLIST는 이미 Formatted Ticker들이므로 바로 사용
-            raw_data = get_bulk_data(USER_WATCHLIST)
-            
-            scan_results = []
-            
-            progress_bar = st.progress(0)
-            for i, ticker_code in enumerate(USER_WATCHLIST):
-                try:
-                    # 데이터 추출
-                    if isinstance(raw_data.columns, pd.MultiIndex):
-                        try: df_ticker = raw_data.xs(ticker_code, axis=1, level=1)
-                        except: df_ticker = raw_data[ticker_code]
-                    else:
-                        df_ticker = raw_data
-                    
-                    df_ticker = df_ticker.dropna(how='all')
-                    if df_ticker.empty: continue
-                    
-                    df_indi = calculate_indicators(df_ticker)
-                    if df_indi is None: continue
+    col_btn, col_info = st.columns([1, 4])
+    with col_btn:
+        # 새로고침 버튼 (데이터를 강제로 다시 불러옴)
+        if st.button("🔄 분석 새로고침", type="primary"):
+            st.session_state['scan_result_df'] = None # 초기화
+            st.rerun()
 
-                    # 분석 수행
-                    cat, color_code, reasoning = analyze_advanced_strategy(df_indi)
-                    
-                    # 표시용 데이터 생성
-                    curr_price = df_indi['Close'].iloc[-1]
-                    rsi_val = df_indi['RSI'].iloc[-1]
-                    name = TICKER_MAP.get(ticker_code, ticker_code) # 한글명 변환
-                    
-                    scan_results.append({
-                        "종목명": name,
-                        "코드": ticker_code,
-                        "현재가": curr_price,
-                        "RSI": rsi_val,
-                        "AI 추천": cat,
-                        "분석 요약": reasoning,
-                        "color": color_code # 정렬/필터링용
-                    })
-                except:
-                    continue
-                progress_bar.progress((i + 1) / len(USER_WATCHLIST))
-            
-            st.success("분석 완료!")
-            
-            if scan_results:
-                df_res = pd.DataFrame(scan_results)
+    # 데이터가 없으면 실행, 있으면 저장된 것 보여줌
+    if st.session_state['scan_result_df'] is None:
+        if st.button("🔍 전체 리스트 정밀 분석 시작"):
+            with st.spinner('AI가 차트 패턴과 보조지표를 분석 중입니다...'):
+                raw_data = get_bulk_data(USER_WATCHLIST)
+                scan_results = []
+                progress_bar = st.progress(0)
                 
-                # 정렬: 강력 매수 -> 매수 -> 관망 ... 순으로 보기 위해 커스텀 정렬
-                rank_map = {"🚀": 0, "📈": 1, "👀": 2, "📉": 3, "💥": 4}
-                df_res['rank'] = df_res['AI 추천'].apply(lambda x: rank_map.get(x[0], 5))
-                df_res = df_res.sort_values('rank')
+                for i, ticker_code in enumerate(USER_WATCHLIST):
+                    try:
+                        if isinstance(raw_data.columns, pd.MultiIndex):
+                            try: df_ticker = raw_data.xs(ticker_code, axis=1, level=1)
+                            except: df_ticker = raw_data[ticker_code]
+                        else:
+                            df_ticker = raw_data
+                        
+                        df_ticker = df_ticker.dropna(how='all')
+                        if df_ticker.empty: continue
+                        
+                        df_indi = calculate_indicators(df_ticker)
+                        if df_indi is None: continue
+
+                        cat, color_code, reasoning = analyze_advanced_strategy(df_indi)
+                        curr_price = df_indi['Close'].iloc[-1]
+                        rsi_val = df_indi['RSI'].iloc[-1]
+                        name = TICKER_MAP.get(ticker_code, ticker_code)
+                        
+                        scan_results.append({
+                            "종목명": name,
+                            "코드": ticker_code,
+                            "현재가": curr_price,
+                            "RSI": rsi_val,
+                            "AI 추천": cat,
+                            "분석 요약": reasoning,
+                        })
+                    except: continue
+                    progress_bar.progress((i + 1) / len(USER_WATCHLIST))
                 
-                # UI: Streamlit Dataframe Column Config 활용 (깔끔한 디자인)
-                st.dataframe(
-                    df_res[['종목명', '현재가', 'RSI', 'AI 추천', '분석 요약']],
-                    use_container_width=True,
-                    height=700,
-                    column_config={
-                        "종목명": st.column_config.TextColumn("종목명", help="종목의 한글 이름"),
-                        "현재가": st.column_config.NumberColumn("현재가", format="%.0f"),
-                        "RSI": st.column_config.ProgressColumn(
-                            "RSI (강도)", 
-                            help="상대강도지수 (30이하:과매도, 70이상:과매수)",
-                            format="%.1f",
-                            min_value=0, max_value=100,
-                        ),
-                        "AI 추천": st.column_config.TextColumn("AI 종합 의견", width="medium"),
-                        "분석 요약": st.column_config.TextColumn("상세 분석 사유", width="large"),
-                    },
-                    hide_index=True
-                )
-            else:
-                st.error("분석할 데이터가 없습니다.")
+                if scan_results:
+                    df_res = pd.DataFrame(scan_results)
+                    rank_map = {"🚀": 0, "📈": 1, "👀": 2, "📉": 3, "💥": 4}
+                    df_res['rank'] = df_res['AI 추천'].apply(lambda x: rank_map.get(x[0], 5))
+                    df_res = df_res.sort_values('rank')
+                    st.session_state['scan_result_df'] = df_res # 세션에 저장
+                    st.success("분석 완료!")
+                    st.rerun() # 저장된 데이터 표시를 위해 리런
+                else:
+                    st.error("데이터를 가져오지 못했습니다.")
+    
+    # 세션에 저장된 데이터 표시
+    if st.session_state['scan_result_df'] is not None:
+        st.dataframe(
+            st.session_state['scan_result_df'][['종목명', '현재가', 'RSI', 'AI 추천', '분석 요약']],
+            use_container_width=True,
+            height=700,
+            column_config={
+                "종목명": st.column_config.TextColumn("종목명"),
+                "현재가": st.column_config.NumberColumn("현재가", format="%.0f"),
+                "RSI": st.column_config.ProgressColumn(
+                    "RSI (강도)", format="%.1f", min_value=0, max_value=100,
+                ),
+                "AI 추천": st.column_config.TextColumn("AI 종합 의견", width="medium"),
+                "분석 요약": st.column_config.TextColumn("상세 분석 사유", width="large"),
+            },
+            hide_index=True
+        )
 
 # === TAB 2: 포트폴리오 ===
 with tab2:
     st.markdown("### ☁️ 내 자산 포트폴리오")
+    st.caption("토스 증권 수수료(국내 0.195%, 해외 0.1%)가 반영된 실질 수익률입니다.")
     
     db = get_db()
     if not db:
@@ -289,6 +297,7 @@ with tab2:
     else:
         col_u1, col_u2 = st.columns([1, 3])
         with col_u1:
+            # 닉네임 입력 시 세션 유지 또는 기본값 처리
             user_id = st.text_input("닉네임 입력", value="my_portfolio")
         
         doc_ref = db.collection('portfolios').document(user_id)
@@ -299,19 +308,37 @@ with tab2:
             pf_data = doc.to_dict().get('stocks', []) if doc.exists else []
         except: pf_data = []
 
-        # 추가 폼
-        with st.expander("➕ 종목 추가하기", expanded=False):
-            with st.form("add_pf"):
-                c1, c2 = st.columns(2)
-                input_ticker = c1.text_input("종목 코드 (예: TSLA, 005930)")
-                input_price = c2.number_input("내 평단가", min_value=0.0)
-                if st.form_submit_button("리스트에 추가"):
-                    fmt_ticker, _ = format_ticker(input_ticker)
-                    # 기존 것 삭제 후 추가
-                    pf_data = [p for p in pf_data if p['ticker'] != fmt_ticker]
-                    pf_data.append({"ticker": fmt_ticker, "price": input_price})
-                    doc_ref.set({'stocks': pf_data})
-                    st.rerun()
+        # === 종목 추가 UI (검색 기능 강화) ===
+        with st.container():
+            st.markdown("#### ➕ 종목 추가")
+            c1, c2, c3 = st.columns([2, 1, 1])
+            with c1:
+                # 검색 가능한 Selectbox (Autocomplete)
+                selected_item = st.selectbox(
+                    "종목 검색 (이름 또는 코드 입력)", 
+                    options=["선택하세요"] + SEARCH_LIST,
+                    index=0
+                )
+            with c2:
+                input_price = st.number_input("내 평단가", min_value=0.0, format="%.2f")
+            with c3:
+                st.write("")
+                st.write("")
+                if st.button("추가하기", type="primary"):
+                    if selected_item != "선택하세요":
+                        # "삼성전자 (005930.KS)" -> "005930.KS" 추출
+                        target_code = SEARCH_MAP[selected_item]
+                        
+                        # 기존 리스트에서 동일 종목 제거 (업데이트)
+                        new_pf_data = [p for p in pf_data if p['ticker'] != target_code]
+                        new_pf_data.append({"ticker": target_code, "price": input_price})
+                        
+                        doc_ref.set({'stocks': new_pf_data})
+                        st.success(f"{selected_item} 추가 완료!")
+                        time.sleep(0.5)
+                        st.rerun()
+                    else:
+                        st.warning("종목을 선택해주세요.")
 
         st.divider()
 
@@ -319,17 +346,15 @@ with tab2:
             st.subheader(f"{user_id}님의 보유 종목 진단")
             
             my_tickers = [p['ticker'] for p in pf_data]
-            with st.spinner("보유 종목 정밀 분석 중..."):
+            with st.spinner("최신 시세 조회 중..."):
                 my_raw = get_bulk_data(my_tickers)
             
-            # 카드 뷰 스타일
             for item in pf_data:
                 tk = item['ticker']
                 avg = item['price']
                 name = TICKER_MAP.get(tk, tk)
                 
                 try:
-                    # 데이터 추출
                     if isinstance(my_raw.columns, pd.MultiIndex):
                         try: df_tk = my_raw.xs(tk, axis=1, level=1)
                         except: df_tk = my_raw[tk]
@@ -342,17 +367,17 @@ with tab2:
                         st.warning(f"{name}: 데이터 부족")
                         continue
 
-                    # 분석
                     cat, color_hex, reasoning = analyze_advanced_strategy(df_indi)
                     curr = df_indi['Close'].iloc[-1]
-                    profit_pct = ((curr - avg) / avg) * 100
+                    
+                    # 수수료 반영 수익률 계산
+                    profit_pct, profit_amt, currency = calculate_net_profit(tk, avg, curr)
                     
                     # 수익률 색상
                     pct_color = "red" if profit_pct < 0 else "green"
                     
                     # 카드 UI
                     with st.container():
-                        # 다크모드 대응을 위한 HTML/CSS 스타일링 없는 Streamlit 네이티브 활용
                         c1, c2, c3 = st.columns([1.5, 1.5, 4])
                         
                         with c1:
@@ -360,21 +385,30 @@ with tab2:
                             st.caption(f"{tk}")
                         
                         with c2:
-                            st.metric("수익률", f"{profit_pct:.2f}%", delta=f"{curr - avg:.0f}")
-                            st.caption(f"평단: {avg:,.0f} / 현재: {curr:,.0f}")
+                            # 통화 기호와 포맷 자동 적용
+                            if currency == "₩":
+                                fmt_curr = f"{curr:,.0f}"
+                                fmt_avg = f"{avg:,.0f}"
+                                fmt_diff = f"{profit_amt:,.0f}"
+                            else:
+                                fmt_curr = f"{curr:,.2f}"
+                                fmt_avg = f"{avg:,.2f}"
+                                fmt_diff = f"{profit_amt:,.2f}"
+                                
+                            st.metric("순수익률 (수수료 제)", f"{profit_pct:.2f}%", delta=f"{currency}{fmt_diff}")
+                            st.caption(f"평단: {currency}{fmt_avg} / 현재: {currency}{fmt_curr}")
                             
                         with c3:
-                            # 추천 등급 배지
                             st.markdown(f"**AI 판단:** :{color_hex}[{cat}]")
-                            st.info(f"💡 **분석:** {reasoning}")
+                            st.info(f"💡 {reasoning}")
                         
                         st.divider()
                         
                 except Exception as e:
-                    st.error(f"{name} 분석 중 오류 발생")
+                    st.error(f"{name} 오류: {e}")
 
-            if st.button("🗑️ 포트폴리오 전체 초기화"):
+            if st.button("🗑️ 포트폴리오 전체 삭제"):
                 doc_ref.delete()
                 st.rerun()
         else:
-            st.info("저장된 종목이 없습니다. '종목 추가하기'를 눌러 포트폴리오를 구성해보세요.")
+            st.info("위 검색창에서 종목을 검색하여 추가해주세요.")
