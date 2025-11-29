@@ -386,7 +386,7 @@ with tab4:
         bar.empty()
         progress_text.empty()
         
-if results:
+        if results:
             df_res = pd.DataFrame(results)
             
             # ---------------------------------------------------------
