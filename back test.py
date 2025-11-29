@@ -492,7 +492,7 @@ with tab4:
             # UI용 이름 리스트 생성
             ticker_options = [f"{TICKER_MAP.get(t, t)} ({t})" for t in traded_tickers]
             
-if len(ticker_options) > 0:
+            if len(ticker_options) > 0:
                 selected_option = st.selectbox("분석할 종목 선택", ticker_options)
                 selected_ticker = selected_option.split('(')[-1].replace(')', '')
                 selected_name = TICKER_MAP.get(selected_ticker, selected_ticker)
