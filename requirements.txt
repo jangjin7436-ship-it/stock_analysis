@@ -1,0 +1,5 @@
+streaance
+pandas
+numpy
+plotlymlit
+yfin
