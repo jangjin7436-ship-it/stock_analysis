@@ -279,31 +279,31 @@ def get_bulk_us_data(us_tickers):
 
 
 def fetch_kr_polling(ticker):
-
-    """국내 주식 실시간 (네이버)"""
-
+    """국내 주식 실시간 (네이버, 시간외 단일가까지 최대한 반영)"""
     code = ticker.split('.')[0]
-
     try:
-
         url = f"https://polling.finance.naver.com/api/realtime/domestic/stock/{code}"
-
         headers = {"User-Agent": "Mozilla/5.0"}
-
         res = requests.get(url, headers=headers, timeout=2)
-
         data = res.json()
+        item = data["datas"][0]
 
-        item = data['datas'][0]
+        # 1) 기본: 정규장 기준 가격(지금까지 쓰던 값)
+        price = float(str(item["closePrice"]).replace(",", ""))
 
+        # 2) 시간외 단일가 정보가 있으면 그걸 우선 사용
+        # ⚠ 실제 키 이름은 res.json() 찍어서 확인하고 맞게 수정해야 함
+        over_info = item.get("overMarketPriceInfo") or item.get("afterHoursTrading")
+        if over_info:
+            status = over_info.get("overMarketStatus") or over_info.get("status")
+            over_price = over_info.get("overPrice") or over_info.get("price")
+            if over_price and status and status != "NONE":
+                # 예: status가 "TRADING" 이면 시간외 거래 중이라는 의미일 가능성이 큼
+                price = float(str(over_price).replace(",", ""))
 
-
-        close = float(str(item['closePrice']).replace(',', ''))
-
-        return ticker, close
+        return ticker, price
 
     except Exception:
-
         return ticker, None
 
 
