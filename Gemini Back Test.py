@@ -193,8 +193,6 @@ def get_ai_score_row(row):
 def prepare_stock_data(ticker_info, start_date):
     """
     개별 종목의 데이터를 미리 준비하는 함수
-    → 네트워크는 load_price_data에서 캐시되므로
-      같은 세션/같은 시작일이면 항상 같은 데이터 사용
     """
     code, name = ticker_info
     try:
@@ -208,26 +206,22 @@ def prepare_stock_data(ticker_info, start_date):
         df['Ticker'] = code
         df['Name'] = name
         
-        # [수정] Vol_Ratio 추가 (정렬 기준용)
-        # ★ STD20까지 돌려줘서 포지션 사이징에 사용
-        return df[['Close_Calc', 'AI_Score', 'STD20', 'Vol_Ratio', 'Ticker', 'Name']]
+        # [수정] 1분봉 시뮬레이션을 위해 Open, High, Low 데이터 추가 반환
+        return df[['Open', 'High', 'Low', 'Close_Calc', 'AI_Score', 'STD20', 'Vol_Ratio', 'Ticker', 'Name']]
     except Exception as e:
-        # 원하면 로그 찍기
-        # st.write(f"{code} 데이터 오류: {e}")
         return None
 
 
 def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
                            max_hold_days, exchange_data, use_compound, selection_mode):
     """
-    [수정 완료] 2주 단기 스윙 최적화 백테스트 엔진
-    - 데이터 로딩 + 환율 처리 + 매매 로직(스윙) + 자산 평가 통합
+    [수정 완료] 장중(Intraday) 변동성을 반영한 1분봉 시뮬레이션 매도 로직 적용
+    - Open/High/Low를 사용하여 갭락 및 장중 손절/익절을 정밀하게 체크
     """
     # ---------------------------------------------------------
-    # 1. 전 종목 데이터 준비 (단일 스레드, 순서 고정)
+    # 1. 전 종목 데이터 준비
     # ---------------------------------------------------------
     all_dfs = []
-    # targets는 (Ticker, Name) 튜플 리스트
     for t in targets:
         res = prepare_stock_data(t, start_date)
         if res is not None:
@@ -237,7 +231,7 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
         return pd.DataFrame(), pd.DataFrame()
 
     # ---------------------------------------------------------
-    # 2. Market Data 통합 (날짜별로 종목 리스트 모으기)
+    # 2. Market Data 통합
     # ---------------------------------------------------------
     market_data = {}
     for df in all_dfs:
@@ -254,11 +248,9 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
     if isinstance(exchange_data, (float, int)):
         get_rate = lambda d: float(exchange_data)
     else:
-        # 시리즈나 데이터프레임인 경우 딕셔너리로 변환해 접근 속도 향상
         rate_dict = exchange_data.to_dict()
         def get_rate(d):
             ts = pd.Timestamp(d)
-            # 해당 날짜 환율 없으면 기본값 1430.0 (fallback)
             return rate_dict.get(ts, 1430.0)
 
     # ---------------------------------------------------------
@@ -269,7 +261,6 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
     trades_log = []
     equity_curve = []
     
-    # "점수 1등만 매수" -> 1종목 몰빵 / "분산" -> 최대 5종목
     max_slots = 1 if selection_mode == 'TOP1' else 5 
 
     # ---------------------------------------------------------
@@ -280,93 +271,139 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
         current_rate = get_rate(date)
 
         # =================================================
-        # A. 매도 로직 (Sell Check) - 2주 스윙 최적화
+        # A. 매도 로직 (Sell Check) - [1분봉 시뮬레이션 적용]
         # =================================================
         sell_list = []
         for ticker in sorted(portfolio.keys()):
             info = portfolio[ticker]
             stock_row = next((x for x in daily_stocks if x['Ticker'] == ticker), None)
             
-            # 상장폐지 등 데이터가 사라진 경우 건너뜀 (보유 유지 or 강제청산 로직 필요시 추가)
             if stock_row is None: 
                 continue
             
-            curr_price_raw = stock_row['Close_Calc']
-            curr_price_krw = curr_price_raw * (1.0 if ".KS" in ticker else current_rate)
+            # [1분봉 시뮬레이션을 위한 데이터 추출]
+            # yfinance auto_adjust=True이므로 O/H/L/C 모두 수정주가 기준임
+            rate = 1.0 if ".KS" in ticker else current_rate
+            
+            raw_open = stock_row['Open']
+            raw_high = stock_row['High']
+            raw_low = stock_row['Low']
+            raw_close = stock_row['Close_Calc']
+            
+            # 환율 적용 가격
+            curr_open = raw_open * rate
+            curr_high = raw_high * rate
+            curr_low = raw_low * rate
+            curr_close = raw_close * rate
+            
             score = stock_row['AI_Score']
             fee_sell = 0.003 if ".KS" in ticker else 0.001
             
-            # 수익률 계산
-            profit_ratio = (curr_price_krw - info['avg_price']) / info['avg_price']
-            profit_pct = profit_ratio * 100
+            # 보유 정보
+            avg_price = info['avg_price']
             
-            # 보유 일수 계산
+            # 수익률(종가 기준 - 단순 참고용)
+            profit_pct_close = ((curr_close - avg_price) / avg_price) * 100
             held_days = (pd.Timestamp(date) - pd.Timestamp(info['buy_date'])).days
             
-            # 최고가 갱신 (트레일링 스탑용)
-            if curr_price_krw > info['max_price']:
-                portfolio[ticker]['max_price'] = curr_price_krw
-            
-            # 고점 대비 하락률
-            drawdown_from_peak = (curr_price_krw - info['max_price']) / info['max_price']
-
             should_sell = False
             sell_reason = ""
+            final_sell_price = curr_close # 기본은 종가 매도
+            final_sell_price_raw = raw_close
 
-            # 1) 절대적 타임 컷 (2주 = 14일, 거래일 기준 약 10일)
-            limit_days = max_hold_days if max_hold_days > 0 else 14 
-            if held_days >= limit_days:
-                should_sell = True
-                sell_reason = f"⏱️ 만기청산({held_days}일)"
-
-            # 2) 시간 가속 청산 (Time Decay)
-            # 1주일(7일) 지났는데 수익이 1%도 안 되면 교체 매매
-            if not should_sell and held_days >= 7 and profit_pct < 1.0:
-                should_sell = True
-                sell_reason = "🐢 지지부진(7일↑)"
-
-            # 3) 수익 및 손절 관리 (Dynamic Trailing Stop)
+            # ---------------------------------------------------
+            # [시나리오 1] 장 시작 갭락(Gap Down) 체크 - 최우선
+            # ---------------------------------------------------
+            # 시가가 이미 손절가(-3.5%) 아래에서 시작했는가?
+            stop_loss_price = avg_price * 0.965
+            
             if not should_sell:
-                # (a) 손절매 (Hard Stop): -3.5%
-                if profit_pct <= -3.5:
+                if curr_open <= stop_loss_price:
                     should_sell = True
-                    sell_reason = "⚡ 손절(-3.5%)"
+                    sell_reason = "⚡ 갭락손절(시가)"
+                    final_sell_price = curr_open # 시가에 체결 (어쩔 수 없음)
+                    final_sell_price_raw = raw_open
+
+            # ---------------------------------------------------
+            # [시나리오 2] 장중 손절 (Intraday Stop)
+            # ---------------------------------------------------
+            # 시가는 괜찮았는데, 장중에 저가가 손절가를 건드렸는가?
+            if not should_sell:
+                if curr_low <= stop_loss_price:
+                    should_sell = True
+                    sell_reason = "⚡ 장중손절(-3.5%)"
+                    final_sell_price = stop_loss_price # 손절가에 정확히 체결 (지정가 감시 효과)
+                    final_sell_price_raw = raw_low # (근사치)
+
+            # ---------------------------------------------------
+            # [시나리오 3] 트레일링 스탑 & 익절 (Intraday Trailing)
+            # ---------------------------------------------------
+            # 먼저 고가(High)를 확인해 최고가 갱신 처리
+            if not should_sell:
+                if curr_high > info['max_price']:
+                    portfolio[ticker]['max_price'] = curr_high
                 
-                # (b) 트레일링 스탑 (수익 보존)
-                # 수익 5% 이상 나면 -> 평단가 + 1% 밑으로 내려오면 바로 매도 (원금 사수)
-                elif info['max_price'] > info['avg_price'] * 1.05:
-                    if curr_price_krw < info['avg_price'] * 1.01: 
+                max_p = portfolio[ticker]['max_price']
+                
+                # (a) 수익 반납 방어: 최고가가 평단 대비 +5% 이상 갔었는데
+                if max_p > avg_price * 1.05:
+                    # 장중 저가가 평단가 +1% 라인을 깼다면?
+                    protect_line = avg_price * 1.01
+                    if curr_low < protect_line:
                         should_sell = True
                         sell_reason = "🛡️ 수익반납방어"
-                    # 고점에서 3% 빠지면 익절
-                    elif drawdown_from_peak <= -0.03:
+                        final_sell_price = protect_line
+                        final_sell_price_raw = raw_low # (근사치)
+                    
+                    # (b) 고점 대비 -3% 하락 (트레일링)
+                    elif curr_low < max_p * 0.97:
                         should_sell = True
                         sell_reason = "📉 트레일링(-3%)"
+                        final_sell_price = max_p * 0.97
+                        final_sell_price_raw = raw_low
 
-                # (c) 급등 시 차익 실현 (RSI 과열)
-                # 15% 이상 급등하고 점수가 50 미만으로 떨어지면 익절
-                elif profit_pct >= 15.0 and score < 50: 
+            # ---------------------------------------------------
+            # [시나리오 4] 종가 기준 판단 (기존 로직 유지)
+            # ---------------------------------------------------
+            if not should_sell:
+                # 타임 컷
+                limit_days = max_hold_days if max_hold_days > 0 else 14 
+                if held_days >= limit_days:
+                    should_sell = True
+                    sell_reason = f"⏱️ 만기청산({held_days}일)"
+                
+                # 지지부진
+                elif held_days >= 7 and profit_pct_close < 1.0:
+                    should_sell = True
+                    sell_reason = "🐢 지지부진(7일↑)"
+                
+                # 급등 후 점수 하락 익절
+                elif profit_pct_close >= 15.0 and score < 50:
                     should_sell = True
                     sell_reason = "💰 급등익절(+15%)"
-
-                # (d) 점수 급락 (추세 이탈)
+                
+                # 추세 이탈
                 elif score < 40:
                     should_sell = True
                     sell_reason = "추세이탈(40↓)"
 
             # 매도 실행
             if should_sell:
-                return_amt = info['shares'] * curr_price_krw * (1 - fee_sell)
+                # 실제 수익률 재계산 (체결가 기준)
+                real_profit_pct = ((final_sell_price - avg_price) / avg_price) * 100
+                
+                return_amt = info['shares'] * final_sell_price * (1 - fee_sell)
                 balance += return_amt
+                
                 trades_log.append({
                     'ticker': ticker,
                     'name': info['name'],
                     'date': date,
                     'type': 'sell',
-                    'price': curr_price_raw,
+                    'price': final_sell_price_raw, # 원화 환산 전 가격(기록용)
                     'shares': info['shares'],
                     'score': score,
-                    'profit': profit_pct,
+                    'profit': real_profit_pct,
                     'reason': sell_reason,
                     'balance': balance
                 })
@@ -377,7 +414,7 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
             del portfolio[t]
 
         # =================================================
-        # B. 신규 매수 (Buy Logic)
+        # B. 신규 매수 (Buy Logic) - [기존 유지: 일봉 종가 기준]
         # =================================================
         if len(portfolio) < max_slots:
             candidates = []
@@ -390,12 +427,9 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
                 price_raw = row['Close_Calc']
                 price_krw = price_raw * (1.0 if ".KS" in ticker else current_rate)
                 
-                # [수정] 거래량 비율 확인 (데이터에 있으면 쓰고 없으면 기본값)
                 vol_power = row.get('Vol_Ratio', 1.0)
                 
-                # [필터] 점수 70점 이상 (스윙 진입 타점)
                 if score >= 70:
-                    # 너무 과열된 종목(RSI 75 이상)은 제외
                     rsi_val = row.get('RSI', 50)
                     if rsi_val < 75:
                         vol_ratio = row.get('STD20', 0) / price_raw if price_raw > 0 else 0.03
@@ -405,15 +439,13 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
                             'price_raw': price_raw,
                             'price_krw': price_krw,
                             'score': score,
-                            'vol_power': vol_power, # 정렬용 추가
+                            'vol_power': vol_power,
                             'vol_ratio': vol_ratio,
                             'reason': "AI추천(70↑)"
                         })
 
-            # [핵심 수정] 정렬 기준 변경: 1순위(점수), 2순위(거래량비율)
             candidates.sort(key=lambda x: (x['score'], x['vol_power']), reverse=True)
             
-            # 매수할 종목 수 계산
             open_slots = max_slots - len(portfolio)
             buy_targets = candidates[:open_slots]
             
@@ -421,7 +453,6 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
                 if balance <= 0: 
                     break
                 
-                # 자금 배분: (남은 현금 / 남은 슬롯) -> 균등 배분
                 current_open_slots = max_slots - len(portfolio)
                 slot_budget = balance / current_open_slots
                 
@@ -439,7 +470,7 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
                             'shares': shares,
                             'avg_price': target['price_krw'],
                             'buy_date': date,
-                            'max_price': target['price_krw'], # 고점 초기화
+                            'max_price': target['price_krw'],
                         }
                         
                         trades_log.append({
@@ -474,13 +505,12 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
 # =========================================================
 # 3. UI 통합 (탭 추가)
 # =========================================================
-# (기존 코드의 tab1, tab2, tab3 정의 아래에 tab4를 추가한다고 가정)
 
-tab4 = st.tabs(["📊 전체 백테스트 시뮬레이션"])[0] # 기존 tabs 리스트에 추가 필요
+tab4 = st.tabs(["📊 전체 백테스트 시뮬레이션"])[0] 
 
 with tab4:
     st.markdown("### 🧪 포트폴리오 유니버스 백테스트")
-    st.caption("AI 전략 시뮬레이터 Final Ver. (일봉 종가 기준 / 동시 호가 반영)")
+    st.caption("AI 전략 시뮬레이터 Final Ver. (일봉 기준 매수 / 1분봉 시뮬레이션 매도)")
     
     # --------------------------------------------------------------------------------
     # 1. 설정 패널
@@ -530,48 +560,39 @@ with tab4:
     # 2. 실행 로직 (세션 스테이트를 사용하여 결과 저장)
     # --------------------------------------------------------------------------------
     
-    # 세션 상태 초기화 (결과 저장용 변수가 없으면 만듦)
     if 'bt_result_trade' not in st.session_state:
         st.session_state['bt_result_trade'] = pd.DataFrame()
     if 'bt_result_equity' not in st.session_state:
         st.session_state['bt_result_equity'] = pd.DataFrame()
 
     if start_btn:
-        # 환율 준비
         if exchange_arg_val == "DYNAMIC":
             with st.spinner("💱 환율 데이터 수집 중..."):
                 exchange_data_payload = load_fx_series(str(bt_start_date))
         else:
             exchange_data_payload = float(exchange_arg_val)
 
-        # 시뮬레이션 실행
         with st.spinner(f"🔄 [{selected_strategy}] 전략으로 전체 시장 스캔 중..."):
             targets = list(TICKER_MAP.items())
             
-            # 백테스트 함수 실행
             t_df, e_df = run_portfolio_backtest(
                 targets, str(bt_start_date), initial_cap_input, strat_code, 
                 max_hold_days, exchange_data_payload, comp_mode, selection_code
             )
             
-            # ★ 핵심: 결과를 세션 스테이트에 저장 (화면이 리로드되어도 안 사라짐)
             st.session_state['bt_result_trade'] = t_df
             st.session_state['bt_result_equity'] = e_df
             
-            # 완료 메시지 (잠깐 떴다 사라짐)
             st.success("백테스트 완료! 결과를 확인하세요.")
 
     # --------------------------------------------------------------------------------
-    # 3. 결과 대시보드 (저장된 데이터가 있으면 출력)
+    # 3. 결과 대시보드
     # --------------------------------------------------------------------------------
     
-    # 버튼을 눌렀든 안 눌렀든, 저장된 결과가 있으면 변수에 할당하여 화면에 표시
     trade_df = st.session_state['bt_result_trade']
     equity_df = st.session_state['bt_result_equity']
 
-    # 데이터가 비어있지 않을 때만 대시보드 렌더링
     if not trade_df.empty and not equity_df.empty:
-            # --- 추가 지표 계산 ---
             equity_df['max_equity'] = equity_df['equity'].cummax()
             equity_df['drawdown'] = (equity_df['equity'] - equity_df['max_equity']) / equity_df['max_equity'] * 100
             mdd = equity_df['drawdown'].min()
@@ -585,42 +606,31 @@ with tab4:
             total_sells = len(sells)
             win_rate = (win_count / total_sells * 100) if total_sells > 0 else 0.0
 
-            # ---------------------------
-            # [섹션 A] 핵심 성과 지표 (KPI)
-            # ---------------------------
+            # [섹션 A] 핵심 성과 지표
             st.markdown("#### 🚀 백테스트 요약 리포트")
             
             with st.container(border=True):
                 k1, k2, k3, k4, k5 = st.columns(5)
-                
                 k1.metric("최종 자산", f"{final_equity/10000:,.0f}만원", 
                           delta=f"{profit_amt/10000:,.0f}만원", delta_color="normal")
-                
                 k2.metric("총 수익률", f"{total_return:,.2f}%", 
                           delta="복리 적용" if comp_mode else "단리 적용")
-                
                 k3.metric("승률 (Win Rate)", f"{win_rate:.1f}%", 
                           f"{win_count}승 {total_sells-win_count}패")
-                
                 k4.metric("MDD (최대낙폭)", f"{mdd:.2f}%", 
                           "Risk Level", delta_color="off")
-                
                 k5.metric("총 매매 횟수", f"{len(trade_df)//2}회", 
                           f"평균 {len(trade_df)//2 / len(equity_df) * 5:.1f}회/주")
 
-            # ---------------------------
-            # [섹션 B] 자산 성장 그래프 (테마 적응형)
-            # ---------------------------
+            # [섹션 B] 자산 성장 그래프
             st.markdown("#### 📈 자산 성장 & MDD 추이")
-            
             tab_g1, tab_g2 = st.tabs(["💰 자산 커브 (Equity)", "💧 낙폭 (Drawdown)"])
             
-            # 공통 레이아웃 설정 (투명 배경 + 반투명 그리드)
             common_layout = dict(
-                paper_bgcolor='rgba(0,0,0,0)',  # 전체 배경 투명
-                plot_bgcolor='rgba(0,0,0,0)',   # 차트 영역 투명
-                font=dict(color=None),          # 폰트색: None으로 두면 Streamlit 테마 자동 추적
-                xaxis=dict(showgrid=True, gridcolor='rgba(128,128,128,0.2)'), # 그리드: 연한 회색 (양쪽 모드 호환)
+                paper_bgcolor='rgba(0,0,0,0)',
+                plot_bgcolor='rgba(0,0,0,0)',
+                font=dict(color=None),
+                xaxis=dict(showgrid=True, gridcolor='rgba(128,128,128,0.2)'),
                 yaxis=dict(showgrid=True, gridcolor='rgba(128,128,128,0.2)'),
                 hovermode="x unified"
             )
@@ -628,26 +638,20 @@ with tab4:
             with tab_g1:
                 fig = px.line(equity_df, x='date', y='equity', title=None, height=350)
                 fig.add_hline(y=initial_cap_input, line_dash="dash", line_color="gray", annotation_text="원금")
-                
-                # 라인 색상: 민트색 (다크/라이트 모두 잘 보임)
                 fig.update_traces(line=dict(color='#00CC96', width=2), fill='tozeroy') 
                 fig.update_layout(xaxis_title="", yaxis_title="평가 금액 (원)", **common_layout)
                 st.plotly_chart(fig, use_container_width=True)
                 
             with tab_g2:
                 fig_dd = px.area(equity_df, x='date', y='drawdown', title=None, height=350)
-                # 낙폭 색상: 붉은 계열 (경고 의미)
                 fig_dd.update_traces(line=dict(color='#EF553B'), fillcolor='rgba(239, 85, 59, 0.2)')
-                
                 y_min = mdd * 1.2 if mdd < 0 else -5.0
                 fig_dd.update_layout(xaxis_title="", yaxis_title="낙폭 (%)", yaxis_range=[y_min, 1], **common_layout)
                 st.plotly_chart(fig_dd, use_container_width=True)
 
             st.divider()
 
-            # ---------------------------
             # [섹션 C] 매매 상세 분석
-            # ---------------------------
             c_left, c_right = st.columns([1, 1.5])
             
             with c_left:
@@ -659,13 +663,12 @@ with tab4:
                     with st.container(border=True):
                         st.caption("🔥 최고의 매매")
                         st.markdown(f"**{best_trade['name']}**")
-                        # 빨간색/파란색 텍스트 대신 Streamlit 기본 컬러 사용 (가독성 확보)
                         st.metric("수익률", f"{best_trade['profit']:.2f}%", best_trade['reason'])
                         
                     with st.container(border=True):
                         st.caption("💧 최악의 매매")
                         st.markdown(f"**{worst_trade['name']}**")
-                        st.metric("수익률", f"{worst_trade['profit']:.2f}%", worst_trade['reason'], delta_color="inverse") # inverse: 하락이 빨강(나쁨) 표시
+                        st.metric("수익률", f"{worst_trade['profit']:.2f}%", worst_trade['reason'], delta_color="inverse")
                 else:
                     st.info("매도 완료된 거래가 없습니다.")
 
@@ -678,7 +681,6 @@ with tab4:
                     selected_option = st.selectbox("종목 선택", ticker_options, label_visibility="collapsed")
                     selected_ticker = selected_option.split('(')[-1].replace(')', '')
                     
-                    # 데이터 로딩
                     my_trades = trade_df[trade_df['ticker'] == selected_ticker].sort_values('date')
                     with st.spinner("차트 로딩..."):
                         chart_data = yf.download(selected_ticker, start=str(bt_start_date), progress=False, auto_adjust=True)
@@ -688,23 +690,20 @@ with tab4:
 
                     if not chart_data.empty:
                         fig_d = go.Figure()
-                        
-                        # 주가 라인: 테마에 따라 자동 조정되도록 회색 계열 사용하되 약간 진하게
                         fig_d.add_trace(go.Scatter(x=chart_data.index, y=chart_data['Close'], 
                                                    mode='lines', name='주가', 
                                                    line=dict(color='#888888', width=1.5)))
                         
-                        # 매수: 빨강 (표준)
                         buys = my_trades[my_trades['type'] == 'buy']
                         if not buys.empty:
                             fig_d.add_trace(go.Scatter(x=buys['date'], y=buys['price'], mode='markers', name='매수', 
-                                                       marker=dict(symbol='triangle-up', color='#FF4B4B', size=11), # 가시성 높은 빨강
+                                                       marker=dict(symbol='triangle-up', color='#FF4B4B', size=11),
                                                        hovertemplate='매수: %{y:,.0f}<br>날짜: %{x}'))
-                        # 매도: 파랑 (표준)
+                        
                         sells_sub = my_trades[my_trades['type'] == 'sell']
                         if not sells_sub.empty:
                             fig_d.add_trace(go.Scatter(x=sells_sub['date'], y=sells_sub['price'], mode='markers', name='매도', 
-                                                       marker=dict(symbol='triangle-down', color='#1C83E1', size=11), # 가시성 높은 파랑
+                                                       marker=dict(symbol='triangle-down', color='#1C83E1', size=11),
                                                        text=[f"{p:.1f}%" for p in sells_sub['profit']], 
                                                        hovertemplate='매도: %{y:,.0f}<br>수익: %{text}'))
                         
@@ -713,7 +712,7 @@ with tab4:
                             height=350, 
                             margin=dict(l=10, r=10, t=40, b=10),
                             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                            **common_layout # 위에서 정의한 공통 투명 레이아웃 적용
+                            **common_layout
                         )
                         st.plotly_chart(fig_d, use_container_width=True)
                     else:
@@ -723,17 +722,12 @@ with tab4:
 
             st.divider()
 
-            # ---------------------------
             # [섹션 D] 전체 거래 일지
-            # ---------------------------
             st.subheader("📝 전체 거래 로그")
             
             with st.expander("전체 거래 내역 (펼치기/접기)", expanded=True):
                 log_df = trade_df.copy()
                 log_df['date'] = log_df['date'].dt.date
-
-                # ★ shares 컬럼 포함
-                #    date, name, type, price, shares, profit, score, reason 순으로 정리
                 log_df = log_df[['date', 'name', 'type', 'price', 'shares', 'profit', 'score', 'reason']]
                 log_df.columns = ['날짜', '종목명', '구분', '가격', '수량', '수익률', 'AI점수', '매매사유']
 
@@ -744,7 +738,7 @@ with tab4:
                     height=500,
                     column_config={
                         "날짜": st.column_config.DateColumn("날짜", format="YYYY-MM-DD"),
-                        "가격": st.column_config.NumberColumn("체결가", format="%.0f"),  # 기존 체결가 포맷 유지
+                        "가격": st.column_config.NumberColumn("체결가", format="%.0f"), 
                         "수량": st.column_config.NumberColumn("수량(주)", format="%d"),
                         "AI점수": st.column_config.ProgressColumn("AI Score", format="%.0f점", min_value=0, max_value=100),
                         "수익률": st.column_config.NumberColumn("수익률(%)", format="%.2f%%"),
