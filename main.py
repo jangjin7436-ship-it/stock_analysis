@@ -74,9 +74,10 @@ SEARCH_MAP = {f"{name} ({code})": code for code, name in TICKER_MAP.items()}
 USER_WATCHLIST = list(TICKER_MAP.keys())
 
 # ---------------------------------------------------------
-# 2. 데이터 수집 (NXT/After Market 대응)
+# 2. 데이터 수집 (NXT/After Market 강력 반영)
 # ---------------------------------------------------------
 def fetch_single_kr_stock(ticker):
+    """한국 주식: FinanceDataReader (네이버 금융)"""
     try:
         code = ticker.split('.')[0]
         df = fdr.DataReader(code, '2023-01-01')
@@ -85,35 +86,42 @@ def fetch_single_kr_stock(ticker):
     except:
         return None
 
-def get_realtime_price_us(ticker):
-    """미국 주식 실시간 가격 (NXT/After Market 포함)"""
+def fetch_us_realtime(ticker):
+    """미국 주식: 실시간/애프터마켓 가격 (fast_info)"""
     try:
-        info = yf.Ticker(ticker).fast_info
-        return info['last_price']
+        # fast_info는 가장 최신의 체결가(장후 포함)를 제공함
+        price = yf.Ticker(ticker).fast_info['last_price']
+        return (ticker, price)
     except:
-        return None
+        return (ticker, None)
 
-@st.cache_data(ttl=5)
-def get_hybrid_data(tickers_list):
+@st.cache_data(ttl=5) # 5초 캐시
+def get_hybrid_data_v2(tickers_list):
+    """
+    1. 히스토리 데이터(지표용)와 실시간 가격(현재가용)을 병합하여
+    2. 분석 시점에 가장 정확한 데이터셋을 생성함
+    """
     kr_tickers = [t for t in tickers_list if t.endswith('.KS') or t.endswith('.KQ')]
     us_tickers = [t for t in tickers_list if t not in kr_tickers]
-    combined_data = {}
+    
+    final_dfs = {} # {ticker: DataFrame}
 
-    # 1. 한국 주식 (병렬)
+    # === A. 한국 주식 (FDR) ===
     if kr_tickers:
         with concurrent.futures.ThreadPoolExecutor() as executor:
-            future_to_ticker = {executor.submit(fetch_single_kr_stock, t): t for t in kr_tickers}
-            for future in concurrent.futures.as_completed(future_to_ticker):
-                result = future.result()
-                if result:
-                    ticker, df = result
-                    combined_data[ticker] = df
+            future_to_kr = {executor.submit(fetch_single_kr_stock, t): t for t in kr_tickers}
+            for future in concurrent.futures.as_completed(future_to_kr):
+                res = future.result()
+                if res:
+                    tk, df = res
+                    final_dfs[tk] = df
 
-    # 2. 미국 주식 (Bulk History)
+    # === B. 미국 주식 (History + Realtime Merge) ===
     if us_tickers:
+        # 1. 차트 분석용 히스토리 (Bulk)
+        history_map = {}
         try:
             yf_data = yf.download(us_tickers, period="2y", group_by='ticker', threads=True, prepost=True)
-            
             for t in us_tickers:
                 try:
                     df = None
@@ -127,16 +135,38 @@ def get_hybrid_data(tickers_list):
                             df = yf_data
                     
                     if df is not None and not df.empty:
-                        if 'Close' in df.columns:
-                            combined_data[t] = df
-                        elif 'Adj Close' in df.columns: 
+                        # Close 컬럼 보정
+                        if 'Close' not in df.columns and 'Adj Close' in df.columns:
                             df['Close'] = df['Adj Close']
-                            combined_data[t] = df
+                        history_map[t] = df
                 except: pass
-        except Exception as e:
-            pass 
-                    
-    return combined_data
+        except: pass
+
+        # 2. 현재가용 실시간 데이터 (Parallel)
+        realtime_map = {}
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future_to_us = {executor.submit(fetch_us_realtime, t): t for t in us_tickers}
+            for future in concurrent.futures.as_completed(future_to_us):
+                tk, price = future.result()
+                if price: realtime_map[tk] = price
+
+        # 3. 병합 (History의 마지막 값을 Realtime 가격으로 강제 업데이트)
+        # 이렇게 해야 RSI, MACD 등이 애프터마켓 가격 기준으로 계산됨
+        for t in us_tickers:
+            if t in history_map:
+                df = history_map[t].copy()
+                if t in realtime_map:
+                    latest_price = realtime_map[t]
+                    # 마지막 행의 Close 값을 최신 실시간 가격으로 덮어씀 (AI 분석 정확도 향상)
+                    # 혹은 새로운 행을 추가할 수도 있으나, 데이터 연속성을 위해 덮어쓰기 방식 채택
+                    df.iloc[-1, df.columns.get_loc('Close')] = latest_price
+                final_dfs[t] = df
+            elif t in realtime_map:
+                # 히스토리가 실패해도 실시간 가격만이라도 있으면 DataFrame 생성 (분석은 안되더라도 가격 표시는 되게)
+                # 단, 지표 계산 시 에러나므로 여기선 생략하거나 더미 데이터 처리 필요
+                pass
+
+    return final_dfs
 
 def calculate_indicators(df):
     if len(df) < 60: return None
@@ -168,17 +198,41 @@ def calculate_indicators(df):
     
     return df.dropna()
 
-def calculate_net_profit(ticker, avg_price, current_price):
+def calculate_total_profit(ticker, avg_price, current_price, quantity):
+    """
+    수수료/세금 반영한 총 순수익 계산
+    """
     is_kr = ticker.endswith(".KS") or ticker.endswith(".KQ")
     if is_kr: fee_tax_rate = 0.0018 
     else: fee_tax_rate = 0.002
     
-    net_sell_price = current_price * (1 - fee_tax_rate)
-    profit_amt = net_sell_price - avg_price
-    profit_pct = (profit_amt / avg_price) * 100
+    # 1. 총 매수 금액
+    total_buy = avg_price * quantity
+    
+    # 2. 총 평가 금액 (현재가 * 수량)
+    total_eval = current_price * quantity
+    
+    # 3. 매도 시 수령 예상 금액 (수수료 차감 후)
+    total_sell_net = total_eval * (1 - fee_tax_rate)
+    
+    # 4. 순수익 (세후 수령액 - 매수 원금)
+    net_profit_amt = total_sell_net - total_buy
+    
+    # 5. 순수익률
+    if total_buy > 0:
+        net_profit_pct = (net_profit_amt / total_buy) * 100
+    else:
+        net_profit_pct = 0.0
+    
     currency = "₩" if is_kr else "$"
     
-    return profit_pct, profit_amt, currency
+    return {
+        "pct": net_profit_pct,
+        "amt": net_profit_amt,
+        "eval": total_eval,
+        "invest": total_buy,
+        "currency": currency
+    }
 
 # ---------------------------------------------------------
 # 3. 전략 분석
@@ -285,7 +339,7 @@ tab1, tab2, tab3 = st.tabs(["🚀 전체 종목 스캐너", "💼 내 포트폴�
 
 with tab1:
     st.markdown("### 📋 AI 정밀 스캐너")
-    st.caption("안전성(저점 매수)과 수익성(추세/모멘텀)을 종합 평가하여 점수를 매깁니다.")
+    st.caption("실시간(After Market) 가격을 반영하여 AI가 분석합니다.")
 
     col_btn, col_info = st.columns([1, 4])
     with col_btn:
@@ -295,8 +349,8 @@ with tab1:
 
     if st.session_state['scan_result_df'] is None:
         if st.button("🔍 전체 리스트 정밀 분석 시작"):
-            with st.spinner('데이터 수집 및 분석 중... (NXT 반영)'):
-                raw_data_dict = get_hybrid_data(USER_WATCHLIST)
+            with st.spinner('실시간 가격 반영 및 AI 분석 중...'):
+                raw_data_dict = get_hybrid_data_v2(USER_WATCHLIST)
                 scan_results = []
                 progress_bar = st.progress(0)
                 
@@ -358,7 +412,7 @@ with tab1:
 
 with tab2:
     st.markdown("### ☁️ 내 자산 포트폴리오")
-    st.caption("NXT(After Market) 가격 적용 | 수수료/세금 적용")
+    st.caption("NXT(After Market) 실시간 반영 | 수수료/세금 적용 순수익")
     
     db = get_db()
     if not db:
@@ -375,19 +429,26 @@ with tab2:
 
         with st.container():
             st.markdown("#### ➕ 종목 추가")
-            c1, c2, c3 = st.columns([2, 1, 1])
+            c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
             with c1:
                 selected_item = st.selectbox("종목 검색", ["선택하세요"] + SEARCH_LIST)
             with c2:
                 input_price = st.number_input("내 평단가", min_value=0.0, format="%.2f")
             with c3:
+                input_qty = st.number_input("보유 수량(주)", min_value=0, value=1)
+            with c4:
                 st.write("")
                 st.write("")
                 if st.button("추가하기", type="primary"):
                     if selected_item != "선택하세요":
                         target_code = SEARCH_MAP[selected_item]
+                        # 기존 데이터 삭제 후 추가 (수량 정보 포함)
                         new_pf_data = [p for p in pf_data if p['ticker'] != target_code]
-                        new_pf_data.append({"ticker": target_code, "price": input_price})
+                        new_pf_data.append({
+                            "ticker": target_code, 
+                            "price": input_price,
+                            "qty": input_qty
+                        })
                         doc_ref.set({'stocks': new_pf_data})
                         st.success("추가 완료!")
                         time.sleep(0.5)
@@ -398,13 +459,15 @@ with tab2:
         if pf_data:
             st.subheader(f"{user_id}님의 보유 종목 진단")
             my_tickers = [p['ticker'] for p in pf_data]
-            with st.spinner("실시간(NXT) 시세 조회 중..."):
-                raw_data_dict = get_hybrid_data(my_tickers)
+            with st.spinner("실시간(NXT) 시세 및 순수익 계산 중..."):
+                # 하이브리드 데이터 호출 (최신가 강제 적용됨)
+                raw_data_dict = get_hybrid_data_v2(my_tickers)
             
             display_list = []
             for item in pf_data:
                 tk = item['ticker']
                 avg = item['price']
+                qty = item.get('qty', 1) # 기존 데이터 호환용
                 name = TICKER_MAP.get(tk, tk)
                 
                 df_tk = None
@@ -414,34 +477,32 @@ with tab2:
                 cat, col_name, reasoning, score = "데이터 로딩 중", "gray", "잠시 후 다시 시도", 0
                 curr = 0
                 
-                # 1. 지표 분석 (History 사용)
                 if df_tk is not None and not df_tk.empty:
                     df_indi = calculate_indicators(df_tk)
                     if df_indi is not None:
                         cat, col_name, reasoning, score = analyze_advanced_strategy(df_indi)
                         curr = df_indi['Close'].iloc[-1] 
 
-                # 2. 가격 보정 (미국 주식 NXT 적용)
-                is_kr = tk.endswith(".KS") or tk.endswith(".KQ")
-                if not is_kr:
-                    nxt_price = get_realtime_price_us(tk)
-                    if nxt_price:
-                        curr = nxt_price 
-
                 if curr > 0:
-                    profit_pct, profit_amt, currency = calculate_net_profit(tk, avg, curr)
+                    # 총 순수익 계산 함수 호출
+                    res = calculate_total_profit(tk, avg, curr, qty)
                     
                     display_list.append({
-                        "name": TICKER_MAP.get(tk, tk), "tk": tk, "avg": avg, "curr": curr,
+                        "name": TICKER_MAP.get(tk, tk), "tk": tk, 
+                        "avg": avg, "curr": curr, "qty": qty,
                         "cat": cat, "col_name": col_name, "reasoning": reasoning,
-                        "profit_pct": profit_pct, "profit_amt": profit_amt,
-                        "currency": currency, "score": score
+                        "profit_pct": res['pct'], 
+                        "profit_amt": res['amt'],
+                        "eval_amt": res['eval'],
+                        "currency": res['currency'], 
+                        "score": score
                     })
                 else:
                     display_list.append({
-                        "name": TICKER_MAP.get(tk, tk), "tk": tk, "avg": avg, "curr": avg,
+                        "name": TICKER_MAP.get(tk, tk), "tk": tk, 
+                        "avg": avg, "curr": avg, "qty": qty,
                         "cat": "로딩 실패", "col_name": "gray", "reasoning": "데이터 수신 불가",
-                        "profit_pct": 0.0, "profit_amt": 0.0,
+                        "profit_pct": 0.0, "profit_amt": 0.0, "eval_amt": 0.0,
                         "currency": "$" if not tk.endswith(".KS") else "₩", "score": 0
                     })
             
@@ -450,17 +511,24 @@ with tab2:
             for item in display_list:
                 with st.container():
                     c1, c2, c3 = st.columns([1.5, 1.5, 4])
+                    sym = item['currency'].replace("$", "\$")
+                    
                     with c1:
                         st.markdown(f"### {item['name']}")
-                        st.caption(f"{item['tk']}")
+                        st.caption(f"{item['tk']} | 보유: {item['qty']}주")
+                        
                     with c2:
-                        sym = item['currency'].replace("$", "\$")
                         fmt_curr = f"{item['curr']:,.0f}" if item['currency'] == "₩" else f"{item['curr']:,.2f}"
                         fmt_avg = f"{item['avg']:,.0f}" if item['currency'] == "₩" else f"{item['avg']:,.2f}"
-                        fmt_diff = f"{item['profit_amt']:,.0f}" if item['currency'] == "₩" else f"{item['profit_amt']:,.2f}"
+                        fmt_profit = f"{item['profit_amt']:,.0f}" if item['currency'] == "₩" else f"{item['profit_amt']:,.2f}"
+                        fmt_eval = f"{item['eval_amt']:,.0f}" if item['currency'] == "₩" else f"{item['eval_amt']:,.2f}"
                         
-                        st.metric("순수익률", f"{item['profit_pct']:.2f}%", delta=f"{sym}{fmt_diff}")
+                        st.metric("총 순수익 (수수료 제)", f"{item['profit_pct']:.2f}%", delta=f"{sym}{fmt_profit}")
+                        
+                        # 평가금 및 평단 정보
+                        st.markdown(f"**총 평가금:** {sym}{fmt_eval}")
                         st.markdown(f"<small style='color: gray'>평단: {sym}{fmt_avg} / 현재: {sym}{fmt_curr}</small>", unsafe_allow_html=True)
+                        
                     with c3:
                         st.markdown(f"**AI 점수: {item['score']}점**")
                         st.markdown(f"**판단:** :{item['col_name']}[{item['cat']}]")
@@ -473,92 +541,12 @@ with tab2:
 
 with tab3:
     st.markdown("## 📘 AI 투자 전략 알고리즘 상세 백서 (Whitepaper)")
-    st.markdown("""
-    본 서비스에 탑재된 AI 알고리즘은 **'추세 추종(Trend Following)'** 전략과 **'평균 회귀(Mean Reversion)'** 이론을 
-    결합하여 설계되었습니다. 단순히 감에 의존하는 투자가 아닌, 철저한 **데이터와 통계적 확률**에 기반하여 
-    0점부터 100점까지의 '매수 매력도'를 산출합니다.
-    """)
-    
+    st.markdown("단순한 지표 합산이 아닌, **'수익은 길게, 손실은 짧게'** 가져가는 프로 트레이더의 로직을 구현했습니다.")
     st.divider()
-    
-    st.header("1. 🧠 핵심 평가 로직 (5-Factor Model)")
-    st.markdown("AI는 다음 5가지 핵심 요소를 종합적으로 분석하여 점수를 계산합니다.")
-    
-    with st.expander("① 추세 (Trend) - 시장의 흐름을 읽다", expanded=True):
-        st.markdown("""
-        * **개념:** '달리는 말에 올라타라'는 격언처럼, 주가가 상승세일 때 매수하는 것이 승률이 높습니다.
-        * **판단 기준:**
-            * **장기 추세 (60일 이동평균선):** 주가가 60일선 위에 있으면 '상승장'으로 판단합니다. (+15점)
-            * **단기 추세 (20일 이동평균선):** 주가가 20일선 위에 있으면 단기 탄력이 좋다고 판단합니다. (+10점)
-            * **역배열:** 주가가 이동평균선 아래에 있으면 하락 추세로 간주하여 감점합니다. (-10~20점)
-        """)
-
-    with st.expander("② 지지 & 저점 (Support) - 싸게 사는 기술", expanded=True):
-        st.markdown("""
-        * **개념:** 아무리 좋은 주식도 비싸게 사면 의미가 없습니다. 상승 추세 속에서 일시적으로 가격이 하락했을 때(조정)가 기회입니다.
-        * **판단 기준:**
-            * **황금 눌림목 (Golden Dip):** 주가가 상승 추세(60일선 위)에 있으면서, 단기적으로 하락해 **20일선(-2% ~ +2%)**에 근접할 때. 가장 높은 가산점을 부여합니다. (+25점)
-            * **볼린저 밴드 하단:** 주가가 통계적 하단 밴드를 터치하면 '과매도' 상태로 보아 기술적 반등을 기대합니다. (+15점)
-            * **볼린저 밴드 상단:** 주가가 상단 밴드를 뚫으면 '단기 고점'으로 보아 감점합니다. (-10점)
-        """)
-
-    with st.expander("③ 모멘텀 (Momentum) - 상승 에너지", expanded=True):
-        st.markdown("""
-        * **개념:** 주가가 상승하려고 하는 '가속도'를 측정합니다.
-        * **판단 기준 (MACD):**
-            * **골든크로스:** 단기 이평선이 장기 이평선을 뚫고 올라갈 때 강력한 매수 신호로 봅니다. (+15점)
-            * **상승 추세 유지:** MACD가 시그널선 위에 머물러 있으면 상승 에너지가 지속되는 것으로 봅니다. (+5점)
-            * **데드크로스:** 반대로 하락 반전 신호가 뜨면 감점합니다. (-15점)
-        """)
-        
-    with st.expander("④ 심리 (Psychology) - 공포와 탐욕", expanded=True):
-        st.markdown("""
-        * **개념:** 투자자들의 심리가 과열되었는지, 공포에 질려있는지를 RSI 지표로 판단합니다.
-        * **판단 기준 (RSI):**
-            * **침체 구간 (RSI < 30):** '공포' 구간입니다. 남들이 팔 때 사는 역발상 전략으로 가산점을 줍니다. (+15점)
-            * **과열 구간 (RSI > 75):** '탐욕' 구간입니다. 언제든 차익 실현 매물이 나올 수 있어 감점합니다. (-20점)
-        """)
-        
-    with st.expander("⑤ 거래량 (Volume) - 신뢰의 척도", expanded=True):
-        st.markdown("""
-        * **개념:** 거래량이 없는 상승은 가짜일 수 있습니다. 거래량이 동반된 상승만이 '진짜'입니다.
-        * **판단 기준:**
-            * **거래량 폭발:** 평소 거래량(20일 평균)보다 1.5배 이상 터지면서 양봉(상승)이 나오면 '세력 유입'으로 봅니다. (+10점)
-        """)
-
-    st.divider()
-    
-    st.header("2. 🚦 AI 판단 등급표 (Decision Matrix)")
-    st.markdown("위 5가지 요소의 합산 점수(0~100점)에 따라 최종 행동 지침을 내립니다.")
-    
-    grade_data = {
-        "점수 구간": ["80점 ~ 100점", "60점 ~ 79점", "41점 ~ 59점", "21점 ~ 40점", "0점 ~ 20점"],
-        "등급 (Grade)": ["🚀 강력 매수 (Strong Buy)", "📈 매수 (Buy)", "👀 관망 (Hold)", "📉 매도 (Sell)", "💥 강력 매도 (Strong Sell)"],
-        "상세 설명": [
-            "모든 지표가 상승을 가리킵니다. 추세는 살아있고 가격은 매력적인 '눌림목' 상태일 확률이 높습니다. 적극적으로 비중을 실을 때입니다.",
-            "전반적으로 긍정적입니다. 상승 추세에 있거나, 과매도 구간에서 반등을 시작했습니다. 분할 매수로 진입하기 좋습니다.",
-            "방향성이 뚜렷하지 않습니다. 호재와 악재가 섞여있거나 횡보장입니다. 신규 진입보다는 추세를 더 지켜봐야 합니다.",
-            "위험 신호가 감지됩니다. 추세가 꺾였거나 단기 과열 상태입니다. 이익 실현을 하거나 비중을 줄이는 것이 현명합니다.",
-            "매우 위험합니다. 역배열 하락 추세가 가속화되고 있습니다. 가지고 있다면 손절을, 없다면 쳐다보지도 말아야 할 때입니다."
-        ]
-    }
-    st.table(pd.DataFrame(grade_data))
-    
-    st.divider()
-    
-    st.header("3. 💸 수수료 및 비용 계산 방식 (토스증권 기준)")
-    st.info("이 봇은 단순 등락률이 아닌, 세금과 수수료를 모두 뗀 '실현 손익'을 계산합니다.")
-    
-    st.markdown("""
-    **🇰🇷 국내 주식 (KR)**
-    * **증권거래세:** 매도 금액의 `0.15%` (국가 납부)
-    * **유관기관 제비용:** 약 `0.03%`
-    * **총 비용:** 매도 시 약 **0.18%**가 원금에서 차감됩니다.
-    
-    **🇺🇸 해외 주식 (US)**
-    * **매매 수수료:** 매도 금액의 `0.2%` (토스증권 표준 요율 적용 시)
-    * **총 비용:** 매도 시 약 **0.2%**가 원금에서 차감됩니다.
-    * *(참고: 환전 수수료는 변동성이 커서 계산에 포함하지 않았습니다)*
-    """)
-    
-    st.warning("⚠️ **면책 조항:** 본 서비스는 투자를 보조하는 도구일 뿐이며, AI의 분석이 100% 정확성을 보장하지 않습니다. 모든 투자 결정의 책임은 본인에게 있습니다.")
+    st.subheader("1. 💯 점수 산정 로직 (Total 100점)")
+    score_table = pd.DataFrame({
+        "평가 요소": ["추세 (Trend)", "지지 (Support)", "모멘텀 (Momentum)", "거래량 (Volume)", "리스크 (Risk)"],
+        "내용": ["60일선/20일선 위에 있는가?", "싸게 살 수 있는 자리인가? (눌림목/볼린저 하단)", "상승 에너지가 강한가? (MACD)", "세력이 들어왔는가?", "너무 비싸진 않은가? (과열)"],
+        "배점": ["±15~25점", "+15~25점 (가산점)", "±15점", "+10점", "±10~20점"]
+    })
+    st.table(score_table)
