@@ -5,6 +5,40 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 from concurrent.futures import ThreadPoolExecutor
+import time
+
+def prepare_stock_data(ticker_info, start_date):
+    """
+    [수정됨] 데이터 로드 실패 시 재시도(Retry) 로직 추가
+    """
+    code, name = ticker_info
+    max_retries = 3
+    
+    for attempt in range(max_retries):
+        try:
+            # 데이터 다운로드
+            df = yf.download(code, start=start_date, progress=False, auto_adjust=True)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            
+            # 데이터가 비어있으면 예외 발생시켜서 재시도 유도
+            if df.empty or len(df) < 60: 
+                raise ValueError("Data Empty")
+            
+            # 지표 계산
+            df = calculate_indicators_for_backtest(df)
+            df['AI_Score'] = df.apply(get_ai_score_row, axis=1)
+            df['Ticker'] = code
+            df['Name'] = name
+            
+            return df[['Close_Calc', 'AI_Score', 'Ticker', 'Name']]
+            
+        except Exception:
+            # 실패 시 잠시 대기 후 재시도
+            time.sleep(0.5)
+            continue
+            
+    return None # 3번 다 실패하면 어쩔 수 없이 None 반환
 
 TICKER_MAP = {
     "INTC": "인텔", "005290.KS": "동진쎄미켐", "SOXL": "반도체 3X(Bull)", 
@@ -273,6 +307,30 @@ def prepare_stock_data(ticker_info, start_date):
         return None
 
 def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode, max_hold_days, exchange_data, use_compound, selection_mode):
+    # 1. 전 종목 데이터 병렬 준비 (안정성 강화)
+    all_dfs = []
+    
+    # max_workers를 조금 줄여서(10 -> 5) 서버 부하를 줄이고 안정성을 높임
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(prepare_stock_data, t, start_date): t for t in targets}
+        for future in futures:
+            res = future.result()
+            if res is not None: 
+                all_dfs.append(res)
+    
+    # [디버깅용] 몇 개 종목이 로드되었는지 확인 (로그나 print로 찍어보셔도 좋습니다)
+    # st.write(f"Loaded Tickers: {len(all_dfs)} / {len(targets)}") 
+            
+    if not all_dfs: return pd.DataFrame(), pd.DataFrame()
+
+    # 2. Market Data 통합
+    market_data = {}
+    for df in all_dfs:
+        for date, row in df.iterrows():
+            if date not in market_data: market_data[date] = []
+            market_data[date].append(row)
+            
+    sorted_dates = sorted(market_data.keys())
     """
     [수정됨] 현실성 강화:
     - 매수 우선순위: 이름순(X) -> AI 점수 높은 순(O)
