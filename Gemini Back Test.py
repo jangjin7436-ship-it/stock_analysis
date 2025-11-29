@@ -39,6 +39,29 @@ def load_fx_series(start_date: str):
     except Exception:
         return pd.Series()
 
+# [신규 기능] 시장 상황 판단 함수 (마켓 필터)
+@st.cache_data(show_spinner=False)
+def get_market_regime(start_date):
+    """
+    시장 전체(SPY)의 추세를 확인하여 매매 허용 여부 결정
+    - SPY가 200일 이동평균선 위에 있으면 : 상승장 (Aggressive) -> 매수 비중 100%
+    - SPY가 200일 이동평균선 아래에 있으면 : 하락장 (Defensive) -> 신규 매수 금지
+    """
+    try:
+        # 200일 이동평균선 계산을 위해 시작일보다 1년 전 데이터부터 로딩
+        req_start = pd.to_datetime(start_date) - pd.Timedelta(days=365)
+        spy = yf.download("SPY", start=req_start, progress=False, auto_adjust=False)
+        
+        if isinstance(spy.columns, pd.MultiIndex):
+            spy.columns = spy.columns.get_level_values(0)
+        
+        spy['MA200'] = spy['Close'].rolling(200).mean()
+        # MA200보다 위에 있으면 True (상승장), 아니면 False (하락장)
+        regime = (spy['Close'] > spy['MA200'])
+        return regime
+    except:
+        return pd.Series(dtype=bool)
+
 TICKER_MAP = {
     "INTC": "인텔", "005290.KS": "동진쎄미켐", "SOXL": "반도체 3X(Bull)", 
     "316140.KS": "우리금융지주", "WDC": "웨스턴디지털", "NFLX": "넷플릭스", 
@@ -194,7 +217,7 @@ def get_ai_score_row(row):
         return 0.0
 
 # =========================================================
-# 3. 백테스트 엔진 (ATR 기반 청산 로직 적용)
+# 3. 백테스트 엔진 (ATR 기반 청산 + 마켓 필터 + 변동성 조절)
 # =========================================================
 
 def prepare_stock_data(ticker_info, start_date):
@@ -217,6 +240,12 @@ def prepare_stock_data(ticker_info, start_date):
 
 def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
                            max_hold_days, exchange_data, use_compound, selection_mode):
+    
+    # ---------------------------------------------------------
+    # 0. 마켓 데이터(SPY) 로딩 (거시 경제 필터)
+    # ---------------------------------------------------------
+    market_regime_series = get_market_regime(start_date)
+
     # ---------------------------------------------------------
     # 1. 전 종목 데이터 준비
     # ---------------------------------------------------------
@@ -260,6 +289,7 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
     trades_log = []
     equity_curve = []
     
+    # [설정] 안정성을 위해 TOP1 모드에서도 최소 3종목 분산 권장 (여기서는 그대로 유지하되 로직 보강)
     max_slots = 1 if selection_mode == 'TOP1' else 5 
 
     # ---------------------------------------------------------
@@ -269,8 +299,18 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
         daily_stocks = market_data[date]
         current_rate = get_rate(date)
 
+        # [중요] 오늘의 시장 상황 확인 (Market Regime)
+        # SPY 데이터가 있는 날짜면 확인, 없으면 보수적으로 전일 상태 유지 또는 True
+        is_bull_market = True
+        try:
+            ts_date = pd.Timestamp(date)
+            if ts_date in market_regime_series.index:
+                is_bull_market = market_regime_series.loc[ts_date]
+        except:
+            pass
+
         # =================================================
-        # A. 매도 로직 (Sell Check) - ATR 기반 유동적 대응
+        # A. 매도 로직 (Sell Check) - ATR + 마켓 필터 대응
         # =================================================
         sell_list = []
         for ticker in sorted(portfolio.keys()):
@@ -296,7 +336,7 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
             fee_sell = 0.003 if ".KS" in ticker else 0.001
             
             avg_price = info['avg_price']
-            buy_price_raw = info.get('buy_price_raw', avg_price/rate) # 매수 당시 원화가 아닌 달러가 기준
+            buy_price_raw = info.get('buy_price_raw', avg_price/rate)
 
             held_days = (pd.Timestamp(date) - pd.Timestamp(info['buy_date'])).days
             
@@ -306,22 +346,21 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
             final_sell_price_raw = raw_close
 
             # --- [동적 손절/익절 로직] ---
-            # 고정 %가 아닌 ATR(변동성)을 사용하여 "숨 쉴 공간"을 부여함
-            # ATR이 크면(변동성 큼) 손절폭을 넓게 잡음 -> 휩소(속임수) 방지
+            # 하락장(SPY < 200MA)일 때는 더 타이트하게 관리
+            regime_penalty = 0.0 if is_bull_market else 0.5 
             
-            atr_multiplier_stop = 2.0 # 손절: 2 ATR
-            atr_multiplier_profit = 3.0 # 익절 목표: 3 ATR
+            atr_multiplier_stop = 2.0 - regime_penalty # 손절: 2 ATR (하락장은 1.5)
+            atr_multiplier_profit = 3.0 - regime_penalty # 익절: 3 ATR
 
             stop_price_raw = buy_price_raw - (atr * atr_multiplier_stop)
-            target_price_raw = buy_price_raw + (atr * atr_multiplier_profit)
+            # target_price_raw = buy_price_raw + (atr * atr_multiplier_profit)
 
             # [시나리오 1] ATR 기반 손절 (Trailing Stop 포함)
-            # 최고가 갱신 시 손절 라인도 같이 올림 (수익 보전)
             current_max_raw = info.get('max_price_raw', buy_price_raw)
             if raw_high > current_max_raw:
                 portfolio[ticker]['max_price_raw'] = raw_high
-                # 고점 대비 2.5 ATR 하락 시 익절/청산 (기존 -3% 고정보다 유연함)
-                new_stop = raw_high - (atr * 2.5)
+                # 고점 대비 하락 청산 기준
+                new_stop = raw_high - (atr * (2.5 - regime_penalty))
                 if new_stop > stop_price_raw:
                     stop_price_raw = new_stop
 
@@ -336,7 +375,6 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
                 elif raw_low < stop_price_raw:
                     should_sell = True
                     sell_reason = "📉 ATR손절/청산"
-                    # 슬리피지 고려: 손절가보다 살짝 아래에서 체결 가정
                     final_sell_price_raw = stop_price_raw * 0.995 
                     final_sell_price = final_sell_price_raw * rate
 
@@ -349,7 +387,7 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
                     should_sell = True
                     sell_reason = "💰 점수하락익절"
                 
-                # 너무 오래 들고 있는데 수익이 안 나면 교체
+                # 만기 청산
                 elif held_days >= limit_days:
                     should_sell = True
                     sell_reason = f"⏱️ 만기청산({held_days}일)"
@@ -358,6 +396,11 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
                 elif score < 30:
                     should_sell = True
                     sell_reason = "점수급락(30↓)"
+                
+                # [추가] 시장이 하락세로 전환되었고 수익권이면 현금 확보 (Defensive)
+                elif not is_bull_market and raw_close > buy_price_raw * 1.02:
+                    should_sell = True
+                    sell_reason = "🚨 하락장대피"
 
             if should_sell:
                 real_profit_pct = ((final_sell_price - avg_price) / avg_price) * 100
@@ -382,9 +425,14 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
             del portfolio[t]
 
         # =================================================
-        # B. 신규 매수 (Buy Logic) - 높은 점수 + 눌림목
+        # B. 신규 매수 (Buy Logic) - 마켓 필터 & 변동성 조절 적용
         # =================================================
-        if len(portfolio) < max_slots:
+        
+        # [안정성 핵심] 하락장(SPY < 200MA)이면 신규 매수 금지 (Cash is King)
+        if not is_bull_market:
+            # 하락장에서는 현금 보유를 우선시하여 매수를 건너뜀
+            pass
+        elif len(portfolio) < max_slots:
             candidates = []
             for row in daily_stocks:
                 ticker = row['Ticker']
@@ -401,6 +449,7 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
                     
                     # 변동성 대비 거래량 파워 확인
                     vol_power = row.get('Vol_Ratio', 1.0)
+                    atr = row['ATR']
                     
                     candidates.append({
                         'ticker': ticker,
@@ -408,6 +457,7 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
                         'price_raw': price_raw,
                         'price_krw': price_krw,
                         'score': score,
+                        'atr': atr,
                         'vol_power': vol_power,
                         'reason': "AI추천(눌림목/추세)"
                     })
@@ -422,13 +472,34 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
                     break
                 
                 current_open_slots = max_slots - len(portfolio)
-                slot_budget = balance / current_open_slots
-                fee_buy = 0.00015 if ".KS" in target['ticker'] else 0.001
                 
-                if target['price_krw'] > 0:
-                    shares = int(slot_budget / (target['price_krw'] * (1 + fee_buy)))
-                    if shares > 0:
-                        cost = shares * target['price_krw'] * (1 + fee_buy)
+                # [안정성 핵심] 변동성 역가중(Risk Parity) 포지션 사이징
+                # 예산만 1/N 하는 것이 아니라, 변동성(ATR)이 큰 종목은 수량을 줄임
+                
+                # 1. 예산 기준 최대 수량 (기존 방식)
+                budget_per_slot = balance / current_open_slots
+                fee_buy = 0.00015 if ".KS" in target['ticker'] else 0.001
+                shares_by_budget = int(budget_per_slot / (target['price_krw'] * (1 + fee_buy)))
+                
+                # 2. 리스크 기준 적정 수량 (신규 방식)
+                # 계좌 전체 자산의 2%만 잃도록 설계 (손절폭 2ATR 기준)
+                total_equity = balance + sum([v['shares'] * v['avg_price'] for k,v in portfolio.items()])
+                risk_budget = total_equity * 0.02 # 트레이드 당 2% 리스크 허용
+                
+                rate = 1.0 if ".KS" in target['ticker'] else current_rate
+                stop_loss_amount_krw = target['atr'] * 2.0 * rate
+                
+                if stop_loss_amount_krw > 0:
+                    shares_by_risk = int(risk_budget / stop_loss_amount_krw)
+                else:
+                    shares_by_risk = 0
+                
+                # 두 기준 중 더 보수적인(작은) 수량 선택 -> 변동성 큰 종목은 자동으로 적게 매수됨
+                shares = min(shares_by_budget, shares_by_risk)
+
+                if shares > 0:
+                    cost = shares * target['price_krw'] * (1 + fee_buy)
+                    if balance >= cost:
                         balance -= cost
                         portfolio[target['ticker']] = {
                             'name': target['name'],
