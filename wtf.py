@@ -794,6 +794,5 @@ with tab4:
                         "구분": st.column_config.TextColumn("Type", width="small")
                     }
                 )
-
-        else:
+    else:
             st.warning("⚠️ 매매 신호가 발생하지 않았습니다. 전략 조건을 완화하거나 기간을 늘려보세요.")
