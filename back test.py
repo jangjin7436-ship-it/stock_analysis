@@ -156,7 +156,7 @@ def prepare_stock_data(ticker_info, start_date):
 
 def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode, max_hold_days, exchange_data, use_compound, selection_mode):
     """
-    전체 종목을 날짜별로 순회하며 포트폴리오를 운용하는 시뮬레이션
+    strategy_mode: 'Basic', 'SuperLocking', 'Sniper' (신규 추가)
     """
     # 1. 전 종목 데이터 병렬 준비
     all_dfs = []
@@ -166,9 +166,9 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode, 
             res = future.result()
             if res is not None: all_dfs.append(res)
             
-    if not all_dfs: return pd.DataFrame(), pd.DataFrame() # 빈 데이터프레임 반환
+    if not all_dfs: return pd.DataFrame(), pd.DataFrame()
 
-    # 2. 데이터를 날짜 기준으로 통합 (Market Data)
+    # 2. Market Data 통합
     market_data = {}
     for df in all_dfs:
         for date, row in df.iterrows():
@@ -178,14 +178,12 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode, 
     sorted_dates = sorted(market_data.keys())
     
     # 3. 환율 데이터 준비
-    exchange_map = {}
     if isinstance(exchange_data, (float, int)):
         get_rate = lambda d: float(exchange_data)
     else:
         rate_dict = exchange_data.to_dict()
         def get_rate(d):
             ts = pd.Timestamp(d)
-            # 환율 데이터가 없으면 전날 데이터 또는 기본값 사용
             return rate_dict.get(ts, 1430.0)
 
     # 4. 시뮬레이션 상태 변수
@@ -196,18 +194,15 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode, 
     
     max_slots = 1 if selection_mode == 'TOP1' else 10 
 
-    # --- 날짜별 루프 (Time Loop) ---
+    # --- 날짜별 루프 ---
     for date in sorted_dates:
         daily_stocks = market_data[date]
         current_rate = get_rate(date)
         
-        # A. 보유 종목 관리 (매도 체크)
+        # A. 매도 (Sell Check)
         sell_list = []
-        
         for ticker, info in portfolio.items():
             stock_row = next((x for x in daily_stocks if x['Ticker'] == ticker), None)
-            
-            # 🔴 [수정] 여기가 에러 원인이었습니다. (is not None 추가)
             if stock_row is None: continue 
             
             curr_price_raw = stock_row['Close_Calc']
@@ -231,11 +226,17 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode, 
 
             # 2) 전략별 매도 로직
             if not should_sell:
+                # -------------------------------------------------------
+                # [전략 1] 기본 (Basic)
+                # -------------------------------------------------------
                 if strategy_mode == "Basic":
                     if score <= 45:
                         should_sell = True
                         sell_reason = "AI 45↓"
-                        
+                
+                # -------------------------------------------------------
+                # [전략 2] 슈퍼 락킹 (SuperLocking)
+                # -------------------------------------------------------
                 elif strategy_mode == "SuperLocking":
                     if not info['mode_active'] and profit_ratio >= 0.03:
                         portfolio[ticker]['mode_active'] = True
@@ -244,15 +245,45 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode, 
                     if info['mode_active']:
                         if curr_price_krw > portfolio[ticker]['max_price']:
                             portfolio[ticker]['max_price'] = curr_price_krw
-                        
-                        if curr_price_krw <= portfolio[ticker]['max_price'] * 0.98:
+                        if curr_price_krw <= portfolio[ticker]['max_price'] * 0.98: # -2% Trailing
                             should_sell = True
-                            sell_reason = "💎 Locking Trailing"
+                            sell_reason = "💎 락킹 익절"
                     else:
                         if score <= 45:
                             should_sell = True
-                            sell_reason = "Defense(45↓)"
+                            sell_reason = "방어(45↓)"
 
+                # -------------------------------------------------------
+                # [전략 3] AI 스나이퍼 (Sniper) - NEW!
+                # -------------------------------------------------------
+                elif strategy_mode == "Sniper":
+                    # a. 손절 (Hard Stop): -3% 도달 시 즉시 매도
+                    if profit_ratio <= -0.03:
+                        should_sell = True
+                        sell_reason = "⚡ 칼손절(-3%)"
+                    
+                    # b. 익절 (Smart Trailing)
+                    # 수익이 5% 넘으면 트레일링 모드 발동
+                    elif not info['mode_active'] and profit_ratio >= 0.05:
+                        portfolio[ticker]['mode_active'] = True
+                        portfolio[ticker]['max_price'] = curr_price_krw
+                    
+                    if info['mode_active']:
+                        # 고점 갱신
+                        if curr_price_krw > portfolio[ticker]['max_price']:
+                            portfolio[ticker]['max_price'] = curr_price_krw
+                        
+                        # 고점 대비 -3% 하락 시 익절 (슈퍼락킹보다 여유있게)
+                        if curr_price_krw <= portfolio[ticker]['max_price'] * 0.97:
+                            should_sell = True
+                            sell_reason = "🎯 스나이퍼 익절"
+                    
+                    # c. 추세 이탈 (점수가 40점 미만으로 깨지면 매도)
+                    if not should_sell and score < 40:
+                         should_sell = True
+                         sell_reason = "추세 이탈(40↓)"
+
+            # 매도 실행
             if should_sell:
                 return_amt = info['shares'] * curr_price_krw * (1 - fee_sell)
                 balance += return_amt
@@ -280,12 +311,14 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode, 
                 
                 entry_signal = False
                 reason = ""
+                
+                # 진입 조건
                 if strategy_mode == "Basic" and score >= 65:
-                    entry_signal = True
-                    reason = "AI 65↑"
+                    entry_signal = True; reason = "AI 65↑"
                 elif strategy_mode == "SuperLocking" and score >= 80:
-                    entry_signal = True
-                    reason = "Strong Buy(80↑)"
+                    entry_signal = True; reason = "강력매수(80↑)"
+                elif strategy_mode == "Sniper" and score >= 70: # 스나이퍼는 70점
+                    entry_signal = True; reason = "스나이퍼(70↑)"
                 
                 if entry_signal:
                     candidates.append({
@@ -294,7 +327,6 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode, 
                     })
             
             candidates.sort(key=lambda x: x['score'], reverse=True)
-            
             open_slots = max_slots - len(portfolio)
             buy_targets = candidates[:open_slots] 
             
@@ -307,45 +339,33 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode, 
                 for target in buy_targets:
                     budget = min(balance, per_stock_budget)
                     fee_buy = 0.00015 if ".KS" in target['ticker'] else 0.001
-                    
-                    # 0으로 나누기 방지
                     if target['price_krw'] > 0:
                         shares = int(budget / (target['price_krw'] * (1 + fee_buy)))
-                    else:
-                        shares = 0
+                    else: shares = 0
                     
                     if shares > 0:
                         cost = shares * target['price_krw'] * (1 + fee_buy)
                         balance -= cost
-                        
                         portfolio[target['ticker']] = {
-                            'name': target['name'],
-                            'shares': shares,
-                            'avg_price': target['price_krw'],
-                            'buy_date': date,
-                            'mode_active': False, 
-                            'max_price': 0       
+                            'name': target['name'], 'shares': shares, 'avg_price': target['price_krw'],
+                            'buy_date': date, 'mode_active': False, 'max_price': 0       
                         }
-                        
                         trades_log.append({
                             'ticker': target['ticker'], 'name': target['name'], 'date': date, 
                             'type': 'buy', 'price': target['price_raw'], 'score': target['score'], 
                             'profit': 0, 'reason': target['reason'], 'balance': balance
                         })
 
-        # C. 자산 평가 (Equity Curve)
+        # C. 자산 평가
         current_equity = balance
         for ticker, info in portfolio.items():
             stock_row = next((x for x in daily_stocks if x['Ticker'] == ticker), None)
-            
-            # 🔴 [수정] 여기도 에러 원인이 될 수 있으므로 is not None 추가
             if stock_row is not None:
                 p_raw = stock_row['Close_Calc']
                 p_krw = p_raw * (1.0 if ".KS" in ticker else current_rate)
                 current_equity += info['shares'] * p_krw
             else:
-                # 오늘 데이터가 없으면(휴장 등) 어제 가격(평단가 등)으로 임시 평가
-                current_equity += info['shares'] * info['avg_price'] # 혹은 직전 가격 유지
+                current_equity += info['shares'] * info['avg_price']
                 
         equity_curve.append({'date': date, 'equity': current_equity})
 
@@ -359,93 +379,83 @@ tab4 = st.tabs(["📊 전체 백테스트 시뮬레이션"])[0] # 기존 tabs �
 
 with tab4:
     st.markdown("### 🧪 포트폴리오 유니버스 백테스트")
-    st.caption("전체 시장을 대상으로 날짜별 시뮬레이션을 수행합니다. (환율/복리/집중투자/타점분석 반영)")
+    st.caption("AI 전략 시뮬레이터 v2.0 (환율/복리/신규전략 탑재)")
     
     # --------------------------------------------------------------------------------
-    # 1. 설정 UI (3단 컬럼 구성)
+    # 1. 설정 패널
     # --------------------------------------------------------------------------------
     r1_c1, r1_c2, r1_c3 = st.columns(3)
-    
     with r1_c1:
         bt_start_date = st.date_input("시작일", value=pd.to_datetime("2024-01-01"))
-        max_hold_days = st.slider("⏱️ 타임 컷 (일)", 0, 60, 0, help="0: 제한 없음. 설정 시 N일 후 강제 매도")
-
+        max_hold_days = st.slider("⏱️ 타임 컷 (일)", 0, 60, 0, help="매수 후 N일 지나면 강제 매도")
     with r1_c2:
-        initial_cap_input = st.number_input("💰 초기 자본금 (원)", value=10000000, step=1000000, format="%d")
-        
-        # 투자 스타일
-        sel_mode = st.selectbox(
-            "🎯 종목 선정 방식", 
-            ["조건 만족 전부 매수 (분산)", "점수 1등만 매수 (집중)"],
-            help="분산: 최대 10종목까지 자금을 쪼개서 매수\n집중: 가장 점수 높은 1개 종목에 자금 올인"
-        )
+        initial_cap_input = st.number_input("💰 초기 자본금", value=10000000, step=1000000, format="%d")
+        sel_mode = st.selectbox("🎯 종목 선정", ["조건 만족 전부 매수 (분산)", "점수 1등만 매수 (집중)"])
         selection_code = "TOP1" if "집중" in sel_mode else "ALL"
-
     with r1_c3:
-        # 💱 환율 설정 (수정됨: 고정 환율 입력창 부활)
         ex_method = st.radio("💱 환율 방식", ["실시간 변동 (Dynamic)", "고정 환율 (Fixed)"])
-        
         if "고정" in ex_method:
-            fixed_exchange_rate = st.number_input("적용 환율 (원/$)", value=1430.0, step=10.0, format="%.1f")
+            fixed_exchange_rate = st.number_input("환율 (원/$)", value=1430.0, step=10.0, format="%.1f")
             exchange_arg_val = fixed_exchange_rate
         else:
-            st.caption("📅 과거 매매 시점의 실제 환율을 적용합니다.")
             exchange_arg_val = "DYNAMIC"
 
-    # 2열 옵션 (전략 및 복리)
-    r2_c1, r2_c2 = st.columns(2)
-    with r2_c1:
-        selected_strategy = st.radio("⚔️ 매매 전략", ["기본 (65/45)", "슈퍼 락킹 (80/Trailing)"], horizontal=True)
-        strat_code = "Basic" if "기본" in selected_strategy else "SuperLocking"
-    with r2_c2:
-        comp_mode = st.checkbox("복리 투자 (수익 재투자)", value=True)
+    st.divider()
     
-    st.write("")
-    start_btn = st.button("🚀 시뮬레이션 시작", type="primary", use_container_width=True)
+    # 전략 및 옵션
+    c_strat, c_opt, c_btn = st.columns([2, 1, 1])
+    with c_strat:
+        # 🌟 전략 3개로 확장
+        selected_strategy = st.radio(
+            "⚔️ 매매 전략 선택", 
+            ["AI 스나이퍼 (추천)", "슈퍼 락킹 (안전)", "기본 모드 (장투)"],
+            captions=[
+                "70점 진입 / -3% 손절 / +5% 후 트레일링", 
+                "80점 진입 / +3% 후 타이트 익절", 
+                "65점 진입 / 45점 이탈 시 매도"
+            ],
+            horizontal=True
+        )
+        # 매핑
+        if "스나이퍼" in selected_strategy: strat_code = "Sniper"
+        elif "슈퍼" in selected_strategy: strat_code = "SuperLocking"
+        else: strat_code = "Basic"
+        
+    with c_opt:
+        comp_mode = st.checkbox("복리 투자 (재투자)", value=True)
+    with c_btn:
+        st.write("")
+        start_btn = st.button("🚀 시뮬레이션 시작", type="primary", use_container_width=True)
 
     # --------------------------------------------------------------------------------
-    # 2. 시뮬레이션 로직 실행
+    # 2. 실행 로직
     # --------------------------------------------------------------------------------
     if start_btn:
-        # A. 환율 데이터 준비
-        exchange_data_payload = 1430.0 # 기본값
-        
+        # 환율 준비
+        exchange_data_payload = 1430.0
         if exchange_arg_val == "DYNAMIC":
-            with st.spinner("💱 과거 환율 데이터(KRW=X) 수집 중..."):
+            with st.spinner("💱 환율 데이터 수집 중..."):
                 try:
                     ex_df = yf.download("KRW=X", start=str(bt_start_date), progress=False)
                     if isinstance(ex_df.columns, pd.MultiIndex):
                         ex_df.columns = ex_df.columns.get_level_values(0)
                     exchange_data_payload = ex_df['Close']
-                    st.success("실시간 환율 데이터 적용 완료")
-                except: 
-                    st.warning("환율 데이터 수집 실패. 기본값(1,430원)을 사용합니다.")
-                    exchange_data_payload = 1430.0
+                except: pass
         else:
-            # 고정 환율 값 전달
             exchange_data_payload = float(exchange_arg_val)
 
-        # B. 포트폴리오 시뮬레이션 실행
-        with st.spinner("🔄 전 종목 스캔 및 매매 시뮬레이션 중... (약 15~30초)"):
+        # 시뮬레이션
+        with st.spinner(f"🔄 [{selected_strategy}] 전략으로 과거를 여행하는 중..."):
             targets = list(TICKER_MAP.items())
-            
             trade_df, equity_df = run_portfolio_backtest(
-                targets, 
-                str(bt_start_date), 
-                initial_cap_input, 
-                strat_code, 
-                max_hold_days, 
-                exchange_data_payload, 
-                comp_mode, 
-                selection_code
+                targets, str(bt_start_date), initial_cap_input, strat_code, 
+                max_hold_days, exchange_data_payload, comp_mode, selection_code
             )
         
         # --------------------------------------------------------------------------------
-        # 3. 결과 시각화
+        # 3. 결과 대시보드
         # --------------------------------------------------------------------------------
         if not trade_df.empty and not equity_df.empty:
-            
-            # (1) 핵심 지표
             final_equity = equity_df.iloc[-1]['equity']
             total_return = (final_equity - initial_cap_input) / initial_cap_input * 100
             profit_amt = final_equity - initial_cap_input
@@ -455,125 +465,81 @@ with tab4:
             total_sells = len(sells)
             win_rate = (win_count / total_sells * 100) if total_sells > 0 else 0.0
             
-            st.success(f"✅ 시뮬레이션 완료! | 방식: {sel_mode}")
+            st.success(f"✅ 완료! 최종 자산: {final_equity:,.0f}원")
             
-            # KPI 대시보드
             with st.container():
                 k1, k2, k3, k4 = st.columns(4)
                 k1.metric("총 수익률", f"{total_return:,.2f}%")
-                k2.metric("매매 승률", f"{win_rate:.1f}%", f"{win_count}승/{total_sells}전")
+                k2.metric("승률", f"{win_rate:.1f}%", f"{win_count}승/{total_sells}전")
                 
-                if abs(profit_amt) >= 100000000:
-                    amt_str = f"{profit_amt/100000000:,.2f}억 원"
-                else:
-                    amt_str = f"{profit_amt/10000:,.0f}만 원"
-                k3.metric("총 수익금", amt_str)
-                k4.metric("총 매매 횟수", f"{len(trade_df)//2}회")
+                amt_str = f"{profit_amt/100000000:,.2f}억" if abs(profit_amt) > 1e8 else f"{profit_amt/10000:,.0f}만"
+                k3.metric("총 수익금", f"{amt_str}원", delta_color="normal")
+                k4.metric("매매 횟수", f"{len(trade_df)//2}회")
 
             st.divider()
 
-            # (2) 자산 곡선
-            st.subheader("📈 내 계좌 자산 변화")
-            fig = px.line(equity_df, x='date', y='equity', title=f"자산 성장 그래프 ({sel_mode})")
+            # 자산 그래프
+            fig = px.line(equity_df, x='date', y='equity', title=f"자산 성장 ({selected_strategy})")
             fig.add_hline(y=initial_cap_input, line_dash="dash", line_color="gray", annotation_text="원금")
             fig.update_traces(fill='tozeroy', line=dict(color='#00CC96', width=2))
             st.plotly_chart(fig, use_container_width=True)
 
             st.divider()
 
-            # ---------------------------------------------------------------------------
-            # 🌟 [NEW] 종목별 상세 매매 타점 분석 (Visualization)
-            # ---------------------------------------------------------------------------
-            st.subheader("🔍 종목별 상세 매매 타점 분석")
-            st.caption("아래에서 종목을 선택하면, 어디서 사고 팔았는지 차트에 표시해 드립니다.")
+            # 🔍 상세 타점 분석 (오류 수정됨)
+            st.subheader("🔍 매매 타점 분석기")
             
-            # 매매가 있었던 종목 리스트 추출
             traded_tickers = trade_df['ticker'].unique()
-            # UI용 이름 리스트 생성
             ticker_options = [f"{TICKER_MAP.get(t, t)} ({t})" for t in traded_tickers]
             
             if len(ticker_options) > 0:
-                selected_option = st.selectbox("분석할 종목 선택", ticker_options)
+                selected_option = st.selectbox("종목 선택", ticker_options)
                 selected_ticker = selected_option.split('(')[-1].replace(')', '')
                 selected_name = TICKER_MAP.get(selected_ticker, selected_ticker)
 
-                # 선택된 종목의 매매 내역 필터링
                 my_trades = trade_df[trade_df['ticker'] == selected_ticker].sort_values('date')
                 
-                # 차트 데이터 다운로드 (시각화용)
-                with st.spinner(f"{selected_name} 차트 로딩 중..."):
+                with st.spinner("차트 로딩..."):
                     chart_data = yf.download(selected_ticker, start=str(bt_start_date), progress=False, auto_adjust=True)
-                    
-                    # 🛠️ [오류 수정 코드] MultiIndex 평탄화 및 중복 컬럼 제거
                     if isinstance(chart_data.columns, pd.MultiIndex):
                         chart_data.columns = chart_data.columns.get_level_values(0)
-                    
-                    # 🌟 핵심: 중복된 컬럼 이름이 있으면 하나만 남기고 제거 (DuplicateError 방지)
+                    # 중복 컬럼 제거 (DuplicateError 방지)
                     chart_data = chart_data.loc[:, ~chart_data.columns.duplicated()]
                 
                 if not chart_data.empty:
-                    # Plotly 차트 생성
-                    fig_detail = go.Figure()
-
-                    # 1. 주가 라인
-                    fig_detail.add_trace(go.Scatter(
-                        x=chart_data.index, 
-                        y=chart_data['Close'],
-                        mode='lines',
-                        name='주가',
-                        line=dict(color='gray', width=1)
-                    ))
-
-                    # 2. 매수 타점 (▲)
+                    fig_d = go.Figure()
+                    fig_d.add_trace(go.Scatter(x=chart_data.index, y=chart_data['Close'], mode='lines', name='주가', line=dict(color='gray')))
+                    
                     buys = my_trades[my_trades['type'] == 'buy']
                     if not buys.empty:
-                        fig_detail.add_trace(go.Scatter(
-                            x=buys['date'], 
-                            y=buys['price'],
-                            mode='markers',
-                            name='매수 (Buy)',
-                            marker=dict(symbol='triangle-up', color='red', size=12, line=dict(width=1, color='black')),
-                            hovertemplate='매수: %{y:,.2f}<br>날짜: %{x}<extra></extra>'
-                        ))
-
-                    # 3. 매도 타점 (▼)
+                        fig_d.add_trace(go.Scatter(x=buys['date'], y=buys['price'], mode='markers', name='매수', 
+                                                   marker=dict(symbol='triangle-up', color='red', size=12)))
+                    
                     sells = my_trades[my_trades['type'] == 'sell']
                     if not sells.empty:
-                        fig_detail.add_trace(go.Scatter(
-                            x=sells['date'], 
-                            y=sells['price'],
-                            mode='markers',
-                            name='매도 (Sell)',
-                            marker=dict(symbol='triangle-down', color='blue', size=12, line=dict(width=1, color='black')),
-                            hovertemplate='매도: %{y:,.2f}<br>수익률: %{text}<extra></extra>',
-                            text=[f"{p:.2f}%" for p in sells['profit']]
-                        ))
-
-                    fig_detail.update_layout(
-                        title=f"{selected_name} 매매 타점 복기",
-                        height=500,
-                        xaxis_title="날짜",
-                        yaxis_title="주가",
-                        template="plotly_dark"
-                    )
-                    st.plotly_chart(fig_detail, use_container_width=True)
+                        fig_d.add_trace(go.Scatter(x=sells['date'], y=sells['price'], mode='markers', name='매도', 
+                                                   marker=dict(symbol='triangle-down', color='blue', size=12),
+                                                   text=[f"{p:.1f}%" for p in sells['profit']], hovertemplate='수익률: %{text}'))
                     
-                    # 해당 종목 매매 일지 테이블
-                    st.markdown(f"**📄 {selected_name} 거래 내역**")
-                    disp_trade = my_trades[['date', 'type', 'price', 'profit', 'reason', 'score']].copy()
-                    disp_trade['date'] = disp_trade['date'].dt.date
-                    st.dataframe(
-                        disp_trade, 
-                        hide_index=True, 
-                        use_container_width=True,
-                        column_config={
-                            "date": "날짜",
-                            "type": "구분",
-                            "price": st.column_config.NumberColumn("가격", format="%.2f"),
-                            "profit": st.column_config.NumberColumn("수익률", format="%.2f%%"),
-                            "score": st.column_config.NumberColumn("AI점수", format="%.1f점"),
-                            "reason": "사유"
-                        }
-                    )
+                    fig_d.update_layout(title=f"{selected_name} 매매 복기", height=500, template="plotly_dark")
+                    st.plotly_chart(fig_d, use_container_width=True)
+                    
+                    st.dataframe(my_trades[['date', 'type', 'price', 'profit', 'reason', 'score']], hide_index=True, use_container_width=True)
             else:
-                st.info("매매 내역이 없습니다.")
+                st.info("거래 내역이 없습니다.")
+
+            # 전체 로그
+            st.subheader("📝 전체 거래 일지")
+            log_df = trade_df.copy()
+            log_df['date'] = log_df['date'].dt.date
+            st.dataframe(
+                log_df[['date', 'name', 'type', 'price', 'profit', 'balance', 'reason']].sort_values('date', ascending=False),
+                hide_index=True, use_container_width=True, height=400,
+                column_config={
+                    "price": st.column_config.NumberColumn("가격", format="%.2f"),
+                    "profit": st.column_config.NumberColumn("수익률", format="%.2f%%"),
+                    "balance": st.column_config.NumberColumn("잔고", format="%d원")
+                }
+            )
+        else:
+            st.warning("매매 신호가 발생하지 않았습니다.")
