@@ -78,24 +78,22 @@ USER_WATCHLIST = list(TICKER_MAP.keys())
 # ---------------------------------------------------------
 @st.cache_data(ttl=60)
 def get_bulk_us_data(us_tickers):
-    """미국 주식 데이터 수집 (단일/다중 종목 모두 처리 가능하도록 수정)"""
+    """미국 주식 데이터 수집"""
     if not us_tickers:
         return {}, {}
     
     hist_map = {}
     realtime_map = {}
 
-    # 1개일 때와 여러 개일 때 yfinance 리턴 구조가 다름 -> 분기 처리
+    # 1개일 때
     if len(us_tickers) == 1:
         ticker = us_tickers[0]
         try:
-            # 히스토리
             df_hist = yf.download(ticker, period="2y", interval="1d", progress=False, auto_adjust=True)
             if not df_hist.empty:
                 if 'Close' in df_hist.columns:
                     hist_map[ticker] = df_hist
 
-            # 실시간
             df_real = yf.download(ticker, period="5d", interval="1m", progress=False, prepost=True)
             if not df_real.empty:
                 if 'Close' in df_real.columns:
@@ -115,7 +113,6 @@ def get_bulk_us_data(us_tickers):
             try:
                 sub_df = df_hist[t]
                 if isinstance(sub_df, pd.DataFrame) and not sub_df.empty:
-                    # MultiIndex 컬럼 정리 (Open, Close 등만 남김)
                     sub_df = sub_df.dropna(how='all') 
                     if 'Close' in sub_df.columns:
                         hist_map[t] = sub_df
@@ -125,9 +122,8 @@ def get_bulk_us_data(us_tickers):
             try:
                 sub_real = df_real[t]
                 if isinstance(sub_real, pd.DataFrame) and not sub_real.empty:
-                     sub_real = sub_real.dropna(how='all')
-                     if 'Close' in sub_real.columns:
-                        # NaN 제외한 마지막 값
+                      sub_real = sub_real.dropna(how='all')
+                      if 'Close' in sub_real.columns:
                         valid_closes = sub_real['Close'].dropna()
                         if not valid_closes.empty:
                             realtime_map[t] = float(valid_closes.iloc[-1])
@@ -198,14 +194,13 @@ def get_precise_data(tickers_list):
     return hist_map, realtime_map
 
 # ---------------------------------------------------------
-# 3. 공통 분석 엔진
+# 3. 분석 엔진 (점수 로직 대폭 수정됨)
 # ---------------------------------------------------------
 
 def calculate_indicators(df, realtime_price=None):
     if df is None or len(df) < 30: return None
     df = df.copy()
 
-    # 컬럼 정리
     if 'Close' not in df.columns and 'Adj Close' in df.columns:
         df['Close'] = df['Adj Close']
     
@@ -250,104 +245,142 @@ def calculate_indicators(df, realtime_price=None):
     return df.dropna()
 
 def analyze_advanced_strategy(df):
+    """
+    수정된 상세 채점 로직 (Granular Scoring System)
+    - 단순 가산(+10)이 아닌, 지표의 강도와 근접도에 따라 소수점 점수 부여
+    - 중복 점수 최소화
+    """
     if df is None or df.empty:
         return "분석 불가", "gray", "데이터 부족", 0
 
     try:
         curr = float(df['Close_Calc'].iloc[-1])
+        ma5 = float(df['MA5'].iloc[-1])
         ma20 = float(df['MA20'].iloc[-1])
         ma60 = float(df['MA60'].iloc[-1])
         rsi = float(df['RSI'].iloc[-1])
         macd = float(df['MACD'].iloc[-1])
         sig = float(df['Signal_Line'].iloc[-1])
-        prev_macd = float(df['MACD'].iloc[-2])
-        prev_sig = float(df['Signal_Line'].iloc[-2])
         std20 = float(df['STD20'].iloc[-1])
         mom10 = float(df['MOM10'].iloc[-1])
     except:
         return "오류", "gray", "계산 실패", 0
 
-    score = 50
+    # 🟢 기본 점수: 50.0 (Float로 시작)
+    score = 50.0
     reasons = []
 
-    # 1. 추세
-    if curr > ma60 and ma20 > ma60:
-        score += 20
-        reasons.append("📈 중기 상승 추세 (60일선 위)")
-    elif curr > ma60:
-        score += 5
-        reasons.append("↗ 60일선 위 (추세 형성 중)")
+    # -----------------------------------------------------------
+    # 1. 추세 (Trend) - 정밀 평가 (Max +35점)
+    # -----------------------------------------------------------
+    # 60일선 위 (기본 추세)
+    if curr > ma60:
+        score += 10
+        # 추세의 강도: 이격도가 너무 크지 않은 선에서 가산점 (최대 +5점)
+        divergence_60 = (curr - ma60) / ma60
+        if 0 < divergence_60 < 0.15:
+            score += divergence_60 * 33  # 0.15 * 33 ≈ 5점
+        else:
+            score += 2 # 너무 멀어지면 조금만
     else:
-        score -= 25
-        reasons.append("⚠ 하락 추세 (60일선 아래)")
-
-    # 2. 위치
-    dist_ma20 = (curr - ma20) / ma20 if ma20 > 0 else 0
-    if (curr >= ma20) and (curr >= ma60) and (-0.03 <= dist_ma20 <= 0.02):
-        score += 20
-        reasons.append("💎 황금 눌림목 (20일선 근접)")
-    elif 0.02 < dist_ma20 <= 0.07:
+        score -= 20 # 역배열 감점
+        
+    # 정배열 보너스 (5 > 20 > 60)
+    if ma5 > ma20 > ma60:
+        score += 10
+        reasons.append("⚡ 정배열 상승세")
+    elif ma20 > ma60:
         score += 5
-        reasons.append("🙂 상승 유지 (과열 아님)")
-    elif dist_ma20 > 0.07:
+        
+    # -----------------------------------------------------------
+    # 2. 위치 & 눌림목 (Position) - 거리 기반 가변 점수 (Max +30점)
+    # -----------------------------------------------------------
+    # 20일선과의 거리 계산 (비율)
+    dist_ma20 = (curr - ma20) / ma20 
+    abs_dist = abs(dist_ma20)
+
+    # 황금 눌림목: 60일선 위에 있으면서, 20일선 근처(+/- 3%)에 붙어있을 때
+    if curr > ma60 and abs_dist <= 0.03:
+        # 거리가 0에 가까울수록 점수가 높음 (최대 20점)
+        # 공식: 20 * (1 - (현재거리 / 허용거리))
+        proximity_score = 20 * (1 - (abs_dist / 0.03))
+        score += proximity_score
+        
+        if dist_ma20 >= 0:
+            reasons.append(f"💎 황금 눌림목 (20일선 +{dist_ma20*100:.1f}%)")
+        else:
+            reasons.append(f"🛒 저점 매수 기회 (20일선 {dist_ma20*100:.1f}%)")
+            
+    # 상승 지속형 (20일선 위 3%~8%)
+    elif curr > ma60 and 0.03 < dist_ma20 <= 0.08:
+        score += 5
+        
+    # 과열 주의 (20일선 10% 이상 이격)
+    elif dist_ma20 > 0.10:
         score -= 15
-        reasons.append("🔥 단기 과열 (20일선 이격 과다)")
+        reasons.append("🔥 단기 과열 (이격 과다)")
 
-    # 3. RSI
+    # -----------------------------------------------------------
+    # 3. RSI 정밀 평가 - 곡선형 점수 (Max +15점)
+    # -----------------------------------------------------------
+    # 40~60: 안정적 상승 구간 (가장 선호)
     if 40 <= rsi <= 60:
-        score += 15
-        reasons.append(f"⚖ RSI {rsi:.0f} (40-60 균형)")
+        # 50을 중심으로 대칭 점수 부여 (중립일 때 +10, 60에 가까우면 +12)
+        score += 10 + ((rsi - 40) * 0.1)
+        reasons.append(f"⚖ 안정적 RSI ({rsi:.1f})")
+    # 30~40: 반등 준비 구간
     elif 30 <= rsi < 40:
-        score += 5
-        reasons.append("반등 기대 (약한 과매도)")
+        score += 5 + ((40 - rsi) * 0.5) # 30에 가까울수록 점수 높게
+        reasons.append("반등 준비")
+    # 60~70: 강한 모멘텀
+    elif 60 < rsi <= 70:
+        score += 8
+    # 과매도 (30 미만) - 역발상
     elif rsi < 30:
         score += 15
-        reasons.append("심한 과매도 (역발상)")
+        reasons.append("💧 과매도 (기술적 반등 기대)")
+    # 과매수 (70 초과)
     elif rsi > 70:
-        score -= 20
-        reasons.append("🚨 RSI 과열 (조정 주의)")
-
-    # 4. 모멘텀
-    if 0.03 <= mom10 <= 0.15:
-        score += 10
-        reasons.append(f"📊 최근 2주간 {mom10*100:.1f}% 상승")
-    elif mom10 > 0.25:
         score -= 15
-        reasons.append(f"급등 피로감 (2주간 {mom10*100:.1f}% 폭등)")
-    elif mom10 < -0.10:
-        score -= 10
-        reasons.append("낙폭 과대")
+        reasons.append("🚨 RSI 과열")
 
-    # 5. MACD
-    if macd > sig and prev_macd <= prev_sig:
-        score += 15
-        reasons.append("⚡ MACD 골든크로스")
-    elif macd > sig:
+    # -----------------------------------------------------------
+    # 4. MACD & 모멘텀 (Max +20점)
+    # -----------------------------------------------------------
+    # MACD 오실레이터(히스토그램) 크기에 비례한 점수
+    macd_hist = macd - sig
+    
+    if macd > sig:
         score += 5
-        reasons.append("MACD 상방")
-    elif macd < sig and prev_macd >= prev_sig:
-        score -= 10
-        reasons.append("💧 MACD 데드크로스")
+        # 히스토그램이 양수이면서 커질수록 가산점 (최대 5점)
+        hist_bonus = min(5.0, (macd_hist / curr) * 1000)
+        score += hist_bonus
+        if macd_hist > 0 and macd_hist > float(df['MACD'].iloc[-2] - df['Signal_Line'].iloc[-2]):
+             reasons.append("🚀 상승 에너지 확대")
+    else:
+        score -= 5
 
-    # 6. 변동성
+    # -----------------------------------------------------------
+    # 5. 최종 보정
+    # -----------------------------------------------------------
+    # 변동성 페널티 (너무 등락폭이 크면 감점)
     vol_ratio = std20 / curr if curr > 0 else 0
-    if vol_ratio > 0.08:
-        score -= 15
-        reasons.append("🎢 변동성 큼")
-    elif vol_ratio < 0.03:
-        score += 5
-        reasons.append("⚙ 안정적 변동성")
+    if vol_ratio > 0.05:
+        score -= (vol_ratio * 100) # 변동성이 클수록 점수 깎임
+        
+    score = max(0.0, min(100.0, score)) # 0~100 사이로 클램핑
 
-    score = max(0, min(100, score))
-
-    if score >= 80: cat, col = "🚀 단기 강력 매수", "green"
+    # 등급 결정
+    if score >= 80: cat, col = "🚀 강력 매수", "green"
     elif score >= 65: cat, col = "📈 매수 우위", "blue"
     elif score >= 45: cat, col = "👀 관망", "gray"
-    elif score >= 25: cat, col = "📉 매도/비중 축소", "red"
-    else: cat, col = "💥 강력 매도", "red"
+    elif score >= 25: cat, col = "📉 비중 축소", "orange"
+    else: cat, col = "💥 매도", "red"
 
-    if not reasons: reasons.append("관망")
-    return cat, col, " / ".join(reasons[:4]), score
+    if not reasons: reasons.append("중립/관망")
+    
+    # 팁: 리턴할 때 소수점 1자리까지 포함하여 리턴 -> 순위 정렬 시 동점자 방지
+    return cat, col, " / ".join(reasons[:3]), round(score, 1)
 
 def calculate_total_profit(ticker, avg_price, current_price, quantity):
     is_kr = ticker.endswith(".KS") or ticker.endswith(".KQ")
@@ -442,7 +475,7 @@ with tab1:
             height=700,
             column_config={
                 "종목명": st.column_config.TextColumn("종목명 (코드)", width="medium"),
-                "점수": st.column_config.ProgressColumn("AI 점수", format="%d점", min_value=0, max_value=100),
+                "점수": st.column_config.ProgressColumn("AI 점수", format="%.1f점", min_value=0, max_value=100),
                 "현재가": st.column_config.TextColumn("현재가"), 
                 "RSI": st.column_config.NumberColumn("RSI", format="%.1f"),
                 "AI 등급": st.column_config.TextColumn("AI 판단"),
@@ -548,7 +581,7 @@ with tab2:
                         df_indi = calculate_indicators(df_tk, realtime_price=curr_price)
                 
                 if df_indi is not None:
-                     curr = float(df_indi['Close_Calc'].iloc[-1])
+                      curr = float(df_indi['Close_Calc'].iloc[-1])
                 
                 cat, col_name, reasoning, score = "데이터 로딩 중", "gray", "잠시 후 다시 시도", 0
 
