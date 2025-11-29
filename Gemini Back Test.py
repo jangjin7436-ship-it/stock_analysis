@@ -173,8 +173,12 @@ def prepare_stock_data(ticker_info, start_date):
 def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
                            max_hold_days, exchange_data, use_compound, selection_mode):
     """
-    [수정] 기말 보유 종목 평가 로직 추가
+    [수정 완료] ValueError 해결 버전
+    - if stock_row: -> if stock_row is not None: 으로 변경
     """
+    # ---------------------------------------------------------
+    # 1. 전 종목 데이터 준비
+    # ---------------------------------------------------------
     all_dfs = []
     for t in targets:
         res = prepare_stock_data(t, start_date)
@@ -184,6 +188,9 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
     if not all_dfs:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), initial_capital
 
+    # ---------------------------------------------------------
+    # 2. Market Data 통합
+    # ---------------------------------------------------------
     market_data = {}
     for df in all_dfs:
         for date, row in df.iterrows():
@@ -193,6 +200,9 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
     
     sorted_dates = sorted(market_data.keys())
 
+    # ---------------------------------------------------------
+    # 3. 환율 데이터 준비
+    # ---------------------------------------------------------
     if isinstance(exchange_data, (float, int)):
         get_rate = lambda d: float(exchange_data)
     else:
@@ -201,6 +211,9 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
             ts = pd.Timestamp(d)
             return rate_dict.get(ts, 1430.0)
 
+    # ---------------------------------------------------------
+    # 4. 시뮬레이션 상태 변수 초기화
+    # ---------------------------------------------------------
     balance = initial_capital
     portfolio = {}
     trades_log = []
@@ -208,12 +221,16 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
     
     max_slots = 1 if selection_mode == 'TOP1' else 5 
 
-    # --- 날짜별 루프 ---
+    # ---------------------------------------------------------
+    # 5. 날짜별 루프 (백테스트 메인)
+    # ---------------------------------------------------------
     for date in sorted_dates:
         daily_stocks = market_data[date]
         current_rate = get_rate(date)
 
-        # A. 매도 로직 (1분봉 시뮬레이션 적용)
+        # =================================================
+        # A. 매도 로직 (Sell Check)
+        # =================================================
         sell_list = []
         for ticker in sorted(portfolio.keys()):
             info = portfolio[ticker]
@@ -222,8 +239,9 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
             if stock_row is None: 
                 continue
             
-            # 데이터 추출
+            # [1분봉 시뮬레이션을 위한 데이터 추출]
             rate = 1.0 if ".KS" in ticker else current_rate
+            
             raw_open = stock_row['Open']
             raw_high = stock_row['High']
             raw_low = stock_row['Low']
@@ -236,17 +254,17 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
             
             score = stock_row['AI_Score']
             fee_sell = 0.003 if ".KS" in ticker else 0.001
-            avg_price = info['avg_price']
             
+            avg_price = info['avg_price']
             profit_pct_close = ((curr_close - avg_price) / avg_price) * 100
             held_days = (pd.Timestamp(date) - pd.Timestamp(info['buy_date'])).days
             
             should_sell = False
             sell_reason = ""
-            final_sell_price = curr_close
+            final_sell_price = curr_close 
             final_sell_price_raw = raw_close
 
-            # [1] 시가 갭락
+            # [시나리오 1] 장 시작 갭락
             stop_loss_price = avg_price * 0.965
             if not should_sell:
                 if curr_open <= stop_loss_price:
@@ -256,15 +274,15 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
                     final_sell_price = curr_open 
                     final_sell_price_raw = raw_open
 
-            # [2] 장중 손절
+            # [시나리오 2] 장중 손절
             if not should_sell:
                 if curr_low <= stop_loss_price:
                     should_sell = True
                     sell_reason = "⚡ 장중손절(-3.5%)"
-                    final_sell_price = stop_loss_price
+                    final_sell_price = stop_loss_price 
                     final_sell_price_raw = stop_loss_price / rate
 
-            # [3] 트레일링 스탑
+            # [시나리오 3] 트레일링 스탑
             if not should_sell:
                 if curr_high > info['max_price']:
                     portfolio[ticker]['max_price'] = curr_high
@@ -283,7 +301,7 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
                         final_sell_price = max_p * 0.97
                         final_sell_price_raw = final_sell_price / rate
 
-            # [4] 종가 기준 판단
+            # [시나리오 4] 종가 기준 판단
             if not should_sell:
                 limit_days = max_hold_days if max_hold_days > 0 else 14 
                 if held_days >= limit_days:
@@ -321,12 +339,15 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
         for t in sell_list: 
             del portfolio[t]
 
-        # B. 신규 매수
+        # =================================================
+        # B. 신규 매수 (Buy Logic)
+        # =================================================
         if len(portfolio) < max_slots:
             candidates = []
             for row in daily_stocks:
                 ticker = row['Ticker']
-                if ticker in portfolio: continue
+                if ticker in portfolio: 
+                    continue
                 
                 score = row['AI_Score']
                 price_raw = row['Close_Calc']
@@ -339,10 +360,14 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
                     if rsi_val < 75:
                         vol_ratio = row.get('STD20', 0) / price_raw if price_raw > 0 else 0.03
                         candidates.append({
-                            'ticker': ticker, 'name': row['Name'],
-                            'price_raw': price_raw, 'price_krw': price_krw,
-                            'score': score, 'vol_power': vol_power,
-                            'vol_ratio': vol_ratio, 'reason': "AI추천(70↑)"
+                            'ticker': ticker,
+                            'name': row['Name'],
+                            'price_raw': price_raw,
+                            'price_krw': price_krw,
+                            'score': score,
+                            'vol_power': vol_power,
+                            'vol_ratio': vol_ratio,
+                            'reason': "AI추천(70↑)"
                         })
 
             candidates.sort(key=lambda x: (x['score'], x['vol_power']), reverse=True)
@@ -350,7 +375,8 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
             buy_targets = candidates[:open_slots]
             
             for target in buy_targets:
-                if balance <= 0: break
+                if balance <= 0: 
+                    break
                 
                 current_open_slots = max_slots - len(portfolio)
                 slot_budget = balance / current_open_slots
@@ -362,19 +388,28 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
                         cost = shares * target['price_krw'] * (1 + fee_buy)
                         balance -= cost
                         portfolio[target['ticker']] = {
-                            'name': target['name'], 'shares': shares,
+                            'name': target['name'],
+                            'shares': shares,
                             'avg_price': target['price_krw'],
-                            'buy_date': date, 'max_price': target['price_krw'],
+                            'buy_date': date,
+                            'max_price': target['price_krw'],
                         }
                         trades_log.append({
-                            'ticker': target['ticker'], 'name': target['name'],
-                            'date': date, 'type': 'buy',
-                            'price': target['price_raw'], 'shares': shares,
-                            'score': target['score'], 'profit': 0,
-                            'reason': target['reason'], 'balance': balance
+                            'ticker': target['ticker'],
+                            'name': target['name'],
+                            'date': date,
+                            'type': 'buy',
+                            'price': target['price_raw'],
+                            'shares': shares,
+                            'score': target['score'],
+                            'profit': 0,
+                            'reason': target['reason'],
+                            'balance': balance
                         })
 
-        # C. 자산 평가 (Equity Curve)
+        # =================================================
+        # C. 자산 평가
+        # =================================================
         current_equity = balance
         for ticker, info in portfolio.items():
             stock_row = next((x for x in daily_stocks if x['Ticker'] == ticker), None)
@@ -387,7 +422,9 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
         
         equity_curve.append({'date': date, 'equity': current_equity})
 
-    # [수정] D. 최종일 기준 보유 종목 리포트 생성 (Mark-to-Market)
+    # =================================================
+    # D. 최종일 기준 보유 종목 리포트 생성 (Mark-to-Market)
+    # =================================================
     held_stocks_list = []
     
     if sorted_dates:
@@ -396,17 +433,17 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
         last_rate = get_rate(last_date)
         
         for ticker, info in portfolio.items():
+            # [수정] if stock_row: 대신 명시적으로 is not None 체크
             stock_row = next((x for x in last_daily_stocks if x['Ticker'] == ticker), None)
             
-            if stock_row:
+            if stock_row is not None: # ★★★ 여기가 수정된 부분입니다 ★★★
                 rate = 1.0 if ".KS" in ticker else last_rate
                 curr_price = stock_row['Close_Calc'] * rate
                 curr_price_raw = stock_row['Close_Calc']
             else:
-                curr_price = info['avg_price'] # 데이터 없으면 평단가로 가정
+                curr_price = info['avg_price'] 
                 curr_price_raw = 0
             
-            # 평가금액 (가상 매도 시 수수료 차감)
             fee_sell = 0.003 if ".KS" in ticker else 0.001
             market_value = info['shares'] * curr_price
             net_value = market_value * (1 - fee_sell)
