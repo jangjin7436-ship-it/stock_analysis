@@ -493,8 +493,9 @@ with tab1:
 
                         final_price = float(df_indi['Close_Calc'].iloc[-1])
                         rsi_val = float(df_indi['RSI'].iloc[-1])
-                        # ★ 정렬용 모멘텀 데이터
+                        # ★ 정렬용 데이터
                         macd_hist_val = float(df_indi['MACD_Hist'].iloc[-1])
+                        vol_ratio_val = float(df_indi['Vol_Ratio'].iloc[-1])
 
                         name = TICKER_MAP.get(ticker_code, ticker_code)
                         is_kr = ticker_code.endswith(".KS") or ticker_code.endswith(".KQ")
@@ -508,7 +509,8 @@ with tab1:
                             "RSI": rsi_val,
                             "AI 등급": cat,
                             "핵심 요약": reasoning,
-                            "MACD_Hist": macd_hist_val  # 필수 추가
+                            "MACD_Hist": macd_hist_val,
+                            "Vol_Ratio": vol_ratio_val  # 거래량 비율 추가 (정렬용)
                         })
                     except: 
                         continue
@@ -524,8 +526,8 @@ with tab1:
                     st.error("데이터 수집 실패.")
     
     if st.session_state['scan_result_df'] is not None:
-        # ★ [오류 수정 핵심] 기존 세션 데이터에 MACD_Hist가 없는 경우 자동 재설정
-        if 'MACD_Hist' not in st.session_state['scan_result_df'].columns:
+        # ★ [오류 수정 핵심] 기존 세션 데이터에 MACD_Hist/Vol_Ratio가 없는 경우 자동 재설정
+        if 'Vol_Ratio' not in st.session_state['scan_result_df'].columns:
             st.warning("⚠️ 데이터 업데이트가 필요하여 재스캔을 준비합니다...")
             st.session_state['scan_result_df'] = None
             time.sleep(1)
@@ -542,17 +544,17 @@ with tab1:
             
             if len(perfect_candidates) > 5:
                 st.toast(f"💎 100점 만점 종목이 {len(perfect_candidates)}개 발견되었습니다!", icon="🔥")
-                st.info(f"💡 **AI 추천:** 100점 종목이 너무 많아, 상승 에너지(MACD 가속도)가 가장 폭발적인 **상위 5개**를 엄선했습니다.")
+                st.info(f"💡 **AI 추천:** 100점 종목이 너무 많아, 거래량 급증(Volume Ratio)이 가장 강력한 **상위 5개**를 엄선했습니다.")
                 
-                # 1. 100점짜리 중 MACD_Hist(상승 에너지)가 높은 순으로 5개 선정
-                top5_perfect = perfect_candidates.sort_values(by='MACD_Hist', ascending=False).head(5)
+                # 1. 100점짜리 중 Vol_Ratio(거래량 비율)가 높은 순으로 5개 선정
+                top5_perfect = perfect_candidates.sort_values(by='Vol_Ratio', ascending=False).head(5)
                 
                 # 2. 100점 미만 70점 이상 종목들은 그대로 유지
                 others = base_df[base_df['점수'] < 100]
                 
                 # 3. 데이터프레임 재구성
                 display_df = pd.concat([top5_perfect, others])
-                display_df = display_df.sort_values(by=['점수', 'MACD_Hist'], ascending=[False, False])
+                display_df = display_df.sort_values(by=['점수', 'Vol_Ratio'], ascending=[False, False])
             
             count = len(display_df)
             
