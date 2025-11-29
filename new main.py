@@ -104,15 +104,14 @@ def fetch_kr_polling(ticker):
     """
     국내 주식 실시간 가격
 
-    - 장중(09:00~15:30): 항상 '정규장 현재가(체결가)'를 사용
-    - 장 마감 이후:
-        • 시간외 단일가 구간(16:00~18:00): overPrice(시간외)를 우선 사용
-        • 그 외 시간에는 overPrice가 있으면 사용, 없으면 정규장 종가 사용
+    네이버 domestic realtime API에서
+    - 정규장 가격(closePrice)와
+    - 시간외 단일가(overMarketPriceInfo.overPrice)를 함께 받아서
+
+    두 가격의 localTradedAt(체결 시각)을 비교해
+    **가장 최근에 체결된 가격**을 현재가로 사용한다.
     """
     code = ticker.split('.')[0]  # "005930.KS" -> "005930"
-
-    in_regular = _is_kr_regular_session()
-    in_after   = _is_kr_after_session()
 
     try:
         url = f"https://polling.finance.naver.com/api/realtime/domestic/stock/{code}"
@@ -134,30 +133,55 @@ def fetch_kr_polling(ticker):
 
         item = datas[0]
 
-        # 문자열 정리
+        # ---- 1) 가격 문자열 정리 ----
         over_info = item.get("overMarketPriceInfo") or {}
+
         over_price_str  = str(over_info.get("overPrice", "")).replace(",", "").strip()
         close_price_str = str(item.get("closePrice", "")).replace(",", "").strip()
 
-        # 숫자로 변환 (있을 때만)
         over_price  = float(over_price_str)  if over_price_str  not in ("", "0") else None
         close_price = float(close_price_str) if close_price_str not in ("", "0") else None
 
-        # 1) 장중: 항상 가장 최신 정규장 체결가를 사용
-        if in_regular and close_price is not None:
-            return (ticker, close_price)
+        # ---- 2) 체결 시각 파싱 (정규장 / 시간외) ----
+        def _parse_dt(s: str):
+            if not s:
+                return None
+            try:
+                # 예: "2025-11-28T20:00:00.000000+09:00"
+                return datetime.datetime.fromisoformat(s)
+            except Exception:
+                return None
 
-        # 2) 시간외 단일가 구간: 시간외 단일가 있으면 그게 "현재 주가"
-        if in_after and over_price is not None:
-            return (ticker, over_price)
+        base_time_str = item.get("localTradedAt", "")
+        over_time_str = over_info.get("localTradedAt", "")
 
-        # 3) 그 외 시간: 시간외가 남아 있으면 그걸 우선, 없으면 정규장 종가
-        if over_price is not None:
-            return (ticker, over_price)
+        base_time = _parse_dt(base_time_str)
+        over_time = _parse_dt(over_time_str)
+
+        # ---- 3) 가장 최근에 체결된 가격 선택 ----
+        chosen_price = None
+        chosen_time = None
+
         if close_price is not None:
-            return (ticker, close_price)
+            chosen_price = close_price
+            chosen_time = base_time
 
-        # 둘 다 없으면 FDR로 폴백
+        if over_price is not None:
+            if over_time is not None and chosen_time is not None:
+                # 둘 다 시간이 있으면 더 최근 시각 쪽 선택
+                if over_time > chosen_time:
+                    chosen_price = over_price
+                    chosen_time = over_time
+            else:
+                # 한쪽만 시간이 있으면, 그냥 가격 있는 쪽 사용
+                if chosen_price is None:
+                    chosen_price = over_price
+                    chosen_time = over_time
+
+        if chosen_price is not None:
+            return (ticker, float(chosen_price))
+
+        # usable price가 없으면 FDR 폴백
         raise ValueError("no usable price in naver realtime response")
 
     except Exception:
