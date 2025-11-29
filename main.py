@@ -11,8 +11,6 @@ import json
 # ---------------------------------------------------------
 # 0. 파이어베이스(DB) 설정 (서버 저장용)
 # ---------------------------------------------------------
-# 주의: Streamlit Cloud의 Secrets에 'firebase_key'가 설정되어 있어야 작동합니다.
-# 로컬 테스트 시에는 secrets.toml 파일이 필요하거나, 없으면 임시로 로컬 모드로 작동합니다.
 import firebase_admin
 from firebase_admin import credentials, firestore
 
@@ -21,9 +19,21 @@ def get_db():
     # 이미 초기화되었는지 확인
     if not firebase_admin._apps:
         try:
-            # Streamlit Cloud 배포 시 secrets에서 키를 가져옴
             if 'firebase_key' in st.secrets:
-                key_dict = json.loads(st.secrets['firebase_key'])
+                # secrets에서 값을 가져옴
+                secret_val = st.secrets['firebase_key']
+                
+                # 상황 1: 이미 딕셔너리(AttrDict) 형태로 들어온 경우 (TOML 포맷)
+                if isinstance(secret_val, dict) or str(type(secret_val)) == "<class 'streamlit.runtime.secrets.AttrDict'>":
+                    key_dict = dict(secret_val)
+                # 상황 2: 문자열(JSON String) 형태로 들어온 경우
+                else:
+                    key_dict = json.loads(secret_val)
+                
+                # private_key 줄바꿈 문자(\n) 처리 (가끔 문자열로 들어올 때 깨지는 경우 대비)
+                if 'private_key' in key_dict:
+                    key_dict['private_key'] = key_dict['private_key'].replace('\\n', '\n')
+
                 cred = credentials.Certificate(key_dict)
                 firebase_admin.initialize_app(cred)
             else:
@@ -63,36 +73,48 @@ def format_ticker(ticker):
 def get_bulk_data(tickers_list):
     """여러 종목 데이터를 한 번에 다운로드"""
     formatted_tickers = [format_ticker(t) for t in tickers_list]
-    data = yf.download(formatted_tickers, period="6mo", group_by='ticker', threads=True)
+    # 수정: 기간을 '2y'(2년)로 대폭 늘려 충분한 과거 데이터를 확보합니다.
+    # 이렇게 하면 MA60, MA200 등을 계산할 때 앞부분이 잘려도 최신 데이터는 안전합니다.
+    data = yf.download(formatted_tickers, period="2y", group_by='ticker', threads=True)
     return data, formatted_tickers
 
 def calculate_indicators(df):
     """단일 종목 DataFrame에 지표 추가"""
+    # 데이터가 너무 적으면 계산 불가 (최소 60일은 있어야 MA60 계산 가능)
     if len(df) < 60: return None
     
     df = df.copy()
-    # 이평선
+    
+    # 0. 데이터 정제 (빈 데이터가 섞여있을 경우 앞뒤로 채움)
+    df['Close'] = df['Close'].ffill()
+
+    # 1. 이평선
     df['MA20'] = df['Close'].rolling(window=20).mean()
     df['MA60'] = df['Close'].rolling(window=60).mean()
     
-    # RSI
+    # 2. RSI
     delta = df['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs = gain / loss
     df['RSI'] = 100 - (100 / (1 + rs))
 
-    # MACD
+    # 3. MACD
     exp12 = df['Close'].ewm(span=12, adjust=False).mean()
     exp26 = df['Close'].ewm(span=26, adjust=False).mean()
     df['MACD'] = exp12 - exp26
     df['Signal_Line'] = df['MACD'].ewm(span=9, adjust=False).mean()
     
+    # 중요: 지표 계산 후 NaN(계산 불가능한 앞부분) 제거
+    # 2년치를 가져왔으므로 앞부분 60일을 잘라내도 최근 1년 반 데이터가 남습니다.
+    df = df.dropna()
+    
     return df
 
 def analyze_strategy(df):
     """스윙 전략 분석 (매수/매도/관망)"""
-    if df is None or df.isnull().values.any(): return "데이터 부족", "gray", 0
+    # 데이터가 비어있거나 마지막 날짜 데이터가 없으면 예외 처리
+    if df is None or df.empty: return "데이터 로딩 중...", "gray", 0
     
     current_price = df['Close'].iloc[-1]
     ma20 = df['MA20'].iloc[-1]
@@ -152,12 +174,21 @@ with tab1:
             progress_bar = st.progress(0)
             for i, ticker in enumerate(tickers):
                 try:
-                    # MultiIndex 처리
-                    df_ticker = raw_data[ticker].dropna()
+                    # MultiIndex 처리: 해당 티커의 데이터만 추출
+                    if isinstance(raw_data.columns, pd.MultiIndex):
+                        try:
+                            df_ticker = raw_data.xs(ticker, axis=1, level=1)
+                        except:
+                            df_ticker = raw_data[ticker]
+                    else:
+                        df_ticker = raw_data # 단일 종목일 경우
+                        
+                    df_ticker = df_ticker.dropna(how='all') # 모든 컬럼이 NaN인 행만 제거
+                    
                     if df_ticker.empty: continue
                     
                     df_indi = calculate_indicators(df_ticker)
-                    if df_indi is None: continue
+                    if df_indi is None or df_indi.empty: continue
 
                     action, color, score = analyze_strategy(df_indi)
                     
@@ -180,32 +211,28 @@ with tab1:
             # 결과 표시
             st.success("분석 완료!")
             
-            # DataFrame 변환 및 정렬 (점수 높은 순 = 매수 추천 순)
-            res_df = pd.DataFrame(results)
-            res_df = res_df.sort_values(by="점수", ascending=False)
-            
-            # 스타일링하여 출력
-            def color_action(val):
-                color = 'black'
-                if '강력 매수' in val: color = 'green'
-                elif '매수' in val: color = 'blue'
-                elif '매도' in val: color = 'red'
-                return f'color: {color}; font-weight: bold;'
+            if results:
+                # DataFrame 변환 및 정렬 (점수 높은 순 = 매수 추천 순)
+                res_df = pd.DataFrame(results)
+                res_df = res_df.sort_values(by="점수", ascending=False)
+                
+                # 데이터프레임 표시
+                st.dataframe(
+                    res_df[['종목', '현재가', 'AI 판단', 'RSI']],
+                    use_container_width=True,
+                    height=600
+                )
 
-            st.dataframe(
-                res_df[['종목', '현재가', 'AI 판단', 'RSI']],
-                use_container_width=True,
-                height=600
-            )
-
-            # 강력 매수 추천만 따로 표시
-            st.markdown("#### 🔥 오늘 강력 매수 추천 종목")
-            strong_buys = res_df[res_df['AI 판단'] == '강력 매수']
-            if not strong_buys.empty:
-                for idx, row in strong_buys.iterrows():
-                    st.info(f"**{row['종목']}**: 눌림목 혹은 강력한 상승 모멘텀 발생! (RSI: {row['RSI']})")
+                # 강력 매수 추천만 따로 표시
+                st.markdown("#### 🔥 오늘 강력 매수 추천 종목")
+                strong_buys = res_df[res_df['AI 판단'] == '강력 매수']
+                if not strong_buys.empty:
+                    for idx, row in strong_buys.iterrows():
+                        st.info(f"**{row['종목']}**: 눌림목 혹은 강력한 상승 모멘텀 발생! (RSI: {row['RSI']})")
+                else:
+                    st.write("현재 '강력 매수' 신호가 뜬 종목이 없습니다. 관망하세요.")
             else:
-                st.write("현재 '강력 매수' 신호가 뜬 종목이 없습니다. 관망하세요.")
+                st.warning("분석된 종목이 없습니다. 데이터 소스 연결 상태를 확인해주세요.")
 
 
 # === TAB 2: 내 포트폴리오 (Firebase 연동) ===
@@ -218,103 +245,119 @@ with tab2:
         st.warning("⚠️ 데이터베이스(Firebase)가 연결되지 않았습니다.")
         st.info("""
         **[설정 방법]**
-        1. Firebase 프로젝트 생성 -> 설정 -> 서비스 계정 -> 키 생성(JSON)
-        2. Streamlit Cloud -> App Settings -> Secrets에 JSON 내용을 복사해서 넣으세요.
-        키 이름: `firebase_key`
-        
-        *연결 전에는 데이터가 저장되지 않습니다.*
+        1. Streamlit Cloud -> App Settings -> Secrets에 접속
+        2. 제공드린 TOML 내용을 복사해서 붙여넣으세요.
         """)
     else:
-        # 사용자 식별 (간단히 이름 입력, 실제 서비스에선 로그인 기능 구현 필요)
+        # 사용자 식별
         user_id = st.text_input("사용자 닉네임 (이 키로 데이터를 불러옵니다)", value="my_portfolio")
         
-        # 컬렉션 참조
-        doc_ref = db.collection('portfolios').document(user_id)
-        
-        # 1. 데이터 불러오기
-        try:
-            doc = doc_ref.get()
-            if doc.exists:
-                portfolio_data = doc.to_dict().get('stocks', [])
-            else:
+        if user_id:
+            # 컬렉션 참조
+            doc_ref = db.collection('portfolios').document(user_id)
+            
+            # 1. 데이터 불러오기
+            try:
+                doc = doc_ref.get()
+                if doc.exists:
+                    portfolio_data = doc.to_dict().get('stocks', [])
+                else:
+                    portfolio_data = []
+            except Exception as e:
+                st.error(f"데이터 불러오기 오류: {e}")
                 portfolio_data = []
-        except:
-            portfolio_data = []
 
-        # 2. 종목 추가 UI
-        col1, col2, col3 = st.columns([2, 2, 1])
-        with col1:
-            new_ticker = st.text_input("종목 코드 추가 (예: TSLA, 005930)")
-        with col2:
-            new_price = st.number_input("평단가", min_value=0.0)
-        with col3:
-            st.write("") # Spacer
-            st.write("") # Spacer
-            if st.button("저장"):
-                if new_ticker and new_price > 0:
-                    formatted = format_ticker(new_ticker)
-                    # 중복 제거 후 추가
-                    portfolio_data = [p for p in portfolio_data if p['ticker'] != formatted]
-                    portfolio_data.append({"ticker": formatted, "price": new_price})
-                    
-                    # DB 업데이트
-                    doc_ref.set({'stocks': portfolio_data})
-                    st.success(f"{formatted} 저장 완료!")
-                    st.rerun()
-
-        st.divider()
-
-        # 3. 저장된 종목 분석
-        if portfolio_data:
-            st.subheader(f"💼 {user_id}님의 포트폴리오 진단")
-            
-            my_tickers = [p['ticker'] for p in portfolio_data]
-            my_data, _ = get_bulk_data(my_tickers)
-            
-            for item in portfolio_data:
-                tk = item['ticker']
-                my_avg = item['price']
+            # 2. 종목 추가 UI
+            with st.form("add_stock_form"):
+                col1, col2, col3 = st.columns([2, 2, 1])
+                with col1:
+                    new_ticker = st.text_input("종목 코드 (예: TSLA, 005930)")
+                with col2:
+                    new_price = st.number_input("평단가", min_value=0.0)
+                with col3:
+                    st.write("") 
+                    st.write("") 
+                    submitted = st.form_submit_button("저장")
                 
-                try:
-                    df_tk = my_data[tk].dropna()
-                    if df_tk.empty: continue
-                    
-                    df_tk = calculate_indicators(df_tk)
-                    curr = df_tk['Close'].iloc[-1]
-                    profit = ((curr - my_avg) / my_avg) * 100
-                    
-                    # 스윙 전략 분석 (보유자 관점)
-                    ma20 = df_tk['MA20'].iloc[-1]
-                    rsi = df_tk['RSI'].iloc[-1]
-                    
-                    msg = ""
-                    if profit > 0:
-                        profit_color = "green"
-                        if rsi > 70: msg = "🔥 익절 고려 (과열)"
-                        elif curr < ma20: msg = "⚠️ 20일선 이탈 (주의)"
-                        else: msg = "✅ 보유 (추세 지속)"
-                    else:
-                        profit_color = "red"
-                        if curr < ma20 * 0.97: msg = "✂️ 손절 검토 (추세 붕괴)"
-                        elif rsi < 30: msg = "💧 물타기/반등 대기 (과매도)"
-                        else: msg = "⏳ 관망"
-
-                    # 카드 형태로 출력
-                    with st.container():
-                        c1, c2, c3, c4 = st.columns([1, 2, 2, 3])
-                        c1.write(f"**{tk}**")
-                        c2.write(f"평단: {my_avg:,.0f}")
-                        c3.markdown(f":{profit_color}[수익률: {profit:.2f}%]")
-                        c4.markdown(f"**{msg}**")
+                if submitted:
+                    if new_ticker and new_price > 0:
+                        formatted = format_ticker(new_ticker)
+                        # 중복 제거 후 추가
+                        portfolio_data = [p for p in portfolio_data if p['ticker'] != formatted]
+                        portfolio_data.append({"ticker": formatted, "price": new_price})
                         
-                    st.divider()
+                        # DB 업데이트
+                        doc_ref.set({'stocks': portfolio_data})
+                        st.success(f"{formatted} 저장 완료!")
+                        st.rerun()
 
-                    # 삭제 버튼 (개별 삭제 구현은 복잡해지므로, 전체 초기화 버튼 예시)
-                except Exception as e:
-                    st.error(f"{tk} 데이터 로드 실패")
-            
-            if st.button("포트폴리오 초기화 (모두 삭제)"):
-                doc_ref.delete()
-                st.rerun()
-        else:
-            st.info("저장된 종목이 없습니다. 위에서 추가해주세요.")
+            st.divider()
+
+            # 3. 저장된 종목 분석
+            if portfolio_data:
+                st.subheader(f"💼 {user_id}님의 포트폴리오 진단")
+                
+                my_tickers = [p['ticker'] for p in portfolio_data]
+                
+                with st.spinner("포트폴리오 분석 중..."):
+                    my_data, _ = get_bulk_data(my_tickers)
+                
+                for item in portfolio_data:
+                    tk = item['ticker']
+                    my_avg = item['price']
+                    
+                    try:
+                        # 데이터 추출 (안전하게)
+                        if isinstance(my_data.columns, pd.MultiIndex):
+                            try:
+                                df_tk = my_data.xs(tk, axis=1, level=1)
+                            except:
+                                df_tk = my_data[tk]
+                        else:
+                            df_tk = my_data
+                            
+                        df_tk = df_tk.dropna(how='all')
+                        
+                        # 지표 계산
+                        df_tk = calculate_indicators(df_tk)
+                        if df_tk is None:
+                            st.warning(f"{tk}: 데이터 로딩 중...")
+                            continue
+
+                        curr = df_tk['Close'].iloc[-1]
+                        profit = ((curr - my_avg) / my_avg) * 100
+                        
+                        # 스윙 전략 분석 (보유자 관점)
+                        ma20 = df_tk['MA20'].iloc[-1]
+                        rsi = df_tk['RSI'].iloc[-1]
+                        
+                        msg = ""
+                        if profit > 0:
+                            profit_color = "green"
+                            if rsi > 70: msg = "🔥 익절 고려 (과열)"
+                            elif curr < ma20: msg = "⚠️ 20일선 이탈 (주의)"
+                            else: msg = "✅ 보유 (추세 지속)"
+                        else:
+                            profit_color = "red"
+                            if curr < ma20 * 0.97: msg = "✂️ 손절 검토 (추세 붕괴)"
+                            elif rsi < 30: msg = "💧 물타기/반등 대기 (과매도)"
+                            else: msg = "⏳ 관망"
+
+                        # 카드 형태로 출력
+                        with st.container():
+                            c1, c2, c3, c4 = st.columns([1, 2, 2, 3])
+                            c1.markdown(f"**{tk}**")
+                            c2.write(f"평단: {my_avg:,.0f}")
+                            c3.markdown(f":{profit_color}[수익률: {profit:.2f}%]")
+                            c4.markdown(f"**{msg}**")
+                            
+                        st.divider()
+
+                    except Exception as e:
+                        st.error(f"{tk} 분석 오류: {e}")
+                
+                if st.button("포트폴리오 초기화 (전체 삭제)"):
+                    doc_ref.delete()
+                    st.rerun()
+            else:
+                st.info("저장된 종목이 없습니다. 위에서 추가해주세요.")
