@@ -82,39 +82,49 @@ USER_WATCHLIST = list(TICKER_MAP.keys())
 
 def fetch_kr_polling(ticker):
     """
-    [UPDATED] 네이버 금융 Polling API 호출
-    - 가능하면 시간외 현재가(애프터마켓)를 우선 사용
-    - 해당 필드가 없으면 일반 현재가(nv)를 사용
+    [New Method v2] 네이버 국내주식 실시간 + 시간외 단일가 조회
+    - 기본: closePrice
+    - 시간외 단일가 장이 열려 있으면 overMarketPriceInfo.overPrice 를 우선 사용
     """
+    code = ticker.split('.')[0]
+
     try:
-        code = ticker.split('.')[0]
-        url = f"https://polling.finance.naver.com/api/realtime?query=SERVICE_ITEM:{code}"
+        # 예: https://polling.finance.naver.com/api/realtime/domestic/stock/005930
+        url = f"https://polling.finance.naver.com/api/realtime/domestic/stock/{code}"
         headers = {
-            'User-Agent': 'Mozilla/5.0',
-            'Referer': 'https://finance.naver.com/'
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://finance.naver.com/"
         }
         res = requests.get(url, headers=headers, timeout=3)
         data = res.json()
-        
-        result = data.get("result", {})
-        if result.get("code") == "200":
-            for area in result.get("areas", []):
-                for item in area.get("datas", []):
-                    if item.get("cd") == code:
-                        # ⚠️ 시간외 가격 필드는 종목/타입에 따라 다를 수 있음.
-                        # ap / av 등을 우선 시도하고, 없으면 nv(현재가) 사용.
-                        after_price = (
-                            item.get("ap") or  # 예: 시간외 현재가로 쓰이는 경우가 있음
-                            item.get("av") or  # 예비 필드
-                            item.get("nv")     # 기본 현재가
-                        )
-                        if after_price is not None:
-                            return (ticker, float(after_price))
-        return (ticker, None)
-    except:
-        # 실패 시 FDR 백업
+
+        if "datas" not in data or not data["datas"]:
+            return (ticker, None)
+
+        item = data["datas"][0]
+
+        price_str = None
+
+        # 1) 시간외 단일가 장이 열려 있으면 그 가격을 최우선으로 사용
+        over_info = item.get("overMarketPriceInfo")
+        if over_info and over_info.get("overMarketStatus") == "OPEN":
+            # overPrice가 시간외 현재가
+            price_str = over_info.get("overPrice") or over_info.get("closePrice")
+
+        # 2) 시간외가 없으면 정규장 기준 closePrice 사용
+        if not price_str:
+            price_str = item.get("closePrice")
+
+        if not price_str:
+            return (ticker, None)
+
+        price = float(str(price_str).replace(",", ""))
+        return (ticker, price)
+
+    except Exception:
+        # 실패 시 FDR 종가 백업
         try:
-            df = fdr.DataReader(ticker.split('.')[0], '2023-01-01')
+            df = fdr.DataReader(code, '2023-01-01')
             if not df.empty:
                 return (ticker, float(df['Close'].iloc[-1]))
         except:
@@ -257,55 +267,41 @@ def calculate_indicators(df):
     
     return df.dropna()
 
-def calculate_total_profit(
-    ticker,
-    avg_price,
-    current_price,
-    quantity,
-    kr_fee_rate: float = 0.000295,  # ≈ 0.0295%
-    kr_tax_rate: float = 0.0015,    # 0.15%
-    us_fee_rate: float = 0.0020     # 0.2%
-):
+def calculate_total_profit(ticker, avg_price, current_price, quantity):
     """
-    [UPDATED] 토스 방식에 맞춘 세후 수익률 계산
-    - 원금: 평단가 × 수량
-    - 세전 평가금: 현재가 × 수량
-    - 국내: 평가금 기준 수수료 + 세금 차감
-    - 해외: 평가금 기준 수수료만 차감 (세금 0으로 두고 필요시 조정)
+    토스 방식에 최대한 맞춘 세후(수수료/세금 포함) 수익률 계산
+
+    - 국내: (현재가 * 수량) 에서 (수수료 + 거래세) ≈ 0.1794% 를 뺀 후 원단위 반올림
+    - 해외: (현재가 * 수량) 에서 수수료 ≈ 0.1975% 를 뺀 후 원단위 반올림
+    - 원금(평단 * 수량)에는 추가 수수료를 더하지 않고, 토스 화면처럼 비교
     """
     is_kr = ticker.endswith(".KS") or ticker.endswith(".KQ")
-    currency = "₩" if is_kr else "$"
 
-    if quantity <= 0 or avg_price <= 0:
-        return {
-            "pct": 0.0,
-            "profit_amt": 0.0,
-            "net_eval_amt": 0.0,
-            "currency": currency
-        }
+    # 토스 스샷에 맞춘 경험적 수치 (필요하면 여기만 조정하면 됨)
+    KR_FEE_TAX_RATE = 0.001794   # ≈ 0.18% (수수료 + 거래세)
+    US_FEE_RATE      = 0.001975   # ≈ 0.20% (이벤트 기준 실효 수수료 근사)
 
-    # 원금(토스 '원금')
     total_buy = avg_price * quantity
+    raw_eval = current_price * quantity
 
-    # 세전 평가금
-    gross_eval = current_price * quantity
+    # 시장별 수수료율 선택
+    fee_rate = KR_FEE_TAX_RATE if is_kr else US_FEE_RATE
 
-    # 매도 시점 비용
-    if is_kr:
-        fee = math.floor(gross_eval * kr_fee_rate)
-        tax = math.floor(gross_eval * kr_tax_rate)
-    else:
-        fee = math.floor(gross_eval * us_fee_rate)
-        tax = 0
+    # 토스처럼 원 단위 반올림해서 수수료/세금 계산
+    total_fee = int(raw_eval * fee_rate + 0.5)
 
-    total_cost = fee + tax
+    # 평가금 = 현재 평가금 - (예상 수수료/세금)
+    net_eval = raw_eval - total_fee
 
-    # 세후 평가금
-    net_eval = gross_eval - total_cost
-
-    # 순이익 & 수익률
+    # 순수익 = 평가금 - 원금
     net_profit_amt = net_eval - total_buy
-    net_profit_pct = (net_profit_amt / total_buy) * 100.0
+
+    if total_buy > 0:
+        net_profit_pct = (net_profit_amt / total_buy) * 100
+    else:
+        net_profit_pct = 0.0
+
+    currency = "₩" if is_kr else "$"
 
     return {
         "pct": net_profit_pct,
