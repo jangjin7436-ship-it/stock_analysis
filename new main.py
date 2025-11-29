@@ -97,6 +97,38 @@ SEARCH_MAP = {f"{name} ({code})": code for code, name in TICKER_MAP.items()}
 USER_WATCHLIST = list(TICKER_MAP.keys())
 
 # ---------------------------------------------------------
+# 종목 성격 분류 (스윙 전략용)
+# ---------------------------------------------------------
+LEVERAGED_CODES = {
+    "SOXL", "TQQQ", "UPRO", "FNGU", "BULZ", "TMF", "BITX", "TSLL"
+}
+STABLE_ETF_CODES = {
+    "XLE", "SLV"   # 1배 ETF (비교적 안정)
+}
+
+def classify_asset_style(ticker: str) -> str:
+    """
+    종목 코드를 보고 스윙 스타일을 분류한다.
+    - LEVERAGED_ETF : TQQQ, SOXL, UPRO, FNGU, BULZ, TMF, BITX, TSLL 등 레버리지/파생 ETF
+    - ETF_STABLE     : XLE, SLV 등 1배 ETF
+    - KR_STOCK       : 국내 개별주 (코스피/코스닥)
+    - US_STOCK       : 미국 개별주/ETF (기본적으로 성장주 성향으로 취급)
+    """
+    if not ticker:
+        return "DEFAULT"
+
+    base = ticker.split(".")[0]
+
+    if base in LEVERAGED_CODES:
+        return "LEVERAGED_ETF"
+    if base in STABLE_ETF_CODES:
+        return "ETF_STABLE"
+    if ticker.endswith(".KS") or ticker.endswith(".KQ"):
+        return "KR_STOCK"
+    return "US_STOCK"
+
+
+# ---------------------------------------------------------
 # 2. 데이터 수집 혁신 (New Method)
 # ---------------------------------------------------------
 
@@ -290,45 +322,75 @@ def get_precise_data(tickers_list):
     return final_dfs, realtime_prices
 
 def calculate_indicators(df):
-    if len(df) < 60: return None
+    """
+    스윙(2~4주) 전략용 지표 세트 계산
+
+    - Close_Calc : 종가(결측 보정)
+    - MA5 / MA10 / MA20 / MA60 : 단·중기 이동평균
+    - STD20 : 20일 표준편차 (변동성)
+    - VolMA20 : 20일 평균 거래량
+    - RSI(14), MACD(12,26,9)
+    - BB_Upper / BB_Lower : 볼린저 밴드
+    - MOM10 : 10일 모멘텀 (약 2주 수익률)
+    """
+    if len(df) < 60:
+        return None
+
     df = df.copy()
-    
-    # 단일 컬럼 보장
+
+    # 단일 Close 시리즈 확보
     if isinstance(df, pd.DataFrame) and 'Close' in df.columns:
-        if isinstance(df['Close'], pd.DataFrame):
-            close_series = df['Close'].iloc[:, 0]
+        close = df['Close']
+        if isinstance(close, pd.DataFrame):
+            close_series = close.iloc[:, 0]
         else:
-            close_series = df['Close']
+            close_series = close
     else:
         return None
 
     close_series = close_series.ffill()
     df['Close_Calc'] = close_series
 
+    # 📌 이동평균 (단기/중기)
+    df['MA5']  = df['Close_Calc'].rolling(window=5).mean()
+    df['MA10'] = df['Close_Calc'].rolling(window=10).mean()
     df['MA20'] = df['Close_Calc'].rolling(window=20).mean()
     df['MA60'] = df['Close_Calc'].rolling(window=60).mean()
-    
+
+    # 📌 변동성 / 모멘텀
+    df['STD20'] = df['Close_Calc'].rolling(window=20).std()
+    df['RET1']  = df['Close_Calc'].pct_change()
+    df['MOM10'] = df['Close_Calc'] / df['Close_Calc'].shift(10) - 1  # 최근 10영업일 수익률
+
+    # 📌 거래량 관련
     if 'Volume' in df.columns:
-        vol = df['Volume'].iloc[:, 0] if isinstance(df['Volume'], pd.DataFrame) else df['Volume']
+        vol = df['Volume']
+        if isinstance(vol, pd.DataFrame):
+            vol = vol.iloc[:, 0]
+        df['Volume_Calc'] = vol
         df['VolMA20'] = vol.rolling(window=20).mean()
     else:
+        df['Volume_Calc'] = 0
         df['VolMA20'] = 0
 
+    # 📌 RSI(14)
     delta = df['Close_Calc'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs = gain / loss
     df['RSI'] = 100 - (100 / (1 + rs))
 
+    # 📌 MACD(12,26,9)
     exp12 = df['Close_Calc'].ewm(span=12, adjust=False).mean()
     exp26 = df['Close_Calc'].ewm(span=26, adjust=False).mean()
     df['MACD'] = exp12 - exp26
     df['Signal_Line'] = df['MACD'].ewm(span=9, adjust=False).mean()
 
-    df['STD20'] = df['Close_Calc'].rolling(window=20).std()
+    # 📌 볼린저 밴드 (20, 2σ)
     df['BB_Upper'] = df['MA20'] + (df['STD20'] * 2)
     df['BB_Lower'] = df['MA20'] - (df['STD20'] * 2)
-    
+
+    # NaN 행 제거
     return df.dropna()
 
 def calculate_total_profit(ticker, avg_price, current_price, quantity):
@@ -387,104 +449,221 @@ def calculate_total_profit(ticker, avg_price, current_price, quantity):
         "currency": currency
     }
 
-def analyze_advanced_strategy(df):
-    if df is None or df.empty: return "분석 불가", "gray", "데이터 부족", 0
-    
+def analyze_advanced_strategy(df, ticker=None):
+    """
+    [2~4주 스윙 전용] 매수 매력도 스코어링 엔진 (종목 성격별 튜닝)
+
+    공통 목표:
+      - 최대 보유기간 4주, 보통 2주 안에서
+        '중기 상승 추세 + 단기 눌림목' 구간을 찾는다.
+
+    스타일:
+      - KR_STOCK     : 국내 개별주 (조금 더 보수적으로, 변동성·급등에 민감)
+      - US_STOCK     : 미국 성장주/ETF (모멘텀을 조금 더 중시)
+      - ETF_STABLE   : XLE, SLV 같은 1배 ETF (가장 안정 추구)
+      - LEVERAGED_ETF: TQQQ, SOXL 같은 레버리지 ETF (강한 추세 + 모멘텀 위주, 변동성 감점 완화)
+    """
+    if df is None or df.empty:
+        return "분석 불가", "gray", "데이터 부족", 0
+
+    style = classify_asset_style(ticker)
+
     try:
         curr = float(df['Close_Calc'].iloc[-1])
+        ma5  = float(df['MA5'].iloc[-1])
+        ma10 = float(df['MA10'].iloc[-1])
         ma20 = float(df['MA20'].iloc[-1])
         ma60 = float(df['MA60'].iloc[-1])
+
         rsi = float(df['RSI'].iloc[-1])
         macd = float(df['MACD'].iloc[-1])
-        sig = float(df['Signal_Line'].iloc[-1])
+        sig  = float(df['Signal_Line'].iloc[-1])
+        prev_macd = float(df['MACD'].iloc[-2])
+        prev_sig  = float(df['Signal_Line'].iloc[-2])
+
         bb_upper = float(df['BB_Upper'].iloc[-1])
         bb_lower = float(df['BB_Lower'].iloc[-1])
-        
-        prev_macd = float(df['MACD'].iloc[-2])
-        prev_sig = float(df['Signal_Line'].iloc[-2])
-        
-        vol = float(df['Volume'].iloc[-1]) if 'Volume' in df.columns else 0.0
-        vol_ma = float(df['VolMA20'].iloc[-1]) if 'VolMA20' in df.columns else 0.0
-        open_price = float(df['Open'].iloc[-1]) if 'Open' in df.columns else curr
 
-    except Exception as e:
+        vol     = float(df['Volume_Calc'].iloc[-1]) if 'Volume_Calc' in df.columns else 0.0
+        vol_ma  = float(df['VolMA20'].iloc[-1]) if 'VolMA20' in df.columns else 0.0
+        open_px = float(df['Open'].iloc[-1]) if 'Open' in df.columns else curr
+        prev_close = float(df['Close_Calc'].iloc[-2])
+
+        std20  = float(df['STD20'].iloc[-1])
+        mom10  = float(df['MOM10'].iloc[-1]) if 'MOM10' in df.columns else 0.0
+    except Exception:
         return "데이터 오류", "gray", "지표 계산 실패", 0
-
-    trend_up = curr > ma60
-    above_ma20 = curr > ma20
-    golden_cross = (macd > sig) and (prev_macd <= prev_sig)
-    dead_cross = (macd < sig) and (prev_macd >= prev_sig)
-    oversold = rsi < 35
-    overbought = rsi > 70
-    dist_to_ma20 = (curr - ma20) / ma20
-    dip_buy = trend_up and abs(dist_to_ma20) <= 0.02
 
     score = 50
     reasons = []
 
-    if curr > ma60:
-        score += 15
-        if curr > ma20: score += 10
-        else: score -= 5 
+    # -------------------------------------------------
+    # 1) 📈 중기 추세 필터 (60일 기준)
+    # -------------------------------------------------
+    if curr > ma60 and ma20 > ma60:
+        score += 20
+        reasons.append("📈 중기 상승 추세(60일선 위, 20일선도 우상향)")
+    elif curr > ma60:
+        score += 10
+        reasons.append("↗ 60일선 위이지만 추세는 다소 애매")
+    elif curr > ma20:
+        score += 3
+        reasons.append("단기 20일선 위지만 60일선 아래 (반등 초입 가능)")
     else:
         score -= 20
-        if curr < ma20: score -= 10
+        reasons.append("⚠ 하락 추세(20·60일선 아래) - 2~4주 스윙엔 비우호적")
 
-    if dip_buy:
-        score += 25
-        reasons.append("💎 황금 눌림목 (상승장 속 조정)")
-    
-    if curr <= bb_lower * 1.02:
-        score += 15
-        reasons.append("📉 볼린저 밴드 하단 (저점 매수)")
-    
-    if curr >= bb_upper * 0.98:
-        score -= 10
-        reasons.append("⚠️ 볼린저 밴드 상단 (고점)")
+    # -------------------------------------------------
+    # 2) 💎 단기 위치 (MA10/MA20 기준 눌림목)
+    # -------------------------------------------------
+    dist_ma10 = (curr - ma10) / ma10 if ma10 > 0 else 0
+    dist_ma20 = (curr - ma20) / ma20 if ma20 > 0 else 0
 
-    if macd > sig and prev_macd <= prev_sig:
-        score += 15
-        reasons.append("⚡ MACD 골든크로스")
-    elif macd > sig: score += 5
-    elif macd < sig and prev_macd >= prev_sig:
-        score -= 15
-        reasons.append("💧 MACD 데드크로스")
+    # 상승장 + 20일선 근처 (눌림목)
+    if curr >= ma60 and -0.03 <= dist_ma20 <= 0.02:
+        score += 18
+        reasons.append("💎 상승장 속 20일선 부근 눌림목 (스윙 최적 구간)")
+    # 20일선 아래로 -3~-7% 조정
+    elif -0.07 <= dist_ma20 < -0.03:
+        score += 6
+        reasons.append("조정 구간(20일선에서 3~7% 하단) - 반등 포인트 가능")
+    # 20일선에서 너무 멀리 위
+    elif dist_ma20 > 0.07:
+        score -= 12
+        reasons.append("🔥 20일선 대비 과도한 이격(>7%) - 단기 고점 가능성")
 
-    if vol > vol_ma * 1.5 and curr > open_price:
+    # -------------------------------------------------
+    # 3) ⚖ RSI - 과열/과매도
+    # -------------------------------------------------
+    if 40 <= rsi <= 60:
         score += 10
-        reasons.append("🔥 거래량 폭발")
+        reasons.append("⚖ RSI 40~60, 단기 균형 구간 (진입 적당)")
+    elif 30 <= rsi < 40:
+        score += 5
+        reasons.append("가벼운 과매도, 반등 여지")
+    elif 60 < rsi <= 70:
+        score -= 5
+        reasons.append("과열 초입 - 보수적 접근 필요")
+    elif rsi < 30:
+        score += 2   # 공통 기본값은 살짝 플러스
+        reasons.append("강한 과매도 - 단기 반등 가능, 단 리스크 큼")
+    else:  # rsi > 70
+        score -= 15
+        reasons.append("🚨 RSI 과열 (단기 조정 가능성↑)")
 
-    if rsi < 30:
-        score += 15
-        reasons.append("zzZ 과매도 (반등 기대)")
-    elif rsi > 75:
-        score -= 20
-        reasons.append("🔥 RSI 과열")
-    elif 30 <= rsi <= 50: score += 5
+    # -------------------------------------------------
+    # 4) 📊 10일 모멘텀 (≈ 2주 수익률)
+    # -------------------------------------------------
+    if 0.03 <= mom10 <= 0.15:
+        score += 10
+        reasons.append("📊 최근 2주간 3~15% 상승, 건강한 모멘텀")
+    elif -0.05 <= mom10 < 0.03:
+        score += 4
+        reasons.append("횡보 또는 소폭 조정 후 구간")
+    elif mom10 > 0.25:
+        score -= 10
+        reasons.append("급등(>25%) 이후 구간 - 차익 실현 구간일 가능성")
+    elif mom10 < -0.10:
+        score -= 6
+        reasons.append("최근 2주간 10% 이상 급락 - 변동성·리스크 큼")
 
+    # -------------------------------------------------
+    # 5) MACD 크로스 (타이밍)
+    # -------------------------------------------------
+    if macd > sig and prev_macd <= prev_sig:
+        score += 12
+        reasons.append("⚡ MACD 골든크로스 - 단기 매수 시그널")
+    elif macd > sig:
+        score += 4
+        reasons.append("MACD 상방 유지")
+    elif macd < sig and prev_macd >= prev_sig:
+        score -= 8
+        reasons.append("💧 MACD 데드크로스 - 단기 하락 전환 가능")
+    else:
+        score -= 2
+
+    # -------------------------------------------------
+    # 6) 🎢 변동성 & 거래량 (공통 기본)
+    # -------------------------------------------------
+    vol_ratio = std20 / curr if curr > 0 else 0.0
+
+    if vol_ratio > 0.08:
+        score -= 10
+        reasons.append("🎢 변동성 큼(20일 표준편차>8%) - 롤러코스터 주의")
+    elif vol_ratio < 0.03:
+        score += 5
+        reasons.append("⚙ 변동성 낮음 - 비교적 안정적인 스윙 환경")
+
+    if vol_ma > 0 and vol > vol_ma * 1.5 and curr > prev_close:
+        score += 8
+        reasons.append("🔥 거래량 동반 상승 - 추세 신뢰도↑")
+
+    # -------------------------------------------------
+    # 7) 종목 성격(스타일)별 튜닝
+    # -------------------------------------------------
+    # 국내 개별주 / 안정 ETF → 보수적
+    if style in ("KR_STOCK", "ETF_STABLE"):
+        if vol_ratio > 0.06:
+            score -= 5
+            reasons.append("보수 전략: 변동성 높은 종목 선호 X")
+        if mom10 > 0.20:
+            score -= 5
+            reasons.append("보수 전략: 최근 2주 급등 종목은 추격매수 자제")
+        if rsi < 30:
+            score -= 3
+            reasons.append("보수 전략: 깊은 과매도 구간은 추가 하락 리스크 고려")
+
+    # 미국 성장주
+    if style == "US_STOCK":
+        if 0.05 <= mom10 <= 0.25:
+            score += 5
+            reasons.append("성장주 전략: 최근 모멘텀 좋은 종목 우대")
+        if 0.04 <= vol_ratio <= 0.10:
+            score += 3
+            reasons.append("성장주 전략: 어느 정도 변동성은 수익 기회로 활용")
+
+    # 레버리지 ETF
+    if style == "LEVERAGED_ETF":
+        if 0.08 <= mom10 <= 0.40:
+            score += 7
+            reasons.append("레버리지 전략: 강한 2주 모멘텀 구간 선호")
+        if vol_ratio > 0.10:
+            score += 6  # 위에서 준 변동성 페널티를 일부 상쇄
+            reasons.append("레버리지 전략: 높은 변동성 감수 (추세 위주)")
+        if 35 <= rsi <= 65:
+            score += 4
+            reasons.append("레버리지 전략: 중립~약과열 RSI 구간 선호")
+        if rsi > 75:
+            score -= 5   # 과열은 여전히 경고
+            reasons.append("레버리지 전략: 극단 과열 종목은 조정 위험")
+
+    # -------------------------------------------------
+    # 점수 → 등급 매핑
+    # -------------------------------------------------
     score = max(0, min(100, score))
 
-    category = "관망 (Neutral)"
-    color_name = "gray"
-
-    if score >= 80:
-        category = "🚀 강력 매수 (Strong Buy)"
+    if score >= 82:
+        category = "🚀 강력 매수 (2~4주 스윙 최우선)"
         color_name = "green"
-    elif score >= 60:
-        category = "📈 매수 (Buy)"
+    elif score >= 65:
+        category = "📈 매수 우위 (분할 진입 권장)"
         color_name = "blue"
-    elif score <= 20:
-        category = "💥 강력 매도 (Strong Sell)"
-        color_name = "red"
-    elif score <= 40:
-        category = "📉 매도 (Sell)"
+    elif score >= 45:
+        category = "👀 관망 (명확한 엣지 부족)"
+        color_name = "gray"
+    elif score >= 25:
+        category = "📉 매도/비중 축소 권장"
         color_name = "red"
     else:
-        category = "👀 관망 (Neutral)"
-        color_name = "gray"
-        if not reasons: reasons.append("방향성 탐색 중")
+        category = "💥 강력 매도 또는 관심 제외"
+        color_name = "red"
 
-    return category, color_name, ", ".join(reasons), score
+    if not reasons:
+        reasons.append("명확한 시그널 부족 - 관망 권장")
+
+    summary = " / ".join(reasons[:4])  # 너무 길어지지 않게 상위 4개만
+
+    return category, color_name, summary, score
 
 # ---------------------------------------------------------
 # 4. UI
@@ -520,7 +699,7 @@ with tab1:
                         df_indi = calculate_indicators(df_tk)
                         if df_indi is None: continue
 
-                        cat, col_name, reasoning, score = analyze_advanced_strategy(df_indi)
+                        cat, col_name, reasoning, score = analyze_advanced_strategy(df_indi, ticker_code)
                         
                         # 화면 표시는 실시간 맵에 있는 가격 우선
                         curr_price = realtime_map.get(ticker_code, df_indi['Close_Calc'].iloc[-1])
@@ -687,7 +866,7 @@ with tab2:
                     df_indi = calculate_indicators(df_tk)
                     if df_indi is not None:
                         # 분석은 업데이트된 마지막 종가 기준
-                        cat, col_name, reasoning, score = analyze_advanced_strategy(df_indi)
+                        cat, col_name, reasoning, score = analyze_advanced_strategy(df_indi, tk)
                 
                 # 표시는 실시간 맵 기준 (가장 정확)
                 if tk in realtime_map:
