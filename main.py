@@ -79,17 +79,18 @@ USER_WATCHLIST = list(TICKER_MAP.keys())
 # ---------------------------------------------------------
 # 2. 데이터 로드 및 지표 계산
 # ---------------------------------------------------------
-# 중요: 가격 괴리를 줄이기 위해 캐시 유지 시간을 60초로 대폭 단축
-@st.cache_data(ttl=60)
+# 중요: 가격 괴리를 줄이기 위해 캐시 유지 시간을 10초로 대폭 단축
+@st.cache_data(ttl=10)
 def get_bulk_data(tickers_list):
     """데이터 다운로드 (2년치) - 실시간성 강화"""
-    # prepost=True 옵션을 추가하면 장전/장후 거래가 포함될 수 있어 더 최신일 수 있음 (Yahoo Finance 특성)
-    data = yf.download(tickers_list, period="2y", group_by='ticker', threads=True)
+    # prepost=True: 장전/장후 거래 데이터 포함 (최신가 반영 확률 높임)
+    data = yf.download(tickers_list, period="2y", group_by='ticker', threads=True, prepost=True)
     return data
 
 def calculate_indicators(df):
     if len(df) < 60: return None
     df = df.copy()
+    # ffill로 결측치 채우되, 마지막 데이터가 NaN이면 삭제하지 않고 유지
     df['Close'] = df['Close'].ffill()
 
     # 이평선
@@ -254,10 +255,23 @@ with tab1:
                         rsi_val = df_indi['RSI'].iloc[-1]
                         name = TICKER_MAP.get(ticker_code, ticker_code)
                         
+                        # 화폐 단위 및 티커 표시 처리
+                        is_kr = ticker_code.endswith(".KS") or ticker_code.endswith(".KQ")
+                        currency_symbol = "₩" if is_kr else "$"
+                        
+                        # 이름에 코드 추가 (예: 나스닥 3X(Bull) (TQQQ))
+                        display_name = f"{name} ({ticker_code})"
+                        
+                        # 가격 포맷팅 (문자열로 변환하여 단위 표시)
+                        if is_kr:
+                            fmt_price = f"{currency_symbol}{curr_price:,.0f}"
+                        else:
+                            fmt_price = f"{currency_symbol}{curr_price:,.2f}"
+
                         scan_results.append({
-                            "종목명": name,
+                            "종목명": display_name,
                             "점수": score,
-                            "현재가": curr_price,
+                            "현재가": fmt_price,
                             "RSI": rsi_val,
                             "AI 등급": cat,
                             "핵심 요약": reasoning
@@ -281,11 +295,11 @@ with tab1:
             use_container_width=True,
             height=700,
             column_config={
-                "종목명": st.column_config.TextColumn("종목명"),
+                "종목명": st.column_config.TextColumn("종목명 (코드)", width="medium"),
                 "점수": st.column_config.ProgressColumn(
                     "AI 구매 매력도", format="%d점", min_value=0, max_value=100
                 ),
-                "현재가": st.column_config.NumberColumn("현재가", format="%.0f"),
+                "현재가": st.column_config.TextColumn("현재가"), # TextColumn으로 변경하여 화폐 단위 표시
                 "RSI": st.column_config.NumberColumn("RSI", format="%.1f"),
                 "AI 등급": st.column_config.TextColumn("AI 판단"),
                 "핵심 요약": st.column_config.TextColumn("분석 내용", width="large"),
@@ -348,7 +362,7 @@ with tab2:
             
             my_tickers = [p['ticker'] for p in pf_data]
             with st.spinner("최신 시세 조회 중..."):
-                # 캐시 TTL 60초 적용된 함수 호출
+                # 캐시 TTL 적용된 함수 호출
                 my_raw = get_bulk_data(my_tickers)
             
             # 보유 종목도 AI 점수 순으로 정렬해서 보여주기 위해 리스트 생성
@@ -398,6 +412,11 @@ with tab2:
                     with c2:
                         # 통화 기호 일치시키기 (미국 주식도 $ 표시)
                         cur_sym = item['currency']
+                        
+                        # 중요: 달러 기호($)가 Markdown LaTeX로 인식되어 폰트가 깨지는 문제 해결
+                        # 화면 표시용 기호에는 Escape 문자(\)를 추가하여 일반 텍스트로 렌더링되게 함
+                        display_sym = cur_sym.replace("$", "\$") 
+                        
                         if cur_sym == "₩":
                             fmt_curr = f"{item['curr']:,.0f}"
                             fmt_avg = f"{item['avg']:,.0f}"
@@ -410,10 +429,10 @@ with tab2:
                         st.metric(
                             "순수익률 (수수료 제)", 
                             f"{item['profit_pct']:.2f}%", 
-                            delta=f"{cur_sym}{fmt_diff}"
+                            delta=f"{display_sym}{fmt_diff}"
                         )
-                        # 평단/현재가 폰트 및 포맷 통일
-                        st.caption(f"평단: {cur_sym}{fmt_avg} / 현재: {cur_sym}{fmt_curr}")
+                        # 평단/현재가 폰트 및 포맷 통일 (Escape된 심볼 사용)
+                        st.markdown(f"<small style='color: gray'>평단: {display_sym}{fmt_avg} / 현재: {display_sym}{fmt_curr}</small>", unsafe_allow_html=True)
                         
                     with c3:
                         # 글씨 깨짐 수정: Streamlit 공식 컬러 사용 (:green, :blue 등)
