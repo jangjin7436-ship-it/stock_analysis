@@ -8,7 +8,7 @@ import time
 import json
 import concurrent.futures
 import requests
-import math  # ✅ 수수료/세금 계산용 (floor)
+import re  # ✅ 국내 애프터마켓 가격 파싱용
 
 # ---------------------------------------------------------
 # 0. 파이어베이스(DB) 설정
@@ -82,82 +82,62 @@ USER_WATCHLIST = list(TICKER_MAP.keys())
 
 def fetch_kr_polling(ticker):
     """
-    [New Method v2] 네이버 모바일 주식 API 사용
-    - https://m.stock.naver.com/api/json/search/searchListJson.nhn?keyword=티커
-    - 응답 JSON의 'nv' 값을 실시간 가격(시간외 포함)으로 사용
+    [New Method V2] 국내 주식 애프터마켓 포함 현재가
+    - 네이버 금융 개별 종목 페이지 HTML에서
+      '오늘의시세 100,500' / '오늘의시세 101,500' 패턴을 찾아
+      가장 마지막 값을 사용 (시간외 단일가까지 반영)
     """
     code = ticker.split('.')[0]
 
-    # 1차: m.stock.naver.com 검색 API (실시간/시간외 가격)
     try:
-        url = f"https://m.stock.naver.com/api/json/search/searchListJson.nhn?keyword={code}"
+        url = f"https://finance.naver.com/item/main.nhn?code={code}"
         headers = {
-            "User-Agent": "Mozilla/5.0",
-            "Referer": "https://m.stock.naver.com"
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0 Safari/537.36"
+            ),
+            "Referer": "https://finance.naver.com/"
         }
         res = requests.get(url, headers=headers, timeout=3)
         res.raise_for_status()
 
-        data = res.json()
+        # 네이버 금융은 EUC-KR 기반
+        res.encoding = "euc-kr"
+        html = res.text
 
-        # data 형태가 리스트일 가능성이 높음: [{"cd":"005930","nm":"삼성전자","nv":101500, ...}, ...]
-        items = []
-        if isinstance(data, list):
-            items = data
-        elif isinstance(data, dict):
-            # 혹시 dict로 감싸져 있으면 안쪽에서 리스트를 찾아본다
-            for v in data.values():
-                if isinstance(v, list):
-                    items = v
-                    break
+        # '오늘의시세 100,500' / '오늘의시세 101,500' 에서 숫자 부분만 추출
+        prices = re.findall(r"오늘의시세\s*([0-9,]+)", html)
+        if prices:
+            # 가장 마지막 값 = 시간외 포함한 최신 시세
+            last_price = float(prices[-1].replace(",", ""))
+            return (ticker, last_price)
 
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            cd = str(item.get("cd", "")).strip()
-            if cd == code or cd.endswith(code):
-                nv = item.get("nv")
-                if nv is not None:
-                    # 문자열/숫자 모두 처리
-                    price = float(str(nv).replace(",", ""))
-                    return (ticker, price)
+        # 혹시 몰라 '현재가 101,500' 패턴도 한 번 더 시도
+        prices = re.findall(r"현재가\s*([0-9,]+)\s*원?", html)
+        if prices:
+            last_price = float(prices[-1].replace(",", ""))
+            return (ticker, last_price)
 
-        # cd 매칭이 안 되면, 첫 번째 아이템의 nv라도 사용
-        if items:
-            first = items[0]
-            if isinstance(first, dict) and "nv" in first:
-                price = float(str(first["nv"]).replace(",", ""))
-                return (ticker, price)
+        # 위 패턴이 안 잡히면 FDR 종가로 폴백
+        try:
+            df = fdr.DataReader(code, "2023-01-01")
+            if not df.empty:
+                return (ticker, float(df["Close"].iloc[-1]))
+        except Exception:
+            pass
+
+        return (ticker, None)
 
     except Exception:
-        pass  # 아래 백업 로직으로 이동
-
-    # 2차: 기존 polling API (실패 시 백업용, 여전히 종가 기준일 수 있음)
-    try:
-        url = f"https://polling.finance.naver.com/api/realtime?query=SERVICE_ITEM:{code}"
-        headers = {
-            "User-Agent": "Mozilla/5.0",
-            "Referer": "https://finance.naver.com/"
-        }
-        res = requests.get(url, headers=headers, timeout=3)
-        data = res.json()
-        if data.get("result", {}).get("code") == "200":
-            for area in data["result"].get("areas", []):
-                for item in area.get("datas", []):
-                    if item.get("cd") == code and "nv" in item:
-                        return (ticker, float(item["nv"]))
-    except Exception:
-        pass
-
-    # 3차: FDR 종가 (최후의 백업 – 애프터마켓은 아님)
-    try:
-        df = fdr.DataReader(code, "2023-01-01")
-        if not df.empty:
-            return (ticker, float(df["Close"].iloc[-1]))
-    except Exception:
-        pass
-
-    return (ticker, None)
+        # 네트워크 오류 등은 그대로 FDR로 폴백
+        try:
+            df = fdr.DataReader(code, "2023-01-01")
+            if not df.empty:
+                return (ticker, float(df["Close"].iloc[-1]))
+        except Exception:
+            pass
+        return (ticker, None)
 
 def fetch_us_1m_candle(ticker):
     """
@@ -214,7 +194,7 @@ def get_precise_data(tickers_list):
         # A. 실시간 가격 (병렬)
         fut_real = []
         for t in kr_tickers:
-            fut_real.append(executor.submit(fetch_kr_polling, t)) # 네이버 API
+            fut_real.append(executor.submit(fetch_kr_polling, t)) # 네이버 HTML 파싱(애프터마켓)
         for t in us_tickers:
             fut_real.append(executor.submit(fetch_us_1m_candle, t)) # 1분봉
             
@@ -296,41 +276,23 @@ def calculate_indicators(df):
     return df.dropna()
 
 def calculate_total_profit(ticker, avg_price, current_price, quantity):
-    """
-    토스 방식에 최대한 맞춘 세후(수수료/세금 포함) 수익률 계산
-
-    - 국내: (현재가 * 수량) 에서 (수수료 + 거래세) ≈ 0.1794% 를 뺀 후 원단위 반올림
-    - 해외: (현재가 * 수량) 에서 수수료 ≈ 0.1975% 를 뺀 후 원단위 반올림
-    - 원금(평단 * 수량)에는 추가 수수료를 더하지 않고, 토스 화면처럼 비교
-    """
     is_kr = ticker.endswith(".KS") or ticker.endswith(".KQ")
-
-    # 토스 스샷에 맞춘 경험적 수치 (필요하면 여기만 조정하면 됨)
-    KR_FEE_TAX_RATE = 0.001794   # ≈ 0.18% (수수료 + 거래세)
-    US_FEE_RATE      = 0.001975   # ≈ 0.20% (이벤트 기준 실효 수수료 근사)
-
+    if is_kr: fee_tax_rate = 0.0018 
+    else: fee_tax_rate = 0.002
+    
     total_buy = avg_price * quantity
     raw_eval = current_price * quantity
-
-    # 시장별 수수료율 선택
-    fee_rate = KR_FEE_TAX_RATE if is_kr else US_FEE_RATE
-
-    # 토스처럼 원 단위 반올림해서 수수료/세금 계산
-    total_fee = int(raw_eval * fee_rate + 0.5)
-
-    # 평가금 = 현재 평가금 - (예상 수수료/세금)
+    total_fee = raw_eval * fee_tax_rate
     net_eval = raw_eval - total_fee
-
-    # 순수익 = 평가금 - 원금
     net_profit_amt = net_eval - total_buy
-
+    
     if total_buy > 0:
         net_profit_pct = (net_profit_amt / total_buy) * 100
     else:
         net_profit_pct = 0.0
-
+    
     currency = "₩" if is_kr else "$"
-
+    
     return {
         "pct": net_profit_pct,
         "profit_amt": net_profit_amt,
