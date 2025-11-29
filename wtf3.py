@@ -582,8 +582,6 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
 
 st.title("📊 AI 스윙 전략 포트폴리오 백테스터")
 
-tab4 = st.tabs(["📊 전체 백테스트 시뮬레이션"])
-
 with tab4:
     st.markdown("### 🧪 포트폴리오 유니버스 백테스트")
     st.caption("AI 전략 시뮬레이터 Final Ver. (일봉 종가 기준 / 2주 스윙)")
