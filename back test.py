@@ -492,7 +492,7 @@ with tab4:
             # UI용 이름 리스트 생성
             ticker_options = [f"{TICKER_MAP.get(t, t)} ({t})" for t in traded_tickers]
             
-            if len(ticker_options) > 0:
+if len(ticker_options) > 0:
                 selected_option = st.selectbox("분석할 종목 선택", ticker_options)
                 selected_ticker = selected_option.split('(')[-1].replace(')', '')
                 selected_name = TICKER_MAP.get(selected_ticker, selected_ticker)
@@ -503,14 +503,19 @@ with tab4:
                 # 차트 데이터 다운로드 (시각화용)
                 with st.spinner(f"{selected_name} 차트 로딩 중..."):
                     chart_data = yf.download(selected_ticker, start=str(bt_start_date), progress=False, auto_adjust=True)
+                    
+                    # 🛠️ [오류 수정 코드] MultiIndex 평탄화 및 중복 컬럼 제거
                     if isinstance(chart_data.columns, pd.MultiIndex):
                         chart_data.columns = chart_data.columns.get_level_values(0)
+                    
+                    # 🌟 핵심: 중복된 컬럼 이름이 있으면 하나만 남기고 제거 (DuplicateError 방지)
+                    chart_data = chart_data.loc[:, ~chart_data.columns.duplicated()]
                 
                 if not chart_data.empty:
                     # Plotly 차트 생성
                     fig_detail = go.Figure()
 
-                    # 1. 주가 라인 (Candlestick or Line) - 여기선 깔끔하게 Line
+                    # 1. 주가 라인
                     fig_detail.add_trace(go.Scatter(
                         x=chart_data.index, 
                         y=chart_data['Close'],
@@ -521,26 +526,28 @@ with tab4:
 
                     # 2. 매수 타점 (▲)
                     buys = my_trades[my_trades['type'] == 'buy']
-                    fig_detail.add_trace(go.Scatter(
-                        x=buys['date'], 
-                        y=buys['price'],
-                        mode='markers',
-                        name='매수 (Buy)',
-                        marker=dict(symbol='triangle-up', color='red', size=12, line=dict(width=1, color='black')),
-                        hovertemplate='매수: %{y:,.2f}<br>날짜: %{x}<extra></extra>'
-                    ))
+                    if not buys.empty:
+                        fig_detail.add_trace(go.Scatter(
+                            x=buys['date'], 
+                            y=buys['price'],
+                            mode='markers',
+                            name='매수 (Buy)',
+                            marker=dict(symbol='triangle-up', color='red', size=12, line=dict(width=1, color='black')),
+                            hovertemplate='매수: %{y:,.2f}<br>날짜: %{x}<extra></extra>'
+                        ))
 
                     # 3. 매도 타점 (▼)
                     sells = my_trades[my_trades['type'] == 'sell']
-                    fig_detail.add_trace(go.Scatter(
-                        x=sells['date'], 
-                        y=sells['price'],
-                        mode='markers',
-                        name='매도 (Sell)',
-                        marker=dict(symbol='triangle-down', color='blue', size=12, line=dict(width=1, color='black')),
-                        hovertemplate='매도: %{y:,.2f}<br>수익률: %{text}<extra></extra>',
-                        text=[f"{p:.2f}%" for p in sells['profit']] # 호버 텍스트에 수익률 표시
-                    ))
+                    if not sells.empty:
+                        fig_detail.add_trace(go.Scatter(
+                            x=sells['date'], 
+                            y=sells['price'],
+                            mode='markers',
+                            name='매도 (Sell)',
+                            marker=dict(symbol='triangle-down', color='blue', size=12, line=dict(width=1, color='black')),
+                            hovertemplate='매도: %{y:,.2f}<br>수익률: %{text}<extra></extra>',
+                            text=[f"{p:.2f}%" for p in sells['profit']]
+                        ))
 
                     fig_detail.update_layout(
                         title=f"{selected_name} 매매 타점 복기",
@@ -570,30 +577,3 @@ with tab4:
                     )
             else:
                 st.info("매매 내역이 없습니다.")
-
-            st.divider()
-
-            # (3) 전체 거래 로그
-            st.subheader("📝 전체 거래 일지")
-            display_log = trade_df.copy()
-            display_log['date'] = display_log['date'].dt.date
-            display_log = display_log[['date', 'name', 'type', 'price', 'profit', 'balance', 'reason']]
-            
-            st.dataframe(
-                display_log.sort_values('date', ascending=False),
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "date": "날짜",
-                    "name": "종목명",
-                    "type": st.column_config.TextColumn("구분", width="small"),
-                    "price": st.column_config.NumberColumn("가격($/₩)", format="%.2f"),
-                    "profit": st.column_config.NumberColumn("수익률", format="%.2f%%"),
-                    "balance": st.column_config.NumberColumn("잔고(원)", format="%d원"),
-                    "reason": "사유"
-                },
-                height=400
-            )
-
-        else:
-            st.warning("⚠️ 매매 신호가 발생하지 않았습니다.")
