@@ -77,19 +77,16 @@ USER_WATCHLIST = list(TICKER_MAP.keys())
 
 
 # ---------------------------------------------------------
-# 2. 데이터 수집
+# 2. 데이터 수집 (After-market 강화)
 # ---------------------------------------------------------
-@st.cache_data(ttl=60)
-def get_bulk_us_data(us_tickers):
-    """미국 주식 데이터 수집"""
+@st.cache_data(ttl=60) # 히스토리는 1분 캐시
+def get_bulk_history_data(us_tickers):
+    """미국 주식 히스토리 데이터 (지표 계산용)"""
     if not us_tickers:
-        return {}, {}
-
+        return {}
+    
     hist_map = {}
-    realtime_map = {}
-
     try:
-        # auto_adjust=False로 설정하여 실제 체결가 기준 계산 (백테스트 로직과 일치)
         df_hist = yf.download(
             us_tickers,
             period="2y",
@@ -98,18 +95,7 @@ def get_bulk_us_data(us_tickers):
             group_by="ticker",
             auto_adjust=False, 
         )
-        df_real = yf.download(
-            us_tickers,
-            period="5d",
-            interval="1m",
-            progress=False,
-            group_by="ticker",
-            prepost=True,
-        )
-
         hist_is_multi = isinstance(df_hist.columns, pd.MultiIndex)
-        real_is_multi = isinstance(df_real.columns, pd.MultiIndex)
-
         for t in us_tickers:
             try:
                 sub_df = df_hist[t] if hist_is_multi else df_hist
@@ -117,25 +103,45 @@ def get_bulk_us_data(us_tickers):
                     sub_df = sub_df.dropna(how="all")
                     if "Close" in sub_df.columns:
                         hist_map[t] = sub_df
-            except Exception:
-                pass
+            except: pass
+    except: pass
+    return hist_map
 
+@st.cache_data(ttl=5) # 실시간 가격은 5초 캐시 (빠른 갱신)
+def get_bulk_realtime_data(us_tickers):
+    """미국 주식 실시간 데이터 (프리/애프터마켓 포함)"""
+    if not us_tickers:
+        return {}
+    
+    realtime_map = {}
+    try:
+        # period="5d"로 넉넉히 잡고 prepost=True로 장전/장후 데이터 모두 가져옴
+        df_real = yf.download(
+            us_tickers,
+            period="5d",
+            interval="1m",
+            progress=False,
+            group_by="ticker",
+            prepost=True, 
+        )
+        real_is_multi = isinstance(df_real.columns, pd.MultiIndex)
+
+        for t in us_tickers:
             try:
                 sub_real = df_real[t] if real_is_multi else df_real
                 if isinstance(sub_real, pd.DataFrame) and not sub_real.empty:
+                    # 모든 컬럼이 NaN인 행 제거
                     sub_real = sub_real.dropna(how="all")
+                    # Close 컬럼 추출
                     price_series = sub_real["Close"]
                     if price_series is not None:
+                        # NaN 제외하고 가장 마지막 값(가장 최신 시간) 가져오기
                         valid_closes = price_series.dropna()
                         if not valid_closes.empty:
                             realtime_map[t] = float(valid_closes.iloc[-1])
-            except Exception:
-                pass
-
-    except Exception:
-        pass
-
-    return hist_map, realtime_map
+            except: pass
+    except: pass
+    return realtime_map
 
 
 def fetch_kr_polling(ticker):
@@ -162,7 +168,6 @@ def fetch_kr_history(ticker):
         return ticker, None
 
 
-@st.cache_data(ttl=0)
 def get_precise_data(tickers_list):
     """통합 데이터 수집기"""
     if not tickers_list:
@@ -171,8 +176,11 @@ def get_precise_data(tickers_list):
     kr_tickers = [t for t in tickers_list if t.endswith('.KS') or t.endswith('.KQ')]
     us_tickers = [t for t in tickers_list if t not in kr_tickers]
 
-    hist_map, realtime_map = get_bulk_us_data(us_tickers)
+    # 미국 주식: 히스토리와 실시간을 분리해서 호출
+    hist_map = get_bulk_history_data(us_tickers)
+    realtime_map = get_bulk_realtime_data(us_tickers)
 
+    # 국내 주식 병렬 처리
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         fut_real = [executor.submit(fetch_kr_polling, t) for t in kr_tickers]
         fut_hist = [executor.submit(fetch_kr_history, t) for t in kr_tickers]
@@ -192,16 +200,22 @@ def get_precise_data(tickers_list):
 
     return hist_map, realtime_map
 
+def get_current_exchange_rate():
+    """실시간 원달러 환율 가져오기"""
+    try:
+        df = yf.Ticker("KRW=X").history(period="1d")
+        if not df.empty:
+            return float(df['Close'].iloc[-1])
+        return 1430.0 # Fallback
+    except:
+        return 1430.0
+
 # ---------------------------------------------------------
-# 3. 분석 엔진 (NEW: ATR 및 개선된 알고리즘 적용)
+# 3. 분석 엔진 (ATR 및 개선된 알고리즘 적용)
 # ---------------------------------------------------------
 
 def calculate_indicators(df, realtime_price=None):
-    """
-    [NEW] 지표 계산 로직 (백테스트 코드와 100% 일치)
-    - MA120, Disparity, Slope, ATR, BB, RSI, MACD
-    """
-    if df is None or len(df) < 120:  # MA120 계산을 위해 최소 데이터 필요
+    if df is None or len(df) < 120:
         return None
 
     if isinstance(df, pd.Series):
@@ -209,7 +223,6 @@ def calculate_indicators(df, realtime_price=None):
     
     df = df.copy()
 
-    # 컬럼 정리
     if 'Close' in df.columns:
         df['Close_Calc'] = df['Close']
     elif 'Adj Close' in df.columns:
@@ -219,45 +232,42 @@ def calculate_indicators(df, realtime_price=None):
         
     df['Close_Calc'] = df['Close_Calc'].astype(float)
     
-    # High/Low 확인 (ATR 계산용)
     if 'High' not in df.columns or 'Low' not in df.columns:
-        # High/Low 없으면 Close로 대체 (불완전하지만 에러 방지)
         df['High'] = df['Close_Calc']
         df['Low'] = df['Close_Calc']
 
-    # 실시간 가격 주입 및 High/Low 보정
+    # [수정] 실시간 가격 반영 로직 강화
     if realtime_price is not None:
         try:
             rp = float(realtime_price)
             if rp > 0:
-                df['Close_Calc'].iloc[-1] = rp
-                # 실시간 가격이 기존 High보다 높거나 Low보다 낮으면 갱신
-                if rp > df['High'].iloc[-1]:
-                    df['High'].iloc[-1] = rp
-                if rp < df['Low'].iloc[-1]:
-                    df['Low'].iloc[-1] = rp
+                # 마지막 행의 종가를 실시간(애프터마켓 포함) 가격으로 덮어씀
+                df.iloc[-1, df.columns.get_loc('Close_Calc')] = rp
+                
+                # High/Low도 갱신하여 ATR 계산 오차 방지
+                if rp > df.iloc[-1]['High']:
+                    df.iloc[-1, df.columns.get_loc('High')] = rp
+                if rp < df.iloc[-1]['Low']:
+                    df.iloc[-1, df.columns.get_loc('Low')] = rp
         except:
             pass
 
-    # 1. 이동평균
+    # 지표 계산
     df['MA5'] = df['Close_Calc'].rolling(5).mean()
     df['MA10'] = df['Close_Calc'].rolling(10).mean()
     df['MA20'] = df['Close_Calc'].rolling(20).mean()
     df['MA60'] = df['Close_Calc'].rolling(60).mean()
     df['MA120'] = df['Close_Calc'].rolling(120).mean()
 
-    # 2. 이격도 및 기울기 (핵심)
     df['Disparity_20'] = df['Close_Calc'] / df['MA20']
     df['MA20_Slope'] = df['MA20'].diff()
     df['MA60_Slope'] = df['MA60'].diff()
     df['MA120_Slope'] = df['MA120'].diff()
 
-    # 3. 볼린저 밴드
     std = df['Close_Calc'].rolling(20).std()
     df['Upper_Band'] = df['MA20'] + (std * 2)
     df['Lower_Band'] = df['MA20'] - (std * 2)
     
-    # 4. RSI
     delta = df['Close_Calc'].diff()
     gain = delta.where(delta > 0, 0)
     loss = -delta.where(delta < 0, 0)
@@ -266,7 +276,6 @@ def calculate_indicators(df, realtime_price=None):
     rs = avg_gain / avg_loss
     df['RSI'] = 100 - (100 / (1 + rs))
     
-    # 5. MACD
     exp12 = df['Close_Calc'].ewm(span=12, adjust=False).mean()
     exp26 = df['Close_Calc'].ewm(span=26, adjust=False).mean()
     df['MACD'] = exp12 - exp26
@@ -274,7 +283,6 @@ def calculate_indicators(df, realtime_price=None):
     df['MACD_Hist'] = df['MACD'] - df['Signal_Line']
     df['Prev_MACD_Hist'] = df['MACD_Hist'].shift(1)
     
-    # 6. ATR (Average True Range) - 변동성 지표
     prev_close = df['Close_Calc'].shift(1)
     tr1 = df['High'] - df['Low']
     tr2 = abs(df['High'] - prev_close)
@@ -282,7 +290,6 @@ def calculate_indicators(df, realtime_price=None):
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     df['ATR'] = tr.rolling(14).mean()
 
-    # 7. 거래량 (Volume Ratio)
     if 'Volume' in df.columns:
         df['Vol_MA20'] = df['Volume'].rolling(20).mean()
         df['Vol_Ratio'] = df['Volume'] / df['Vol_MA20']
@@ -293,10 +300,6 @@ def calculate_indicators(df, realtime_price=None):
 
 
 def get_ai_score_row(row):
-    """
-    [NEW] AI 점수 로직 (백테스트 코드 이식)
-    - 추세 내 눌림목(Dip Buying) 및 과열 방지 중심
-    """
     try:
         score = 50.0
         curr = row['Close_Calc']
@@ -304,53 +307,34 @@ def get_ai_score_row(row):
         rsi = row['RSI']
         
         # 1. 추세 판단
-        if row['MA60_Slope'] > 0:
-            score += 10.0
-        else:
-            score -= 10.0
+        if row['MA60_Slope'] > 0: score += 10.0
+        else: score -= 10.0
             
-        if curr > ma60:
-            score += 5.0
-        else:
-            score -= 5.0
+        if curr > ma60: score += 5.0
+        else: score -= 5.0
             
-        if row['MA120_Slope'] > 0:
-            score += 5.0
-        elif row['MA120_Slope'] < 0:
-            score -= 5.0
+        if row['MA120_Slope'] > 0: score += 5.0
+        elif row['MA120_Slope'] < 0: score -= 5.0
 
-        # 2. 진입 타이밍 (눌림목 우대)
+        # 2. 진입 타이밍
         if row['MA20_Slope'] > 0:
             if curr > ma20:
                 score += 5.0
-                # 눌림목 보너스 (MA5 근처 혹은 아래)
-                if curr < ma5 * 1.01: 
-                    score += 5.0
+                if curr < ma5 * 1.01: score += 5.0
         
-        # 3. 과열 방지 (이격도 필터)
+        # 3. 과열 방지
         disparity = row['Disparity_20']
-        if disparity > 1.10: 
-            score -= 20.0  # 고점 추격 매수 방지
-        elif disparity > 1.05:
-            score -= 5.0
+        if disparity > 1.10: score -= 20.0
+        elif disparity > 1.05: score -= 5.0
 
-        # 4. 보조지표 혼합
-        if row['MACD_Hist'] > row['Prev_MACD_Hist']:
-            score += 5.0
+        # 4. 보조지표
+        if row['MACD_Hist'] > row['Prev_MACD_Hist']: score += 5.0
         
-        # RSI: 40~60 선호, 70 이상 감점
-        if 40 <= rsi <= 60: 
-            score += 5.0
-        elif rsi > 70: 
-            score -= 10.0
+        if 40 <= rsi <= 60: score += 5.0
+        elif rsi > 70: score -= 10.0
 
-        # 볼린저 밴드 하단 터치
-        if curr <= row['Lower_Band'] * 1.02:
-            score += 10.0
-
-        # 거래량 실린 양봉
-        if row['Vol_Ratio'] >= 1.5 and curr > row['Open']:
-            score += 5.0
+        if curr <= row['Lower_Band'] * 1.02: score += 10.0
+        if row['Vol_Ratio'] >= 1.5 and curr > row['Open']: score += 5.0
 
         return max(0.0, min(100.0, score))
     except:
@@ -358,61 +342,31 @@ def get_ai_score_row(row):
 
 
 def analyze_advanced_strategy(df):
-    """
-    [NEW] 스캐너 결과 해석 함수
-    - 백테스트의 'Candidates' 선정 로직 반영
-    - 점수 >= 75점 & ATR 안정성 등 체크
-    """
     if df is None or df.empty:
         return "분석 불가", "gray", "데이터 부족", 0.0
 
     try:
         row = df.iloc[-1]
         score = float(get_ai_score_row(row))
-
         curr = float(row['Close_Calc'])
-        ma20 = float(row['MA20'])
         ma60 = float(row['MA60'])
         rsi = float(row['RSI'])
         atr = float(row['ATR'])
         disparity = float(row['Disparity_20'])
-        
     except Exception:
         return "오류", "gray", "계산 실패", 0.0
 
     reasons = []
+    if row['MA60_Slope'] > 0 and curr > ma60: reasons.append("상승 추세(60일↑)")
+    elif row['MA60_Slope'] < 0: reasons.append("하락 추세(60일↓)")
 
-    # 1) 추세 상태
-    if row['MA60_Slope'] > 0 and curr > ma60:
-        reasons.append("상승 추세(60일↑)")
-    elif row['MA60_Slope'] < 0:
-        reasons.append("하락 추세(60일↓)")
+    if disparity > 1.1: reasons.append("⚠️ 과열(이격도 110%↑)")
+    elif 1.0 <= disparity <= 1.03: reasons.append("⚡ 20일선 근접(눌림)")
+    elif disparity < 0.97: reasons.append("📉 과매도 구간")
 
-    # 2) 눌림목/과열 여부
-    if disparity > 1.1:
-        reasons.append("⚠️ 과열(이격도 110%↑)")
-    elif 1.0 <= disparity <= 1.03:
-        reasons.append("⚡ 20일선 근접(눌림)")
-    elif disparity < 0.97:
-        reasons.append("📉 과매도 구간")
-
-    # 3) RSI
-    if 40 <= rsi <= 60:
-        reasons.append("RSI 안정(40-60)")
-    elif rsi > 70:
-        reasons.append("RSI 과열(70↑)")
-
-    # 4) ATR (변동성 리스크)
     atr_ratio = atr / curr if curr > 0 else 0
-    if atr_ratio > 0.05:
-        reasons.append("⚠️ 고변동성 주의")
+    if atr_ratio > 0.05: reasons.append("⚠️ 고변동성 주의")
     
-    # 5) MACD
-    if row['MACD_Hist'] > row['Prev_MACD_Hist']:
-        reasons.append("MACD 개선중")
-
-    # ---- AI 등급 판정 (백테스트 기준) ----
-    # Filter 1: 고변동성 제외
     is_high_risk = atr_ratio > 0.05
     
     if score >= 75 and not is_high_risk:
@@ -436,20 +390,37 @@ def analyze_advanced_strategy(df):
 
 
 def calculate_total_profit(ticker, avg_price, current_price, quantity):
+    """
+    [수정] 토스증권 수수료 체계 반영 (순수익 계산)
+    """
     is_kr = ticker.endswith(".KS") or ticker.endswith(".KQ")
     qty, avg, curr = float(quantity), float(avg_price), float(current_price)
 
-    total_buy = avg * qty
+    # 1. 매수 총액 (평단가에 이미 매수 수수료 포함되어 있다고 가정하는 것이 일반적)
+    total_buy_cost = avg * qty
+    
+    # 2. 현재 평가금액 (세전)
     gross_eval = curr * qty
 
-    fee_rate = 0.000295 if is_kr else 0.001965
-    tax_rate = 0.0015 if is_kr else 0.0
+    # 3. 매도 시 예상 비용 (수수료 + 세금)
+    if is_kr:
+        # 국내: 수수료 0.015% + 거래세 0.18% = 0.195%
+        sell_fee_rate = 0.00015 
+        sell_tax_rate = 0.0018
+        sell_cost = gross_eval * (sell_fee_rate + sell_tax_rate)
+    else:
+        # 해외: 수수료 0.1% + SEC Fee 0.00229% (대략) = 0.10229%
+        sell_fee_rate = 0.001
+        sell_tax_rate = 0.0000229
+        sell_cost = gross_eval * (sell_fee_rate + sell_tax_rate)
 
-    sell_fee = gross_eval * fee_rate
-    sell_tax = gross_eval * tax_rate
-    net_eval = gross_eval - sell_fee - sell_tax
-    net_profit = net_eval - total_buy
-    pct = (net_profit / total_buy) * 100 if total_buy > 0 else 0.0
+    # 4. 세후 평가금액 (매도 시 내 손에 쥐는 돈)
+    net_eval = gross_eval - sell_cost
+    
+    # 5. 순수익 (세후 평가금 - 매수 원금)
+    net_profit = net_eval - total_buy_cost
+    
+    pct = (net_profit / total_buy_cost) * 100 if total_buy_cost > 0 else 0.0
 
     return {
         "pct": pct,
@@ -469,7 +440,7 @@ tab1, tab2, tab3 = st.tabs(["🚀 전체 종목 스캐너", "💼 내 포트폴�
 # TAB 1: 스캐너
 with tab1:
     st.markdown("### 📋 AI 정밀 스캐너")
-    st.caption("초정밀 실시간/AfterMarket 데이터 기반 AI 분석 (AI 스나이퍼 기준)")
+    st.caption("실시간(애프터마켓) 가격 반영 | AI 스나이퍼 전략 분석")
 
     col_btn, col_info = st.columns([1, 4])
     with col_btn:
@@ -479,7 +450,7 @@ with tab1:
 
     if st.session_state['scan_result_df'] is None:
         if st.button("🔍 전체 리스트 정밀 분석 시작"):
-            with st.spinner('초정밀 데이터 수집 및 분석 중...'):
+            with st.spinner('초정밀 데이터(After-Market 포함) 수집 및 분석 중...'):
                 raw_data_dict, realtime_map = get_precise_data(USER_WATCHLIST)
                 scan_results = []
                 progress_bar = st.progress(0)
@@ -489,23 +460,18 @@ with tab1:
                         continue
                     try:
                         df_tk = raw_data_dict[ticker_code].dropna(how='all')
-                        if df_tk.empty:
-                            continue
+                        if df_tk.empty: continue
 
                         curr_price = realtime_map.get(ticker_code)
                         df_indi = calculate_indicators(df_tk, realtime_price=curr_price)
 
-                        if df_indi is None or df_indi.empty:
-                            continue
+                        if df_indi is None or df_indi.empty: continue
 
-                        # 🔥 레버리지 종목 필터링 (3X, 2X 등은 알고리즘상 불리할 수 있음 표시)
                         name = TICKER_MAP.get(ticker_code, ticker_code)
                         is_leverage = any(x in name for x in ["3X", "2X", "1.5X"])
                         
-                        # 🔥 백테스트와 동일한 AI_Score/스나이퍼 기준으로 매수/매도 해석
                         cat, col_name, reasoning, score = analyze_advanced_strategy(df_indi)
 
-                        # 레버리지 종목 별도 표기
                         if is_leverage and score >= 70:
                             reasoning += " (레버리지 주의)"
 
@@ -534,10 +500,12 @@ with tab1:
                     df_res = pd.DataFrame(scan_results)
                     df_res = df_res.sort_values('점수', ascending=False)
                     st.session_state['scan_result_df'] = df_res
-                    st.success("완료! (결과는 '분석 새로고침' 전까지 고정됩니다)")
+                    st.success("완료!")
                     st.rerun()
                 else:
                     st.error("데이터 수집 실패.")
+
+    # 스캔 결과 출력
     if st.session_state['scan_result_df'] is not None:
         df_scan = st.session_state['scan_result_df']
 
@@ -557,11 +525,11 @@ with tab1:
         st.dataframe(
             df_scan,
             use_container_width=True,
-            height=700,
+            height=400,
             column_config={
                 "종목명": st.column_config.TextColumn("종목명 (코드)", width="medium"),
                 "점수": st.column_config.ProgressColumn("AI 점수", format="%.1f점", min_value=0, max_value=100),
-                "현재가": st.column_config.TextColumn("현재가"),
+                "현재가": st.column_config.TextColumn("현재가 (실시간)"),
                 "RSI": st.column_config.NumberColumn("RSI", format="%.1f"),
                 "AI 등급": st.column_config.TextColumn("AI 판단"),
                 "핵심 요약": st.column_config.TextColumn("분석 내용", width="large"),
@@ -570,10 +538,97 @@ with tab1:
             hide_index=True,
         )
 
+        # =========================================================
+        # 💰 AI 시드 분배기
+        # =========================================================
+        st.divider()
+        st.markdown("### 💰 AI 시드 머니 분배기")
+        st.caption("보유한 원화 현금을 입력하면, AI가 점수 상위 종목에 맞춰 매수 수량을 자동으로 계산해줍니다. (실시간 환율 적용)")
+
+        c_seed1, c_seed2, c_seed3 = st.columns([2, 1, 1])
+        with c_seed1:
+            seed_money = st.number_input("투자 가능 총 현금 (KRW)", min_value=100000, value=10000000, step=100000, format="%d")
+        with c_seed2:
+            target_count = st.slider("분산 종목 수", min_value=1, max_value=10, value=3)
+        with c_seed3:
+            st.write("") 
+            calc_btn = st.button("🧮 분배 계산", type="primary")
+
+        if calc_btn:
+            with st.spinner("💱 실시간 환율 조회 중..."):
+                usd_krw = get_current_exchange_rate()
+            st.info(f"💡 적용 환율: 1달러 = {usd_krw:,.2f}원")
+
+            candidates = df_scan[df_scan['점수'] >= 75]
+            if candidates.empty:
+                candidates = df_scan[df_scan['점수'] >= 60]
+                if not candidates.empty:
+                    st.warning("⚠️ 75점 이상(스나이퍼) 종목이 없어, 60점 이상(매수 우위) 종목으로 구성합니다.")
+            
+            if candidates.empty:
+                st.warning("⚠️ 매수 신호 종목이 없습니다. 점수 상위 종목으로 단순 계산합니다.")
+                candidates = df_scan.copy()
+
+            top_n = candidates.sort_values('점수', ascending=False).head(target_count)
+
+            if top_n.empty:
+                st.error("분석된 종목이 없습니다. 스캔을 먼저 수행해주세요.")
+            else:
+                per_stock_budget = seed_money / len(top_n)
+                
+                alloc_list = []
+                for idx, row in top_n.iterrows():
+                    raw_price_str = str(row['현재가']).replace(',', '').replace('$', '').replace('₩', '')
+                    try:
+                        price = float(raw_price_str)
+                    except:
+                        price = 0.0
+                    
+                    is_krw = "₩" in str(row['현재가'])
+                    
+                    if is_krw:
+                        price_krw = price
+                        price_usd = price / usd_krw if usd_krw > 0 else 0
+                    else:
+                        price_usd = price
+                        price_krw = price * usd_krw
+                        
+                    qty = 0
+                    if price_krw > 0:
+                        qty = int(per_stock_budget / price_krw)
+                    
+                    invest_krw = qty * price_krw
+                    
+                    alloc_list.append({
+                        "종목명": row['종목명'],
+                        "점수": row['점수'],
+                        "현재가": row['현재가'],
+                        "배정 금액(KRW)": invest_krw,
+                        "추천 수량": qty,
+                        "비고": "KRW 매수" if is_krw else f"환산 ${price_usd:.2f}"
+                    })
+                
+                df_alloc = pd.DataFrame(alloc_list)
+                st.markdown(f"#### 🛒 매수 추천 리스트 (총 {len(df_alloc)}종목)")
+                st.dataframe(
+                    df_alloc, 
+                    hide_index=True,
+                    use_container_width=True,
+                    column_config={
+                        "배정 금액(KRW)": st.column_config.NumberColumn(format="%d원"),
+                        "추천 수량": st.column_config.NumberColumn(format="%d주"),
+                        "점수": st.column_config.ProgressColumn(format="%.1f점", min_value=0, max_value=100)
+                    }
+                )
+                
+                total_invest = df_alloc['배정 금액(KRW)'].sum()
+                remain = seed_money - total_invest
+                st.caption(f"✅ 총 매수 예정 금액: {total_invest:,.0f}원 | 💰 잔액: {remain:,.0f}원")
+
 # TAB 2: 포트폴리오
 with tab2:
     st.markdown("### ☁️ 내 자산 포트폴리오")
-    st.caption("네이버페이(국내) / 1분봉(해외) 실시간 기반 | ATR 기반 리스크 관리")
+    st.caption("토스증권 수수료/세금 적용 | 애프터마켓 시세 반영")
 
     db = get_db()
     if not db:
@@ -658,7 +713,7 @@ with tab2:
         if pf_data:
             st.subheader(f"{user_id}님의 보유 종목 진단 (AI 스나이퍼 기준)")
             my_tickers = [p['ticker'] for p in pf_data]
-            with st.spinner("초정밀 실시간 데이터 수집 중..."):
+            with st.spinner("초정밀 실시간(애프터마켓) 데이터 수집 중..."):
                 raw_data_dict, realtime_map = get_precise_data(my_tickers)
 
             display_list = []
@@ -719,8 +774,11 @@ with tab2:
                         fmt_avg = f"{item['avg']:,.0f}" if item['currency'] == "₩" else f"{item['avg']:,.2f}"
                         fmt_eval = f"{item['eval_amt']:,.0f}" if item['currency'] == "₩" else f"{item['eval_amt']:,.2f}"
 
+                        profit_color = "red" if item['profit_amt'] < 0 else "blue" # 토스는 파란불이 수익, 빨간불이 손실? 아님 빨강=상승/수익
+                        # 한국 앱: 빨강(상승/수익), 파랑(하락/손실). 
+                        
                         st.metric(
-                            "총 순수익",
+                            "총 순수익 (세금/수수료 제)",
                             f"{item['profit_pct']:.2f}%",
                             delta=f"{sym}{item['profit_amt']:,.0f}" if sym == "₩"
                             else f"{sym}{item['profit_amt']:,.2f}",
