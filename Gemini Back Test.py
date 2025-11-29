@@ -44,18 +44,24 @@ DEFAULT_TICKERS = {
 RISK_FREE_RATE = 0.04  # 샤프 지수 계산용 무위험 이자율 (4%)
 
 # -----------------------------------------------------------------------------
-# 클래스 1: 지표 엔진 (Indicator Engine)
-# RSI, ADX, MFI 등 기술적 지표를 벡터 연산으로 고속 처리
+# 클래스 1: 지표 엔진 (Indicator Engine) - [수정됨]
+# 입력값이 Series가 되도록 강제하여 차원 오류 방지
 # -----------------------------------------------------------------------------
 class IndicatorEngine:
     @staticmethod
+    def _ensure_series(data):
+        """데이터가 DataFrame일 경우 Series로 변환 (Squeeze)"""
+        if isinstance(data, pd.DataFrame):
+            return data.squeeze()
+        return data
+
+    @staticmethod
     def calculate_rsi(series, period=2):
-        """Connors의 2일 RSI 계산."""
+        series = IndicatorEngine._ensure_series(series)
         delta = series.diff()
         gain = (delta.where(delta > 0, 0)).fillna(0)
         loss = (-delta.where(delta < 0, 0)).fillna(0)
         
-        # Wilder's Smoothing 사용
         avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
         avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
         
@@ -65,11 +71,17 @@ class IndicatorEngine:
 
     @staticmethod
     def calculate_sma(series, period):
+        series = IndicatorEngine._ensure_series(series)
         return series.rolling(window=period).mean()
 
     @staticmethod
     def calculate_mfi(high, low, close, volume, period=14):
-        """Money Flow Index (거래량 가중 RSI)."""
+        # 모든 입력을 1차원 Series로 강제 변환
+        high = IndicatorEngine._ensure_series(high)
+        low = IndicatorEngine._ensure_series(low)
+        close = IndicatorEngine._ensure_series(close)
+        volume = IndicatorEngine._ensure_series(volume)
+
         typical_price = (high + low + close) / 3
         money_flow = typical_price * volume
         
@@ -86,7 +98,10 @@ class IndicatorEngine:
 
     @staticmethod
     def calculate_adx(high, low, close, period=14):
-        """ADX: 추세 강도 필터링."""
+        high = IndicatorEngine._ensure_series(high)
+        low = IndicatorEngine._ensure_series(low)
+        close = IndicatorEngine._ensure_series(close)
+        
         plus_dm = high.diff()
         minus_dm = low.diff()
         plus_dm = np.where((plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0.0)
@@ -108,11 +123,13 @@ class IndicatorEngine:
 
     @staticmethod
     def calculate_volatility(close, window=20):
-        """역변동성 가중을 위한 연율화 변동성 계산 (20일 기준)"""
+        close = IndicatorEngine._ensure_series(close)
         return close.pct_change().rolling(window=window).std() * np.sqrt(252)
 
+
 # -----------------------------------------------------------------------------
-# 클래스 2: 데이터 로더 (Data Loader)
+# 클래스 2: 데이터 로더 (Data Loader) - [수정됨]
+# MultiIndex 컬럼을 확실하게 1차원으로 펴주는 로직 추가
 # -----------------------------------------------------------------------------
 class DataLoader:
     def __init__(self, tickers, start_date, end_date):
@@ -126,11 +143,11 @@ class DataLoader:
         
         def get_ticker_data(ticker):
             try:
-                # yfinance 데이터 다운로드
+                # auto_adjust=True: 수정주가(배당락/분할 반영) 사용
                 df = yf.download(ticker, start=fetch_start, end=self.end_date, progress=False, auto_adjust=True)
                 if len(df) > 200:
                     return ticker, df
-            except Exception as e:
+            except Exception:
                 return ticker, None
             return ticker, None
 
@@ -138,27 +155,32 @@ class DataLoader:
             results = list(executor.map(get_ticker_data, self.tickers))
 
         for ticker, df in results:
-            if df is not None:
-                # [수정] 멀티인덱스 처리 로직 개선
+            if df is not None and not df.empty:
+                # [핵심 수정] MultiIndex 컬럼 처리 (('Close', 'AAPL') -> 'Close')
+                # 기존의 try-except 구문을 제거하고 더 확실한 방법 사용
                 if isinstance(df.columns, pd.MultiIndex):
-                    try:
-                        # Ticker 레벨이 있는 경우 제거하여 단일 레벨로 변경
-                        df = df.xs(ticker, axis=1, level=1)
-                    except:
-                        pass
-                
-                # [수정] 기존 df를 덮어쓰지 않고 새로운 컬럼에 할당하도록 변경
-                df['RSI'] = IndicatorEngine.calculate_rsi(df['Close'], period=2)
-                df['SMA'] = IndicatorEngine.calculate_sma(df['Close'], period=200)
-                df['MFI'] = IndicatorEngine.calculate_mfi(df['High'], df['Low'], df['Close'], df['Volume'], period=14)
-                df['ADX'] = IndicatorEngine.calculate_adx(df['High'], df['Low'], df['Close'], period=14)
-                df['Volatility'] = IndicatorEngine.calculate_volatility(df['Close'], window=20)
-                
-                # 시뮬레이션용 다음날 시가(Open) 미리 계산
-                df['NextOpen'] = df['Open'].shift(-1) 
-                
-                df.dropna(inplace=True)
-                data_dict[ticker] = df
+                    # 레벨 0(Price Type)만 남기고 나머지(Ticker) 레벨 삭제
+                    df.columns = df.columns.get_level_values(0)
+
+                # 데이터 정제: 중복된 컬럼이 있다면 제거
+                df = df.loc[:, ~df.columns.duplicated()]
+
+                # 지표 계산 (이제 df['Close']는 확실히 1차원 Series입니다)
+                try:
+                    df['RSI'] = IndicatorEngine.calculate_rsi(df['Close'], period=2)
+                    df['SMA'] = IndicatorEngine.calculate_sma(df['Close'], period=200)
+                    df['MFI'] = IndicatorEngine.calculate_mfi(df['High'], df['Low'], df['Close'], df['Volume'], period=14)
+                    df['ADX'] = IndicatorEngine.calculate_adx(df['High'], df['Low'], df['Close'], period=14)
+                    df['Volatility'] = IndicatorEngine.calculate_volatility(df['Close'], window=20)
+                    
+                    df['NextOpen'] = df['Open'].shift(-1) 
+                    
+                    df.dropna(inplace=True)
+                    data_dict[ticker] = df
+                except Exception as e:
+                    # 계산 중 에러 발생 시 해당 종목 스킵하고 로그 출력 (디버깅용)
+                    print(f"Error calculating indicators for {ticker}: {e}")
+                    continue
         
         return data_dict
 
