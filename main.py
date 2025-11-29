@@ -8,7 +8,6 @@ import time
 import json
 import concurrent.futures
 import requests
-from bs4 import BeautifulSoup
 
 # ---------------------------------------------------------
 # 0. 파이어베이스(DB) 설정
@@ -43,11 +42,12 @@ def get_db():
 # ---------------------------------------------------------
 st.set_page_config(page_title="AI 주식 스캐너 Pro", page_icon="📈", layout="wide")
 
+# 스캔 결과 영구 보존을 위한 세션 초기화
 if 'scan_result_df' not in st.session_state:
     st.session_state['scan_result_df'] = None
 
 TICKER_MAP = {
-    "INTC": "인텔 (Intel)", "005290.KS": "동진쎄미켐", "SOXL": "반도체 3X(Bull)", 
+    "INTC": "인텔", "005290.KS": "동진쎄미켐", "SOXL": "반도체 3X(Bull)", 
     "316140.KS": "우리금융지주", "WDC": "웨스턴디지털", "NFLX": "넷플릭스", 
     "000990.KS": "DB하이텍", "KLAC": "KLA", "009540.KS": "HD한국조선해양", 
     "006360.KS": "GS건설", "024110.KS": "기업은행", "042660.KS": "대우조선해양(한화오션)", 
@@ -58,7 +58,7 @@ TICKER_MAP = {
     "079550.KS": "LIG넥스원", "039030.KS": "이오테크닉스", "C": "씨티그룹", 
     "009830.KS": "한화솔루션", "LLY": "일라이릴리", "128940.KS": "한미약품", 
     "WFC": "웰스파고", "012450.KS": "한화에어로스페이스", "ASML": "ASML", 
-    "NVDA": "엔비디아", "GE": "GE에어로스페이스", "V": "비자(Visa)", 
+    "NVDA": "엔비디아", "GE": "GE에어로스페이스", "V": "비자", 
     "XLE": "에너지 ETF", "005935.KS": "삼성전자우", "041510.KS": "에스엠", 
     "BA": "보잉", "000660.KS": "SK하이닉스", "000810.KS": "삼성화재", 
     "000250.KS": "삼천당제약", "TXN": "텍사스인스트루먼트", "122990.KS": "와이지엔터", 
@@ -76,124 +76,141 @@ SEARCH_MAP = {f"{name} ({code})": code for code, name in TICKER_MAP.items()}
 USER_WATCHLIST = list(TICKER_MAP.keys())
 
 # ---------------------------------------------------------
-# 2. 데이터 수집 (After Market / Realtime)
+# 2. 데이터 수집 혁신 (New Method)
 # ---------------------------------------------------------
-def fetch_kr_realtime(ticker):
-    """한국 주식: 네이버 금융 실시간 크롤링"""
+
+def fetch_kr_polling(ticker):
+    """
+    [New Method] 네이버 금융 Polling API 직접 호출
+    HTML 파싱보다 훨씬 빠르고 정확하며, 실시간 체결가를 JSON으로 반환함.
+    """
     try:
         code = ticker.split('.')[0]
-        url = f"https://finance.naver.com/item/sise.naver?code={code}"
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        res = requests.get(url, headers=headers)
-        soup = BeautifulSoup(res.text, 'html.parser')
-        price_str = soup.select_one('#_nowVal').text.replace(',', '')
-        return (ticker, float(price_str))
+        # 네이버페이 증권 등에서 사용하는 실시간 폴링 API
+        url = f"https://polling.finance.naver.com/api/realtime?query=SERVICE_ITEM:{code}"
+        headers = {
+            'User-Agent': 'Mozilla/5.0',
+            'Referer': 'https://finance.naver.com/'
+        }
+        res = requests.get(url, headers=headers, timeout=3)
+        data = res.json()
+        
+        # JSON 경로 파싱: result -> areas -> datas -> nm(현재가)
+        if data['result']['code'] == '200':
+            areas = data['result']['areas']
+            for area in areas:
+                for item in area['datas']:
+                    if item.get('cd') == code:
+                        # 'nv'가 현재가(int)
+                        return (ticker, float(item['nv']))
+        return (ticker, None)
     except:
+        # 실패 시 FDR 백업
+        try:
+            df = fdr.DataReader(ticker.split('.')[0], '2023-01-01')
+            if not df.empty: return (ticker, float(df['Close'].iloc[-1]))
+        except: pass
         return (ticker, None)
 
-def fetch_us_realtime(ticker):
+def fetch_us_1m_candle(ticker):
     """
-    미국 주식: 정규장/프리장/애프터마켓 가격 (우선순위 로직)
+    [New Method] 미국 주식 1분봉(장전/장후 포함) 조회
+    가장 마지막에 찍힌 캔들의 Close 가격을 가져옴. 이것이 진정한 애프터마켓 가격.
     """
     try:
-        # yfinance info 객체를 통해 정밀 데이터 조회
-        t = yf.Ticker(ticker)
-        # fast_info는 빠르지만 postMarket 정보가 없을 수 있음 -> info 사용 (느려도 정확)
-        # 하지만 스피드를 위해 fast_info + info 조합 고려
-        # 여기서는 정확도를 위해 info를 호출하되, 없으면 fast_info last_price 사용
-        
-        # info 호출은 네트워크 비용이 큼. 꼭 필요한 포트폴리오 탭에서만 사용하도록 설계
-        # 병렬 처리 안에서 호출되므로 괜찮음
-        
-        info = t.info
-        
-        # 1순위: Post Market Price (애프터마켓)
-        price = info.get('postMarketPrice')
-        
-        # 2순위: Regular Market Price (정규장 종가/현재가)
-        if price is None:
-            price = info.get('regularMarketPrice')
-            
-        # 3순위: Current Price (일반 현재가)
-        if price is None:
-            price = info.get('currentPrice')
-            
-        # 최후의 수단: fast_info
-        if price is None:
-            price = t.fast_info.get('last_price')
-            
-        return (ticker, price)
+        # period='5d'로 넉넉히 잡고, interval='1m', prepost=True(장외거래 포함)
+        df = yf.download(ticker, period="5d", interval="1m", prepost=True, progress=False)
+        if not df.empty:
+            # 가장 마지막 줄의 종가(Close)
+            last_price = float(df['Close'].iloc[-1])
+            return (ticker, last_price)
+        return (ticker, None)
     except:
         return (ticker, None)
 
 def fetch_history_data(ticker):
-    """지표 분석용 과거 데이터 (2년치)"""
+    """지표 분석용 일봉 데이터 (2년치)"""
     try:
         if ticker.endswith('.KS') or ticker.endswith('.KQ'):
             df = fdr.DataReader(ticker.split('.')[0], '2023-01-01')
         else:
-            df = yf.download(ticker, period="2y", progress=False)
+            # 미국 주식 일봉도 prepost=True로 받아야 마지막 날짜 데이터가 정확할 수 있음
+            df = yf.download(ticker, period="2y", progress=False, prepost=True)
+            
+            # 데이터 평탄화 (MultiIndex 제거)
             if isinstance(df.columns, pd.MultiIndex):
                 try: df.columns = df.columns.droplevel(1)
                 except: pass
             df = df.loc[:, ~df.columns.duplicated()]
             if 'Close' not in df.columns and 'Adj Close' in df.columns:
                 df['Close'] = df['Adj Close']
+                
         return (ticker, df)
     except:
         return (ticker, None)
 
-@st.cache_data(ttl=0) # 캐시 없음 (항상 최신)
-def get_hybrid_data_v3(tickers_list):
+@st.cache_data(ttl=0) # 캐시 0초 (항상 실행)
+def get_precise_data(tickers_list):
+    """
+    [New Logic] 
+    1. 히스토리 데이터 수집 (지표 계산용)
+    2. 초정밀 실시간 데이터 수집 (가격 표시용)
+    3. 히스토리의 마지막 값을 실시간 값으로 강제 교체 (AI 분석용)
+    """
     kr_tickers = [t for t in tickers_list if t.endswith('.KS') or t.endswith('.KQ')]
     us_tickers = [t for t in tickers_list if t not in kr_tickers]
     
-    final_dfs = {} 
-    realtime_map = {}
+    final_dfs = {}
+    realtime_prices = {}
 
     with concurrent.futures.ThreadPoolExecutor() as executor:
-        # 1. 실시간 가격 (KR: 크롤링, US: Info 정밀조회)
-        future_realtime = []
+        # A. 실시간 가격 (병렬)
+        fut_real = []
         for t in kr_tickers:
-            future_realtime.append(executor.submit(fetch_kr_realtime, t))
+            fut_real.append(executor.submit(fetch_kr_polling, t)) # 네이버 API
         for t in us_tickers:
-            future_realtime.append(executor.submit(fetch_us_realtime, t))
+            fut_real.append(executor.submit(fetch_us_1m_candle, t)) # 1분봉
             
-        # 2. 히스토리
-        future_history = []
+        # B. 히스토리 데이터 (병렬)
+        fut_hist = []
         for t in tickers_list:
-            future_history.append(executor.submit(fetch_history_data, t))
+            fut_hist.append(executor.submit(fetch_history_data, t))
             
-        # 수집
-        for f in concurrent.futures.as_completed(future_realtime):
-            tk, price = f.result()
-            if price is not None: realtime_map[tk] = price
+        # 수집 - 실시간
+        for f in concurrent.futures.as_completed(fut_real):
+            tk, p = f.result()
+            if p is not None: realtime_prices[tk] = p
             
-        history_map = {}
-        for f in concurrent.futures.as_completed(future_history):
+        # 수집 - 히스토리
+        hist_map = {}
+        for f in concurrent.futures.as_completed(fut_hist):
             tk, df = f.result()
-            if df is not None and not df.empty: history_map[tk] = df
+            if df is not None and not df.empty: hist_map[tk] = df
 
-    # 병합
+    # C. 병합 및 오버라이딩
     for t in tickers_list:
-        if t in history_map:
-            df = history_map[t].copy()
+        if t in hist_map:
+            df = hist_map[t].copy()
+            # MultiIndex 안전 제거
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
-                
-            if t in realtime_map:
-                latest_price = realtime_map[t]
+            
+            # 실시간 가격이 있으면 덮어쓰기
+            if t in realtime_prices:
+                latest_p = realtime_prices[t]
                 if 'Close' in df.columns:
-                    # 마지막 종가를 실시간(애프터마켓) 가격으로 교체
-                    df.iloc[-1, df.columns.get_loc('Close')] = latest_price
+                    # 마지막 행의 값을 최신 체결가로 변경 (지표가 현재가 기준이 됨)
+                    df.iloc[-1, df.columns.get_loc('Close')] = latest_p
+                    
             final_dfs[t] = df
-
-    return final_dfs, realtime_map
+            
+    return final_dfs, realtime_prices
 
 def calculate_indicators(df):
     if len(df) < 60: return None
     df = df.copy()
     
+    # 단일 컬럼 보장
     if isinstance(df, pd.DataFrame) and 'Close' in df.columns:
         if isinstance(df['Close'], pd.DataFrame):
             close_series = df['Close'].iloc[:, 0]
@@ -239,10 +256,7 @@ def calculate_total_profit(ticker, avg_price, current_price, quantity):
     total_buy = avg_price * quantity
     raw_eval = current_price * quantity
     total_fee = raw_eval * fee_tax_rate
-    
-    # 세후 총 평가금 (예상 수령액)
     net_eval = raw_eval - total_fee
-    
     net_profit_amt = net_eval - total_buy
     
     if total_buy > 0:
@@ -367,7 +381,7 @@ tab1, tab2, tab3 = st.tabs(["🚀 전체 종목 스캐너", "💼 내 포트폴�
 
 with tab1:
     st.markdown("### 📋 AI 정밀 스캐너")
-    st.caption("실시간(After Market) 가격을 반영하여 AI가 분석합니다.")
+    st.caption("초정밀 실시간/AfterMarket 데이터 기반 AI 분석")
 
     col_btn, col_info = st.columns([1, 4])
     with col_btn:
@@ -375,10 +389,11 @@ with tab1:
             st.session_state['scan_result_df'] = None 
             st.rerun()
 
+    # 결과가 없으면 새로 분석, 있으면 기존 것 유지 (결과 고정)
     if st.session_state['scan_result_df'] is None:
         if st.button("🔍 전체 리스트 정밀 분석 시작"):
-            with st.spinner('실시간 가격 반영 및 AI 분석 중...'):
-                raw_data_dict, realtime_map = get_hybrid_data_v3(USER_WATCHLIST)
+            with st.spinner('초정밀 데이터 수집 및 분석 중... (15~20초 소요)'):
+                raw_data_dict, realtime_map = get_precise_data(USER_WATCHLIST)
                 scan_results = []
                 progress_bar = st.progress(0)
                 
@@ -393,6 +408,7 @@ with tab1:
 
                         cat, col_name, reasoning, score = analyze_advanced_strategy(df_indi)
                         
+                        # 화면 표시는 실시간 맵에 있는 가격 우선
                         curr_price = realtime_map.get(ticker_code, df_indi['Close_Calc'].iloc[-1])
                         rsi_val = float(df_indi['RSI'].iloc[-1])
                         name = TICKER_MAP.get(ticker_code, ticker_code)
@@ -417,7 +433,7 @@ with tab1:
                     df_res = pd.DataFrame(scan_results)
                     df_res = df_res.sort_values('점수', ascending=False)
                     st.session_state['scan_result_df'] = df_res
-                    st.success("완료!")
+                    st.success("완료! (결과는 '분석 새로고침' 전까지 고정됩니다)")
                     st.rerun()
                 else:
                     st.error("데이터 수집 실패.")
@@ -440,7 +456,7 @@ with tab1:
 
 with tab2:
     st.markdown("### ☁️ 내 자산 포트폴리오")
-    st.caption("네이버페이/토스증권 실시간 기준 | 총 평가금도 세후(순수익) 기준으로 표시")
+    st.caption("네이버페이(국내) / 1분봉(해외) 실시간 기반 | 세후 순수익 계산")
     
     db = get_db()
     if not db:
@@ -486,8 +502,8 @@ with tab2:
         if pf_data:
             st.subheader(f"{user_id}님의 보유 종목 진단")
             my_tickers = [p['ticker'] for p in pf_data]
-            with st.spinner("실시간 시세 조회 중... (국내:네이버크롤링, 해외:YF Info)"):
-                raw_data_dict, _ = get_hybrid_data_v3(my_tickers)
+            with st.spinner("초정밀 실시간 데이터 수집 중..."):
+                raw_data_dict, realtime_map = get_precise_data(my_tickers)
             
             display_list = []
             for item in pf_data:
@@ -505,9 +521,15 @@ with tab2:
                 
                 if df_tk is not None and not df_tk.empty:
                     df_indi = calculate_indicators(df_tk)
-                    if df_indi is not None and not df_indi.empty:
-                        curr = float(df_indi['Close_Calc'].iloc[-1])
+                    if df_indi is not None:
+                        # 분석은 업데이트된 마지막 종가 기준
                         cat, col_name, reasoning, score = analyze_advanced_strategy(df_indi)
+                
+                # 표시는 실시간 맵 기준 (가장 정확)
+                if tk in realtime_map:
+                    curr = realtime_map[tk]
+                elif df_tk is not None and not df_tk.empty:
+                    curr = float(df_tk['Close'].iloc[-1])
 
                 if curr > 0:
                     res = calculate_total_profit(tk, avg, curr, qty)
@@ -536,28 +558,21 @@ with tab2:
             for item in display_list:
                 with st.container():
                     c1, c2, c3 = st.columns([1.5, 1.5, 4])
-                    sym = item['currency'] # 역슬래시 완전히 제거
+                    sym = item['currency'] 
                     
                     with c1:
                         st.markdown(f"### {item['name']}")
                         st.caption(f"{item['tk']} | 보유: {item['qty']}주")
                         
                     with c2:
-                        # 폰트 깨짐 방지를 위해 포맷팅 명확화
-                        if sym == "₩":
-                            fmt_curr = f"{item['curr']:,.0f}"
-                            fmt_avg = f"{item['avg']:,.0f}"
-                            fmt_profit = f"{item['profit_amt']:,.0f}"
-                            fmt_eval = f"{item['eval_amt']:,.0f}"
-                        else:
-                            fmt_curr = f"{item['curr']:,.2f}"
-                            fmt_avg = f"{item['avg']:,.2f}"
-                            fmt_profit = f"{item['profit_amt']:,.2f}"
-                            fmt_eval = f"{item['eval_amt']:,.2f}"
+                        fmt_curr = f"{item['curr']:,.0f}" if item['currency'] == "₩" else f"{item['curr']:,.2f}"
+                        fmt_avg = f"{item['avg']:,.0f}" if item['currency'] == "₩" else f"{item['avg']:,.2f}"
+                        fmt_profit = f"{item['profit_amt']:,.0f}" if item['currency'] == "₩" else f"{item['profit_amt']:,.2f}"
+                        fmt_eval = f"{item['eval_amt']:,.0f}" if item['currency'] == "₩" else f"{item['eval_amt']:,.2f}"
                         
                         st.metric("총 순수익 (수수료 제)", f"{item['profit_pct']:.2f}%", delta=f"{sym}{fmt_profit}")
                         
-                        st.markdown(f"**세후 총 평가금(예상 수령액):** {sym}{fmt_eval}")
+                        st.markdown(f"**세후 총 평가금:** {sym}{fmt_eval}")
                         st.markdown(f"<small style='color: gray'>평단: {sym}{fmt_avg} / 현재: {sym}{fmt_curr}</small>", unsafe_allow_html=True)
                         
                     with c3:
@@ -572,12 +587,92 @@ with tab2:
 
 with tab3:
     st.markdown("## 📘 AI 투자 전략 알고리즘 상세 백서 (Whitepaper)")
-    st.markdown("단순한 지표 합산이 아닌, **'수익은 길게, 손실은 짧게'** 가져가는 프로 트레이더의 로직을 구현했습니다.")
+    st.markdown("""
+    본 서비스에 탑재된 AI 알고리즘은 **'추세 추종(Trend Following)'** 전략과 **'평균 회귀(Mean Reversion)'** 이론을 
+    결합하여 설계되었습니다. 단순히 감에 의존하는 투자가 아닌, 철저한 **데이터와 통계적 확률**에 기반하여 
+    0점부터 100점까지의 '매수 매력도'를 산출합니다.
+    """)
+    
     st.divider()
-    st.subheader("1. 💯 점수 산정 로직 (Total 100점)")
-    score_table = pd.DataFrame({
-        "평가 요소": ["추세 (Trend)", "지지 (Support)", "모멘텀 (Momentum)", "거래량 (Volume)", "리스크 (Risk)"],
-        "내용": ["60일선/20일선 위에 있는가?", "싸게 살 수 있는 자리인가? (눌림목/볼린저 하단)", "상승 에너지가 강한가? (MACD)", "세력이 들어왔는가?", "너무 비싸진 않은가? (과열)"],
-        "배점": ["±15~25점", "+15~25점 (가산점)", "±15점", "+10점", "±10~20점"]
-    })
-    st.table(score_table)
+    
+    st.header("1. 🧠 핵심 평가 로직 (5-Factor Model)")
+    st.markdown("AI는 다음 5가지 핵심 요소를 종합적으로 분석하여 점수를 계산합니다.")
+    
+    with st.expander("① 추세 (Trend) - 시장의 흐름을 읽다", expanded=True):
+        st.markdown("""
+        * **개념:** '달리는 말에 올라타라'는 격언처럼, 주가가 상승세일 때 매수하는 것이 승률이 높습니다.
+        * **판단 기준:**
+            * **장기 추세 (60일 이동평균선):** 주가가 60일선 위에 있으면 '상승장'으로 판단합니다. (+15점)
+            * **단기 추세 (20일 이동평균선):** 주가가 20일선 위에 있으면 단기 탄력이 좋다고 판단합니다. (+10점)
+            * **역배열:** 주가가 이동평균선 아래에 있으면 하락 추세로 간주하여 감점합니다. (-10~20점)
+        """)
+
+    with st.expander("② 지지 & 저점 (Support) - 싸게 사는 기술", expanded=True):
+        st.markdown("""
+        * **개념:** 아무리 좋은 주식도 비싸게 사면 의미가 없습니다. 상승 추세 속에서 일시적으로 가격이 하락했을 때(조정)가 기회입니다.
+        * **판단 기준:**
+            * **황금 눌림목 (Golden Dip):** 주가가 상승 추세(60일선 위)에 있으면서, 단기적으로 하락해 **20일선(-2% ~ +2%)**에 근접할 때. 가장 높은 가산점을 부여합니다. (+25점)
+            * **볼린저 밴드 하단:** 주가가 통계적 하단 밴드를 터치하면 '과매도' 상태로 보아 기술적 반등을 기대합니다. (+15점)
+            * **볼린저 밴드 상단:** 주가가 상단 밴드를 뚫으면 '단기 고점'으로 보아 감점합니다. (-10점)
+        """)
+
+    with st.expander("③ 모멘텀 (Momentum) - 상승 에너지", expanded=True):
+        st.markdown("""
+        * **개념:** 주가가 상승하려고 하는 '가속도'를 측정합니다.
+        * **판단 기준 (MACD):**
+            * **골든크로스:** 단기 이평선이 장기 이평선을 뚫고 올라갈 때 강력한 매수 신호로 봅니다. (+15점)
+            * **상승 추세 유지:** MACD가 시그널선 위에 머물러 있으면 상승 에너지가 지속되는 것으로 봅니다. (+5점)
+            * **데드크로스:** 반대로 하락 반전 신호가 뜨면 감점합니다. (-15점)
+        """)
+        
+    with st.expander("④ 심리 (Psychology) - 공포와 탐욕", expanded=True):
+        st.markdown("""
+        * **개념:** 투자자들의 심리가 과열되었는지, 공포에 질려있는지를 RSI 지표로 판단합니다.
+        * **판단 기준 (RSI):**
+            * **침체 구간 (RSI < 30):** '공포' 구간입니다. 남들이 팔 때 사는 역발상 전략으로 가산점을 줍니다. (+15점)
+            * **과열 구간 (RSI > 75):** '탐욕' 구간입니다. 언제든 차익 실현 매물이 나올 수 있어 감점합니다. (-20점)
+        """)
+        
+    with st.expander("⑤ 거래량 (Volume) - 신뢰의 척도", expanded=True):
+        st.markdown("""
+        * **개념:** 거래량이 없는 상승은 가짜일 수 있습니다. 거래량이 동반된 상승만이 '진짜'입니다.
+        * **판단 기준:**
+            * **거래량 폭발:** 평소 거래량(20일 평균)보다 1.5배 이상 터지면서 양봉(상승)이 나오면 '세력 유입'으로 봅니다. (+10점)
+        """)
+
+    st.divider()
+    
+    st.header("2. 🚦 AI 판단 등급표 (Decision Matrix)")
+    st.markdown("위 5가지 요소의 합산 점수(0~100점)에 따라 최종 행동 지침을 내립니다.")
+    
+    grade_data = {
+        "점수 구간": ["80점 ~ 100점", "60점 ~ 79점", "41점 ~ 59점", "21점 ~ 40점", "0점 ~ 20점"],
+        "등급 (Grade)": ["🚀 강력 매수 (Strong Buy)", "📈 매수 (Buy)", "👀 관망 (Hold)", "📉 매도 (Sell)", "💥 강력 매도 (Strong Sell)"],
+        "상세 설명": [
+            "모든 지표가 상승을 가리킵니다. 추세는 살아있고 가격은 매력적인 '눌림목' 상태일 확률이 높습니다. 적극적으로 비중을 실을 때입니다.",
+            "전반적으로 긍정적입니다. 상승 추세에 있거나, 과매도 구간에서 반등을 시작했습니다. 분할 매수로 진입하기 좋습니다.",
+            "방향성이 뚜렷하지 않습니다. 호재와 악재가 섞여있거나 횡보장입니다. 신규 진입보다는 추세를 더 지켜봐야 합니다.",
+            "위험 신호가 감지됩니다. 추세가 꺾였거나 단기 과열 상태입니다. 이익 실현을 하거나 비중을 줄이는 것이 현명합니다.",
+            "매우 위험합니다. 역배열 하락 추세가 가속화되고 있습니다. 가지고 있다면 손절을, 없다면 쳐다보지도 말아야 할 때입니다."
+        ]
+    }
+    st.table(pd.DataFrame(grade_data))
+    
+    st.divider()
+    
+    st.header("3. 💸 수수료 및 비용 계산 방식 (토스증권 기준)")
+    st.info("이 봇은 단순 등락률이 아닌, 세금과 수수료를 모두 뗀 '실현 손익'을 계산합니다.")
+    
+    st.markdown("""
+    **🇰🇷 국내 주식 (KR)**
+    * **증권거래세:** 매도 금액의 `0.15%` (국가 납부)
+    * **유관기관 제비용:** 약 `0.03%`
+    * **총 비용:** 매도 시 약 **0.18%**가 원금에서 차감됩니다.
+    
+    **🇺🇸 해외 주식 (US)**
+    * **매매 수수료:** 매도 금액의 `0.2%` (토스증권 표준 요율 적용 시)
+    * **총 비용:** 매도 시 약 **0.2%**가 원금에서 차감됩니다.
+    * *(참고: 환전 수수료는 변동성이 커서 계산에 포함하지 않았습니다)*
+    """)
+    
+    st.warning("⚠️ **면책 조항:** 본 서비스는 투자를 보조하는 도구일 뿐이며, AI의 분석이 100% 정확성을 보장하지 않습니다. 모든 투자 결정의 책임은 본인에게 있습니다.")
