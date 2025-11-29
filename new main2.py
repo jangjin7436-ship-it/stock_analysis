@@ -198,24 +198,31 @@ def get_precise_data(tickers_list):
 
     return hist_map, realtime_map
 
-# ---------------------------------------------------------
-# 3. 분석 엔진 (AI Sniper Logic: 2주 스윙 최적화)
-# ---------------------------------------------------------
+이 오류는 analyze_advanced_strategy 함수가 데이터를 처리할 때, 특정 값(MACD 등)이 숫자 하나(Scalar)가 아니라 데이터 덩어리(Series)로 인식되어 비교 연산(>)을 할 수 없기 때문에 발생합니다.
+
+주로 yfinance 데이터에 중복된 컬럼이 있거나, 계산 과정에서 차원이 꼬였을 때 발생합니다.
+
+아래 수정된 [3. 분석 엔진] 전체 코드를 덮어씌우면, 중복 컬럼을 제거하고 모든 값을 강제로 숫자로 변환하여 오류를 근본적으로 해결합니다.
+
+Python
 
 # ---------------------------------------------------------
-# 3. 분석 엔진 (수정됨: ValueError 해결)
+# 3. 분석 엔진 (수정됨: Series/Scalar 차원 오류 완벽 해결)
 # ---------------------------------------------------------
 
 def calculate_indicators(df, realtime_price=None):
     """
-    [수정] Volume 데이터 처리 시 발생하는 차원 오류(ValueError) 수정
+    [수정] 데이터 차원 오류 방지 로직 추가
     """
     if df is None or len(df) < 60:
         return None
 
     df = df.copy()
 
-    # [핵심 수정 1] 인덱스 중복 제거 (yfinance 데이터 오류 방지)
+    # [핵심 1] 중복된 컬럼명 제거 (yfinance 버그 방지)
+    df = df.loc[:, ~df.columns.duplicated()]
+    
+    # [핵심 2] 인덱스 중복 제거
     df = df[~df.index.duplicated(keep='last')]
 
     # 컬럼 통일
@@ -224,7 +231,7 @@ def calculate_indicators(df, realtime_price=None):
     if 'Close' not in df.columns:
         return None
 
-    # Close가 DataFrame(2차원)인 경우 Series(1차원)로 강제 변환
+    # [핵심 3] Close가 DataFrame(2차원)인 경우 Series(1차원)로 강제 변환
     close = df['Close']
     if isinstance(close, pd.DataFrame):
         close = close.iloc[:, 0]
@@ -267,36 +274,58 @@ def calculate_indicators(df, realtime_price=None):
     df['MACD_Hist'] = df['MACD'] - df['Signal_Line']
     df['Prev_MACD_Hist'] = df['MACD_Hist'].shift(1)
     
-    # 5. 거래량 (여기가 에러 발생 지점 -> 수정됨)
+    # 5. 거래량 (오류 방지 처리 포함)
     if 'Volume' in df.columns:
         vol = df['Volume']
-        # [핵심 수정 2] Volume이 DataFrame일 경우 Series로 변환
         if isinstance(vol, pd.DataFrame):
             vol = vol.iloc[:, 0]
             
         df['Vol_MA20'] = vol.rolling(20).mean()
         
-        # 0으로 나누기 오류 방지
+        # 0으로 나누기 방지
         denom = df['Vol_MA20'].replace(0, np.nan)
         df['Vol_Ratio'] = vol / denom
-        df['Vol_Ratio'] = df['Vol_Ratio'].fillna(0) # NaN 처리
+        df['Vol_Ratio'] = df['Vol_Ratio'].fillna(0)
     else:
         df['Vol_Ratio'] = 1.0 
 
     df['STD20'] = std
-    return df.dropna()
+    
+    # [핵심 4] 최종 결과에서도 중복 컬럼 한번 더 제거
+    return df.loc[:, ~df.columns.duplicated()].dropna()
+
+def get_scalar(val):
+    """
+    [헬퍼 함수] Series나 DataFrame 값을 안전하게 float으로 변환
+    """
+    try:
+        if isinstance(val, (pd.Series, pd.DataFrame)):
+            if val.empty: return 0.0
+            return float(val.iloc[0])
+        return float(val)
+    except:
+        return 0.0
 
 def get_ai_score_row(row):
     """
     [AI 스나이퍼 스코어링]
-    - MA10 지지 & 모멘텀 가속 & 밴드 돌파 시 고득점
+    - 안전한 값 추출(get_scalar) 적용
     """
     try:
         score = 50.0
         
-        curr = row['Close_Calc']
-        ma5, ma10, ma20, ma60 = row['MA5'], row['MA10'], row['MA20'], row['MA60']
-        rsi = row['RSI']
+        curr = get_scalar(row['Close_Calc'])
+        ma5  = get_scalar(row['MA5'])
+        ma10 = get_scalar(row['MA10'])
+        ma20 = get_scalar(row['MA20'])
+        ma60 = get_scalar(row['MA60'])
+        rsi  = get_scalar(row['RSI'])
+        macd_hist = get_scalar(row['MACD_Hist'])
+        prev_hist = get_scalar(row['Prev_MACD_Hist'])
+        u_band    = get_scalar(row['Upper_Band'])
+        band_width= get_scalar(row['Band_Width'])
+        vol_ratio = get_scalar(row['Vol_Ratio'])
+        std20     = get_scalar(row['STD20'])
         
         # 1. 추세 (10일선 생명선)
         if curr > ma10:
@@ -312,11 +341,11 @@ def get_ai_score_row(row):
             score -= 5.0
 
         # 2. 모멘텀 (MACD 가속)
-        if row['MACD_Hist'] > 0:
+        if macd_hist > 0:
             score += 5.0
-            if row['MACD_Hist'] > row['Prev_MACD_Hist']:
+            if macd_hist > prev_hist:
                 score += 5.0 # 상승 가속
-        elif row['MACD_Hist'] > row['Prev_MACD_Hist'] and row['MACD_Hist'] > -0.5:
+        elif macd_hist > prev_hist and macd_hist > -0.5:
              score += 5.0 # 반등 시도
 
         # 3. RSI (스윙 적정 구간 50~70)
@@ -328,21 +357,20 @@ def get_ai_score_row(row):
             score += 5.0 # 낙폭 과대
 
         # 4. 볼린저 밴드 (변동성)
-        u_band = row['Upper_Band']
         if curr >= u_band * 0.98: # 밴드 상단 돌파 시도
             score += 10.0
             
         # 스퀴즈 후 발산
-        if row['Band_Width'] < 0.15 and ma5 > ma10:
+        if band_width < 0.15 and ma5 > ma10:
             score += 5.0
 
         # 5. 거래량
-        if row['Vol_Ratio'] >= 1.2 and curr > row['MA5']:
+        if vol_ratio >= 1.2 and curr > ma5:
              score += 5.0
 
         # 6. 안정성 페널티 (변동성 클수록 감점)
-        vol_ratio = row['STD20'] / curr if curr > 0 else 0
-        score -= (vol_ratio * 100.0)
+        v_ratio = std20 / curr if curr > 0 else 0
+        score -= (v_ratio * 100.0)
 
         return max(0.0, min(100.0, score))
     except:
@@ -351,20 +379,24 @@ def get_ai_score_row(row):
 def analyze_advanced_strategy(df):
     """
     [AI 스나이퍼 전략 등급 분류]
-    - 조건 만족 전부 매수 모드: 70점 이상이면 모두 '매수' 등급 부여
+    - 안전한 값 추출 적용
     """
     if df is None or df.empty:
         return "분석 불가", "gray", "데이터 부족", 0.0
 
     try:
         row = df.iloc[-1]
-        score = float(get_ai_score_row(row))
-        curr = float(row['Close_Calc'])
-        ma10 = float(row['MA10'])
-        ma60 = float(row['MA60'])
-        rsi = float(row['RSI'])
-        macd_hist = float(row['MACD_Hist'])
-        u_band = float(row['Upper_Band'])
+        score = get_ai_score_row(row) # 이미 float 반환
+        
+        # 안전한 값 추출
+        curr = get_scalar(row['Close_Calc'])
+        ma10 = get_scalar(row['MA10'])
+        ma60 = get_scalar(row['MA60'])
+        rsi  = get_scalar(row['RSI'])
+        macd_hist = get_scalar(row['MACD_Hist'])
+        prev_hist = get_scalar(row['Prev_MACD_Hist'])
+        u_band    = get_scalar(row['Upper_Band'])
+        
     except Exception:
         return "오류", "gray", "계산 실패", 0.0
 
@@ -389,14 +421,13 @@ def analyze_advanced_strategy(df):
         reasons.append(f"과매도({rsi:.0f})")
     
     # 4. MACD
-    if macd_hist > 0 and macd_hist > row['Prev_MACD_Hist']:
+    if macd_hist > 0 and macd_hist > prev_hist:
         reasons.append("에너지 가속")
 
     # -----------------------------------------------------
     # [스나이퍼 전략] 점수 구간 → 매수/매도 등급 매핑
     # -----------------------------------------------------
     if score >= 70:
-        # 70점 이상이면 무조건 매수 후보 (분산 투자 권장)
         if rsi > 75:
             cat = "🔥 매수 주의 (과열권)"
             col = "orange"
