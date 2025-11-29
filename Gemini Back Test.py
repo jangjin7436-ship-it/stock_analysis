@@ -16,7 +16,7 @@ warnings.filterwarnings('ignore')
 # -----------------------------------------------------------------------------
 st.set_page_config(layout="wide", page_title="Stable-Alpha: 역변동성 기반 평균회귀 시스템")
 
-# 기본 설정값: 유동성이 풍부한 미국 대형 기술주 및 주요 ETF
+# 기본 설정값
 DEFAULT_TICKERS = {
     "INTC": "인텔", "005290.KS": "동진쎄미켐", "SOXL": "반도체 3X(Bull)", 
     "316140.KS": "우리금융지주", "WDC": "웨스턴디지털", "NFLX": "넷플릭스", 
@@ -41,7 +41,6 @@ DEFAULT_TICKERS = {
     "FNGU": "FANG+ 3X(Bull)", "BULZ": "기술주 3X(Bull)", "TMF": "채권 3X(Bull)", 
     "TSLA": "테슬라", "AMD": "AMD", "BITX": "비트코인 2X", "TSLL": "테슬라 1.5X"
 }
-
 RISK_FREE_RATE = 0.04  # 샤프 지수 계산용 무위험 이자율 (4%)
 
 # -----------------------------------------------------------------------------
@@ -53,6 +52,7 @@ class IndicatorEngine:
     def calculate_rsi(series, period=2):
         """
         Connors의 2일 RSI 계산.
+        참고: [1, 18]
         """
         delta = series.diff()
         gain = (delta.where(delta > 0, 0)).fillna(0)
@@ -74,6 +74,7 @@ class IndicatorEngine:
     def calculate_mfi(high, low, close, volume, period=14):
         """
         Money Flow Index (거래량 가중 RSI).
+        참고: [2, 16, 19]
         """
         typical_price = (high + low + close) / 3
         money_flow = typical_price * volume
@@ -85,17 +86,15 @@ class IndicatorEngine:
         raw_pos_flow = pos_flow.rolling(window=period).sum()
         raw_neg_flow = neg_flow.rolling(window=period).sum()
         
-        # 0으로 나누기 방지
-        with np.errstate(divide='ignore', invalid='ignore'):
-            money_ratio = raw_pos_flow / raw_neg_flow
-            mfi = 100 - (100 / (1 + money_ratio))
-        
+        money_ratio = raw_pos_flow / raw_neg_flow
+        mfi = 100 - (100 / (1 + money_ratio))
         return mfi.fillna(50) 
 
     @staticmethod
     def calculate_adx(high, low, close, period=14):
         """
         ADX: 추세 강도 필터링.
+        참고: [20, 21, 22]
         """
         plus_dm = high.diff()
         minus_dm = low.diff()
@@ -112,10 +111,7 @@ class IndicatorEngine:
         plus_di = 100 * (pd.Series(plus_dm).ewm(alpha=1/period, adjust=False).mean() / atr)
         minus_di = 100 * (pd.Series(minus_dm).ewm(alpha=1/period, adjust=False).mean() / atr)
         
-        # 0으로 나누기 방지
-        with np.errstate(divide='ignore', invalid='ignore'):
-            dx = (abs(plus_di - minus_di) / abs(plus_di + minus_di)) * 100
-        
+        dx = (abs(plus_di - minus_di) / abs(plus_di + minus_di)) * 100
         adx = dx.ewm(alpha=1/period, adjust=False).mean()
         return adx.fillna(0)
 
@@ -156,30 +152,23 @@ class DataLoader:
 
         for ticker, df in results:
             if df is not None:
+                # 데이터 전처리 및 지표 계산
                 # yfinance 최신 버전의 멀티인덱스 컬럼 문제 해결
                 if isinstance(df.columns, pd.MultiIndex):
                     try:
-                        # Ticker 레벨이 있는 경우 제거
-                        if ticker in df.columns.levels[1]:
-                             df = df.xs(ticker, axis=1, level=1)
-                        else:
-                             # 다운로드된 컬럼 구조가 예상과 다른 경우 첫번째 레벨 사용
-                             df.columns = df.columns.get_level_values(0)
+                        df = df.xs(ticker, axis=1, level=1)
                     except:
+                        # 단일 티커 다운로드 시 구조가 다를 수 있음
                         pass
                 
-                # 필수 컬럼 확인
-                required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
-                if not all(col in df.columns for col in required_cols):
-                    continue
-
-                # 지표 계산
-                df = df.copy() # 경고 방지
                 df = IndicatorEngine.calculate_rsi(df['Close'], period=2)
                 df = IndicatorEngine.calculate_sma(df['Close'], period=200)
                 df['MFI'] = IndicatorEngine.calculate_mfi(df['High'], df['Low'], df['Close'], df['Volume'], period=14)
                 df = IndicatorEngine.calculate_adx(df['High'], df['Low'], df['Close'], period=14)
                 df['Volatility'] = IndicatorEngine.calculate_volatility(df['Close'], window=20)
+                
+                # 시뮬레이션용 다음날 시가(Open) 미리 계산
+                df['NextOpen'] = df['Open'].shift(-1) 
                 
                 # NaN 제거 (지표 계산 초반부)
                 df.dropna(inplace=True)
@@ -196,24 +185,25 @@ class StrategyEngine:
         self.data_dict = data_dict
         self.initial_capital = initial_capital
         self.max_holding_days = max_holding_days
-        self.trades =  # 수정됨: 명시적 리스트 초기화
+        self.trades =
         self.equity_curve = {}
 
     def run_backtest(self, start_date, end_date):
         """
         이벤트 기반(Event-driven) 백테스팅 루프.
+        벡터화된 백테스트보다 느리지만, '타임 컷(10일)' 로직을 정확히 구현하기 위해 필수적임.
         """
         # 모든 종목의 날짜 인덱스 통합 및 정렬
         all_dates = sorted(list(set([d for df in self.data_dict.values() for d in df.index if d >= pd.to_datetime(start_date) and d <= pd.to_datetime(end_date)])))
         
         cash = self.initial_capital
-        positions = {} # 구조: {ticker: {'shares': x, 'entry_date': date, 'entry_price': price}}
+        positions = {} # 구조: {ticker: {'shares': x, 'entry_date': date, 'entry_price': price, 'stop_loss': price}}
         
         for current_date in all_dates:
             # ---------------------------------------------------------
             # 1. 청산(Exit) 로직 처리
             # ---------------------------------------------------------
-            tickers_to_sell = # 수정됨: 명시적 리스트 초기화
+            tickers_to_sell =
             
             for ticker, pos in positions.items():
                 df = self.data_dict[ticker]
@@ -226,7 +216,7 @@ class StrategyEngine:
                 price = row['Close']
                 rsi = row
                 
-                # 청산 조건
+                # 청산 조건 [1, 7]
                 # A. 이익 실현: RSI(2) > 75 (과매도 해소 및 슈팅)
                 # B. 타임 컷: 10일 이상 보유 시 무조건 청산 (사용자 제약조건)
                 # C. 손절매 (옵션): 진입가 대비 -10% (안전장치)
@@ -266,11 +256,11 @@ class StrategyEngine:
             # ---------------------------------------------------------
             # 2. 진입(Entry) 로직 처리
             # ---------------------------------------------------------
-            # 최대 보유 종목 수를 제한하여 분산 효과 극대화 (예: 최대 10종목)
+            # 최대 보유 종목 수를 제한하여 분산 효과 극대화 (예: 최대 5~10종목)
             MAX_POSITIONS = 10
             available_slots = MAX_POSITIONS - len(positions)
             
-            candidates = # 수정됨: 명시적 리스트 초기화
+            candidates =
             
             if available_slots > 0:
                 for ticker, df in self.data_dict.items():
@@ -279,7 +269,7 @@ class StrategyEngine:
                     
                     row = df.loc[current_date]
                     
-                    # 진입 조건
+                    # 진입 조건 [1, 3, 23, 24]
                     # 1. 추세: 200일 이평선 위 (상승장)
                     # 2. 과매도: RSI(2) < 10
                     # 3. 국면: ADX > 20 (최소한의 변동성 존재)
@@ -299,38 +289,36 @@ class StrategyEngine:
             # ---------------------------------------------------------
             # 3. 자금 집행 (역변동성 가중 - Risk Parity)
             # ---------------------------------------------------------
+            # [5, 6, 15] 핵심 로직: 변동성이 낮은 종목에 더 많은 비중
             
             if candidates:
-                # 역변동성 점수(인덱스 1)가 높은 순(안정적인 순)으로 정렬하여 상위 종목 선정
-                candidates.sort(key=lambda x: x[1], reverse=True)
+                # 역변동성 점수가 높은 순(안정적인 순)으로 정렬하여 상위 종목 선정
+                candidates.sort(key=lambda x: x, reverse=True)
                 selected = candidates[:available_slots]
                 
                 # 선택된 후보들의 역변동성 총합
-                total_inv_vol = sum([x[1] for x in selected])
+                total_inv_vol = sum([x for x in selected])
                 
                 # 가용 현금의 일부를 사용 (슬롯 당 평균 할당량 고려)
-                # 한번에 현금을 다 쓰지 않고 슬롯 단위로 분할 투입하여 시점 분산(Laddering) 효과 유도
-                current_total_equity = cash + sum([p['shares'] * self.data_dict[t].loc[current_date]['Close'] for t, p in positions.items() if current_date in self.data_dict[t].index])
-                target_cash_per_slot = current_total_equity / MAX_POSITIONS
+                # 한번에 현금을 다 쓰지 않고 슬롯 단위로 분할 투입
+                investable_cash = cash * (len(selected) / MAX_POSITIONS)
                 
                 for ticker, inv_vol, price in selected:
                     # 개별 종목 가중치 계산 (Risk Parity Weight)
-                    # 전체 자산 대비 비중을 계산하되, 현재 가용 현금 범위 내에서 집행
+                    weight = inv_vol / total_inv_vol
                     
-                    # 이번에 투입할 자금: 슬롯당 목표 금액이나 남은 현금 중 작은 것
-                    position_value = min(target_cash_per_slot, cash / len(selected))
+                    # 투입 금액 결정
+                    position_value = investable_cash * weight
                     
                     # 최소 거래 단위 확인 및 매수
                     if position_value > price:
-                        shares = int(position_value / price)
-                        if shares > 0:
-                            cost = shares * price
-                            cash -= cost
-                            positions[ticker] = {
-                                'shares': shares,
-                                'entry_date': current_date,
-                                'entry_price': price
-                            }
+                        shares = position_value / price
+                        cash -= (shares * price)
+                        positions[ticker] = {
+                            'shares': shares,
+                            'entry_date': current_date,
+                            'entry_price': price
+                        }
             
             # ---------------------------------------------------------
             # 4. 자산 가치 평가 (Mark-to-Market)
@@ -406,7 +394,7 @@ if st.button("🚀 전략 백테스트 실행"):
             # 주요 성과 지표 (KPI) 계산
             total_return = (equity_series.iloc[-1] - initial_cap) / initial_cap
             days = (pd.to_datetime(end_date) - pd.to_datetime(start_date)).days
-            annualized_return = ((1 + total_return) ** (365/days)) - 1 if days > 0 else 0
+            annualized_return = ((1 + total_return) ** (365/days)) - 1
             
             daily_ret = equity_series.pct_change().dropna()
             volatility = daily_ret.std() * np.sqrt(252)
