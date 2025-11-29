@@ -186,35 +186,43 @@ def get_precise_data(tickers_list):
     if not tickers_list:
         return {}, {}
 
+    # 국내 / 해외 분리
     kr_tickers = [t for t in tickers_list if t.endswith('.KS') or t.endswith('.KQ')]
     us_tickers = [t for t in tickers_list if t not in kr_tickers]
 
-    # 1. 미국 주식
+    # 1. 미국(및 yfinance로 받는 나머지) 주식 히스토리 + 1분 데이터
     hist_map, realtime_map = get_bulk_us_data(us_tickers)
 
-    # 2. 국내 주식
-    with concurrent.futures.ThreadPoolExecutor() as executor:
+    # 2. 국내 주식 (네이버 실시간 + FDR 히스토리)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         fut_real = [executor.submit(fetch_kr_polling, t) for t in kr_tickers]
         fut_hist = [executor.submit(fetch_kr_history, t) for t in kr_tickers]
 
-        for f in concurrent.futures.as_completed(fut_real):
+        # ----- (1) 네이버 실시간: 3초 타임아웃 -----
+        for f in fut_real:
             try:
-                tk, p = f.result()
+                tk, p = f.result(timeout=3)  # ★ 여기서 오래 걸리면 3초 후 버리고 넘어감
                 if p:
                     realtime_map[tk] = p
+            except concurrent.futures.TimeoutError:
+                # 이 티커는 네이버 응답 너무 느림 → 그냥 무시
+                continue
             except Exception:
-                pass
+                continue
 
-        for f in concurrent.futures.as_completed(fut_hist):
+        # ----- (2) FDR 히스토리: 5초 타임아웃 -----
+        for f in fut_hist:
             try:
-                tk, df = f.result()
+                tk, df = f.result(timeout=5)  # ★ 여기도 5초 후 포기
                 if df is not None and not df.empty:
                     hist_map[tk] = df
+            except concurrent.futures.TimeoutError:
+                # 특정 종목 DataReader가 안 끝나는 경우 → 이 종목만 스킵
+                continue
             except Exception:
-                pass
+                continue
 
     return hist_map, realtime_map
-
 
 # ---------------------------------------------------------
 # 3. 분석 엔진 (백테스트와 완전 동일한 지표/점수 로직)
