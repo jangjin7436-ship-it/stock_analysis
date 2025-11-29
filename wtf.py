@@ -36,7 +36,7 @@ def prepare_stock_data(ticker_info, start_date):
     """
     개별 종목의 데이터를 미리 준비하는 함수
     → 네트워크는 load_price_data에서 캐시되므로
-      여러 번 백테스트를 해도 같은 데이터가 쓰인다.
+      같은 세션/같은 시작일이면 항상 같은 데이터 사용
     """
     code, name = ticker_info
     try:
@@ -50,10 +50,10 @@ def prepare_stock_data(ticker_info, start_date):
         df['Ticker'] = code
         df['Name'] = name
         
-        return df[['Close_Calc', 'AI_Score', 'Ticker', 'Name']]
+        # ★ STD20까지 돌려줘서 포지션 사이징에 사용
+        return df[['Close_Calc', 'AI_Score', 'STD20', 'Ticker', 'Name']]
     except Exception as e:
-        # 여기서 조용히 None만 던져버리면 “어떤 종목이 빠졌는지”가
-        # 매번 달라져서 결과가 바뀌므로, 로그라도 남기는 것을 추천
+        # 원하면 로그 찍기
         # st.write(f"{code} 데이터 오류: {e}")
         return None
 
@@ -263,7 +263,8 @@ def prepare_stock_data(ticker_info, start_date):
         df['Ticker'] = code
         df['Name'] = name
         
-        return df[['Close_Calc', 'AI_Score', 'Ticker', 'Name']]
+        # ★ STD20까지 돌려줘서 포지션 사이징에 사용
+        return df[['Close_Calc', 'AI_Score', 'STD20', 'Ticker', 'Name']]
     except Exception as e:
         # 원하면 로그 찍기
         # st.write(f"{code} 데이터 오류: {e}")
@@ -444,12 +445,20 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
                     reason = "스나이퍼(70↑)"
 
                 if entry_signal:
+                    # 변동성 비율(20일 표준편차 / 가격) 계산
+                    std20 = row.get('STD20', np.nan)
+                    if pd.notna(std20) and price_raw > 0:
+                        vol_ratio = float(std20 / price_raw)  # 일간 변동성 %
+                    else:
+                        vol_ratio = np.nan
+
                     candidates.append({
                         'ticker': ticker,
                         'name': row['Name'],
                         'price_raw': price_raw,
                         'price_krw': price_krw,
                         'score': score,
+                        'vol_ratio': vol_ratio,
                         'reason': reason
                     })
 
@@ -460,13 +469,60 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
             buy_targets = candidates[:open_slots]
 
             if buy_targets:
+                # -------------------------------------------------
+                # ① 기존 방식으로 "총 투자 예산" 먼저 결정
+                #    - use_compound=True  : 남은 현금 balance 기준
+                #    - use_compound=False : 초기자본 / 슬롯 기준
+                # -------------------------------------------------
                 if use_compound:
-                    per_stock_budget = balance / open_slots
+                    base_per_stock_budget = balance / max(open_slots, 1)
                 else:
-                    per_stock_budget = min(balance, initial_capital / max_slots)
+                    base_per_stock_budget = min(balance, initial_capital / max_slots)
 
+                # 예전엔 per_stock_budget * len(buy_targets) 만큼 투자했으니,
+                # 총 예산도 그 수준에 맞춰서 유지
+                total_budget = min(balance, base_per_stock_budget * len(buy_targets))
+
+                # -------------------------------------------------
+                # ② 각 후보별 "위험-보상 가중치" 계산
+                #    weight = (점수 - 50) / 변동성
+                #    → 점수 높고, 변동성 낮을수록 더 많이 배정
+                # -------------------------------------------------
+                weights = []
                 for target in buy_targets:
-                    budget = min(balance, per_stock_budget)
+                    # 점수 50점을 기준으로, 그 이상만 강점으로 사용
+                    score_component = max(1.0, target['score'] - 50.0)
+
+                    vol = target.get('vol_ratio', None)
+                    if vol is None or not np.isfinite(vol) or vol <= 0:
+                        vol = 0.03  # 기본 3% 변동성 가정
+
+                    vol = float(vol)
+                    # 말도 안 되게 작거나 큰 값 방지 (0.5% ~ 10% 사이로 자름)
+                    vol = max(0.005, min(vol, 0.10))
+
+                    # 점수 ↑, 변동성 ↓ → weight 커짐
+                    weight = score_component / vol
+                    weights.append(weight)
+
+                weight_sum = float(sum(weights))
+                if weight_sum <= 0:
+                    # 혹시 모를 예외: 전부 0이면 균등 배분
+                    weights = [1.0 for _ in buy_targets]
+                    weight_sum = float(len(buy_targets))
+
+                # -------------------------------------------------
+                # ③ 가중치 비율대로 총 예산을 나눠서 "몇 주 살지" 결정
+                # -------------------------------------------------
+                for target, w in zip(buy_targets, weights):
+                    if total_budget <= 0 or balance <= 0:
+                        break
+
+                    # 이 종목에 배정된 이론상 예산
+                    target_budget = total_budget * (w / weight_sum)
+
+                    # 실제 사용 가능한 현금 한도 내에서만 사용
+                    budget = min(balance, target_budget)
                     fee_buy = 0.00015 if ".KS" in target['ticker'] else 0.001
 
                     if target['price_krw'] > 0:
@@ -477,6 +533,7 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
                     if shares > 0:
                         cost = shares * target['price_krw'] * (1 + fee_buy)
                         balance -= cost
+                        total_budget -= cost  # 전체 예산에서도 차감
 
                         portfolio[target['ticker']] = {
                             'name': target['name'],
