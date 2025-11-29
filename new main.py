@@ -671,7 +671,6 @@ with tab3:
         * **정배열 가산점 (Golden Alignment):** `5일선 > 20일선 > 60일선` 순서로 정렬된 경우, 상승 에너지가 가장 강한 상태로 판단하여 추가 점수(+10점)를 부여합니다.
         * **역배열 감점 (Death Alignment):** 모든 이평선 아래에 주가가 위치하면 '하락장'으로 간주하여 강력한 페널티(-20점)를 부과합니다.
         """)
-        [Image of stock market moving average chart]
 
     with st.expander("② 황금 눌림목 (The Golden Dip) - 고수익의 비밀", expanded=True):
         st.markdown("""
