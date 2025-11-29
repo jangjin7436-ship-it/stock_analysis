@@ -202,14 +202,21 @@ def get_precise_data(tickers_list):
 # 3. 분석 엔진 (AI Sniper Logic: 2주 스윙 최적화)
 # ---------------------------------------------------------
 
+# ---------------------------------------------------------
+# 3. 분석 엔진 (수정됨: ValueError 해결)
+# ---------------------------------------------------------
+
 def calculate_indicators(df, realtime_price=None):
     """
-    [최적화] 2주 단기 스윙용 지표 (MA10, 볼린저밴드, 거래량 추가)
+    [수정] Volume 데이터 처리 시 발생하는 차원 오류(ValueError) 수정
     """
     if df is None or len(df) < 60:
         return None
 
     df = df.copy()
+
+    # [핵심 수정 1] 인덱스 중복 제거 (yfinance 데이터 오류 방지)
+    df = df[~df.index.duplicated(keep='last')]
 
     # 컬럼 통일
     if 'Close' not in df.columns and 'Adj Close' in df.columns:
@@ -217,6 +224,7 @@ def calculate_indicators(df, realtime_price=None):
     if 'Close' not in df.columns:
         return None
 
+    # Close가 DataFrame(2차원)인 경우 Series(1차원)로 강제 변환
     close = df['Close']
     if isinstance(close, pd.DataFrame):
         close = close.iloc[:, 0]
@@ -230,13 +238,13 @@ def calculate_indicators(df, realtime_price=None):
 
     df['Close_Calc'] = close
 
-    # 1. 이동평균 (MA10 - 스윙 생명선 추가)
+    # 1. 이동평균
     df['MA5'] = df['Close_Calc'].rolling(5).mean()
     df['MA10'] = df['Close_Calc'].rolling(10).mean() 
     df['MA20'] = df['Close_Calc'].rolling(20).mean()
     df['MA60'] = df['Close_Calc'].rolling(60).mean()
     
-    # 2. 볼린저 밴드 (변동성)
+    # 2. 볼린저 밴드
     std = df['Close_Calc'].rolling(20).std()
     df['Upper_Band'] = df['MA20'] + (std * 2)
     df['Lower_Band'] = df['MA20'] - (std * 2)
@@ -259,10 +267,19 @@ def calculate_indicators(df, realtime_price=None):
     df['MACD_Hist'] = df['MACD'] - df['Signal_Line']
     df['Prev_MACD_Hist'] = df['MACD_Hist'].shift(1)
     
-    # 5. 거래량
+    # 5. 거래량 (여기가 에러 발생 지점 -> 수정됨)
     if 'Volume' in df.columns:
-        df['Vol_MA20'] = df['Volume'].rolling(20).mean()
-        df['Vol_Ratio'] = df['Volume'] / df['Vol_MA20']
+        vol = df['Volume']
+        # [핵심 수정 2] Volume이 DataFrame일 경우 Series로 변환
+        if isinstance(vol, pd.DataFrame):
+            vol = vol.iloc[:, 0]
+            
+        df['Vol_MA20'] = vol.rolling(20).mean()
+        
+        # 0으로 나누기 오류 방지
+        denom = df['Vol_MA20'].replace(0, np.nan)
+        df['Vol_Ratio'] = vol / denom
+        df['Vol_Ratio'] = df['Vol_Ratio'].fillna(0) # NaN 처리
     else:
         df['Vol_Ratio'] = 1.0 
 
