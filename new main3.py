@@ -570,6 +570,19 @@ with tab1:
                         if df_indi is None or df_indi.empty:
                             continue
 
+                        # 🔥 거래량 비율(Volume Ratio) 계산: 최근 거래량 / 20일 평균 거래량
+                        vol_ratio = np.nan
+                        try:
+                            if "Volume" in df_tk.columns:
+                                vol_series = df_tk["Volume"].astype(float).dropna()
+                                if len(vol_series) >= 20:
+                                    last_vol = float(vol_series.iloc[-1])
+                                    mean_vol20 = float(vol_series.tail(20).mean())
+                                    if mean_vol20 > 0:
+                                        vol_ratio = last_vol / mean_vol20
+                        except Exception:
+                            vol_ratio = np.nan
+
                         # 🔥 백테스트와 동일한 AI_Score/스나이퍼 기준으로 매수/매도 해석
                         cat, col_name, reasoning, score = analyze_advanced_strategy(df_indi)
 
@@ -587,6 +600,7 @@ with tab1:
                             "RSI": rsi_val,
                             "AI 등급": cat,
                             "핵심 요약": reasoning,
+                            "거래량비율": vol_ratio,  # 🔥 추가 필드
                         })
                     except Exception:
                         continue
@@ -601,8 +615,27 @@ with tab1:
                 else:
                     st.error("데이터 수집 실패.")
     if st.session_state['scan_result_df'] is not None:
+        df_scan = st.session_state['scan_result_df']
+
+        # 🔥 AI 점수 100점 종목이 5개 초과일 때, 거래량 비율 상위 5개 추천
+        try:
+            if "점수" in df_scan.columns:
+                df_100 = df_scan[df_scan["점수"] == 100.0]
+                if len(df_100) > 5 and "거래량비율" in df_100.columns:
+                    df_100_valid = df_100.dropna(subset=["거래량비율"])
+                    if not df_100_valid.empty:
+                        top5 = df_100_valid.sort_values("거래량비율", ascending=False).head(5)
+                        st.markdown("#### 🔥 AI 점수 100점 + 거래량 비율 상위 5 종목 추천")
+                        st.dataframe(
+                            top5[["종목명", "점수", "현재가", "RSI", "AI 등급", "핵심 요약", "거래량비율"]],
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+        except Exception:
+            pass
+
         st.dataframe(
-            st.session_state['scan_result_df'],
+            df_scan,
             use_container_width=True,
             height=700,
             column_config={
