@@ -82,15 +82,15 @@ USER_WATCHLIST = list(TICKER_MAP.keys())
 
 def fetch_kr_polling(ticker):
     """
-    [New Method V2] 국내 주식 애프터마켓 포함 현재가
-    - 네이버 금융 개별 종목 페이지 HTML에서
-      '오늘의시세 100,500' / '오늘의시세 101,500' 패턴을 찾아
-      가장 마지막 값을 사용 (시간외 단일가까지 반영)
+    [Final] 국내 주식 현재가 = 시간외 단일가(있으면) 우선 사용
+    - 네이버 domestic realtime API 사용
+    - overMarketPriceInfo.overPrice 가 존재하면 그 값을 사용
+    - 없으면 정규장 closePrice 로 폴백
     """
-    code = ticker.split('.')[0]
+    code = ticker.split('.')[0]  # "005930.KS" -> "005930"
 
     try:
-        url = f"https://finance.naver.com/item/main.nhn?code={code}"
+        url = f"https://polling.finance.naver.com/api/realtime/domestic/stock/{code}"
         headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -101,36 +101,31 @@ def fetch_kr_polling(ticker):
         }
         res = requests.get(url, headers=headers, timeout=3)
         res.raise_for_status()
+        data = res.json()
 
-        # 네이버 금융은 EUC-KR 기반
-        res.encoding = "euc-kr"
-        html = res.text
+        datas = data.get("datas", [])
+        if not datas:
+            raise ValueError("no datas in naver realtime response")
 
-        # '오늘의시세 100,500' / '오늘의시세 101,500' 에서 숫자 부분만 추출
-        prices = re.findall(r"오늘의시세\s*([0-9,]+)", html)
-        if prices:
-            # 가장 마지막 값 = 시간외 포함한 최신 시세
-            last_price = float(prices[-1].replace(",", ""))
-            return (ticker, last_price)
+        item = datas[0]
 
-        # 혹시 몰라 '현재가 101,500' 패턴도 한 번 더 시도
-        prices = re.findall(r"현재가\s*([0-9,]+)\s*원?", html)
-        if prices:
-            last_price = float(prices[-1].replace(",", ""))
-            return (ticker, last_price)
+        # 1️⃣ 시간외 단일가가 있으면 그걸 우선 사용
+        over_info = item.get("overMarketPriceInfo") or {}
+        over_price_str = str(over_info.get("overPrice", "")).replace(",", "").strip()
 
-        # 위 패턴이 안 잡히면 FDR 종가로 폴백
-        try:
-            df = fdr.DataReader(code, "2023-01-01")
-            if not df.empty:
-                return (ticker, float(df["Close"].iloc[-1]))
-        except Exception:
-            pass
+        if over_price_str and over_price_str != "0":
+            return (ticker, float(over_price_str))
 
-        return (ticker, None)
+        # 2️⃣ 시간외 정보가 없으면 정규장 종가 사용
+        close_price_str = str(item.get("closePrice", "")).replace(",", "").strip()
+        if close_price_str:
+            return (ticker, float(close_price_str))
+
+        # 3️⃣ 둘 다 없으면 실패 처리 -> 아래 FDR 폴백
+        raise ValueError("no price field in naver realtime response")
 
     except Exception:
-        # 네트워크 오류 등은 그대로 FDR로 폴백
+        # 네이버 API 실패 시 FDR 종가로 폴백 (애프터마켓은 아님)
         try:
             df = fdr.DataReader(code, "2023-01-01")
             if not df.empty:
@@ -138,6 +133,7 @@ def fetch_kr_polling(ticker):
         except Exception:
             pass
         return (ticker, None)
+
 
 def fetch_us_1m_candle(ticker):
     """
