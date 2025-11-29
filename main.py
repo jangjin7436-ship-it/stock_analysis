@@ -1,12 +1,12 @@
 import streamlit as st
 import yfinance as yf
+import FinanceDataReader as fdr  # 한국 주식 실시간 데이터용
 import pandas as pd
 import numpy as np
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 import datetime
 import time
 import json
+import concurrent.futures
 
 # ---------------------------------------------------------
 # 0. 파이어베이스(DB) 설정 (서버 저장용)
@@ -41,11 +41,9 @@ def get_db():
 # ---------------------------------------------------------
 st.set_page_config(page_title="AI 주식 스캐너 Pro", page_icon="📈", layout="wide")
 
-# 세션 상태 초기화
 if 'scan_result_df' not in st.session_state:
     st.session_state['scan_result_df'] = None
 
-# 종목 코드와 한글명 매핑
 TICKER_MAP = {
     "INTC": "인텔 (Intel)", "005290.KS": "동진쎄미켐", "SOXL": "반도체 3X(Bull)", 
     "316140.KS": "우리금융지주", "WDC": "웨스턴디지털", "NFLX": "넷플릭스", 
@@ -71,144 +69,208 @@ TICKER_MAP = {
     "TSLA": "테슬라", "AMD": "AMD", "BITX": "비트코인 2X", "TSLL": "테슬라 1.5X"
 }
 
-# 검색용 리스트
 SEARCH_LIST = [f"{name} ({code})" for code, name in TICKER_MAP.items()]
 SEARCH_MAP = {f"{name} ({code})": code for code, name in TICKER_MAP.items()}
 USER_WATCHLIST = list(TICKER_MAP.keys())
 
 # ---------------------------------------------------------
-# 2. 데이터 로드 및 지표 계산
+# 2. 데이터 수집 및 지표 계산 (볼린저밴드 추가)
 # ---------------------------------------------------------
-# 중요: 가격 괴리를 줄이기 위해 캐시 유지 시간을 10초로 대폭 단축
-@st.cache_data(ttl=10)
-def get_bulk_data(tickers_list):
-    """데이터 다운로드 (2년치) - 실시간성 강화"""
-    # prepost=True: 장전/장후 거래 데이터 포함 (최신가 반영 확률 높임)
-    data = yf.download(tickers_list, period="2y", group_by='ticker', threads=True, prepost=True)
-    return data
+def fetch_single_kr_stock(ticker):
+    try:
+        code = ticker.split('.')[0]
+        df = fdr.DataReader(code, '2023-01-01')
+        if df.empty: return None
+        return (ticker, df)
+    except:
+        return None
+
+@st.cache_data(ttl=5)
+def get_hybrid_data(tickers_list):
+    kr_tickers = [t for t in tickers_list if t.endswith('.KS') or t.endswith('.KQ')]
+    us_tickers = [t for t in tickers_list if t not in kr_tickers]
+    combined_data = {}
+
+    if kr_tickers:
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future_to_ticker = {executor.submit(fetch_single_kr_stock, t): t for t in kr_tickers}
+            for future in concurrent.futures.as_completed(future_to_ticker):
+                result = future.result()
+                if result:
+                    ticker, df = result
+                    combined_data[ticker] = df
+
+    if us_tickers:
+        yf_data = yf.download(us_tickers, period="2y", group_by='ticker', threads=True, prepost=True)
+        if len(us_tickers) == 1:
+            combined_data[us_tickers[0]] = yf_data
+        else:
+            for t in us_tickers:
+                try:
+                    if isinstance(yf_data.columns, pd.MultiIndex):
+                        df = yf_data.xs(t, axis=1, level=1)
+                    else: df = yf_data
+                    if not df.empty: combined_data[t] = df
+                except: pass
+                    
+    return combined_data
 
 def calculate_indicators(df):
     if len(df) < 60: return None
     df = df.copy()
-    # ffill로 결측치 채우되, 마지막 데이터가 NaN이면 삭제하지 않고 유지
     df['Close'] = df['Close'].ffill()
 
-    # 이평선
+    # 1. 이동평균선
     df['MA20'] = df['Close'].rolling(window=20).mean()
     df['MA60'] = df['Close'].rolling(window=60).mean()
     
-    # RSI
+    # 2. 거래량 이동평균
+    if 'Volume' in df.columns:
+        df['VolMA20'] = df['Volume'].rolling(window=20).mean()
+    else:
+        df['VolMA20'] = 0
+
+    # 3. RSI
     delta = df['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs = gain / loss
     df['RSI'] = 100 - (100 / (1 + rs))
 
-    # MACD
+    # 4. MACD
     exp12 = df['Close'].ewm(span=12, adjust=False).mean()
     exp26 = df['Close'].ewm(span=26, adjust=False).mean()
     df['MACD'] = exp12 - exp26
     df['Signal_Line'] = df['MACD'].ewm(span=9, adjust=False).mean()
+
+    # 5. 볼린저 밴드 (Bollinger Bands) - 안전성 지표 핵심
+    df['STD20'] = df['Close'].rolling(window=20).std()
+    df['BB_Upper'] = df['MA20'] + (df['STD20'] * 2)
+    df['BB_Lower'] = df['MA20'] - (df['STD20'] * 2)
     
     return df.dropna()
 
 def calculate_net_profit(ticker, avg_price, current_price):
-    """
-    토스 증권 수수료 반영 수익률 계산
-    """
     is_kr = ticker.endswith(".KS") or ticker.endswith(".KQ")
+    # 토스증권 역산 수수료 적용
+    if is_kr: fee_tax_rate = 0.0018 
+    else: fee_tax_rate = 0.002
     
-    if is_kr:
-        sell_fee_rate = 0.00015 + 0.0018  # 0.195%
-    else:
-        sell_fee_rate = 0.001  # 0.1%
-        
-    net_sell_price = current_price * (1 - sell_fee_rate)
+    net_sell_price = current_price * (1 - fee_tax_rate)
     profit_amt = net_sell_price - avg_price
     profit_pct = (profit_amt / avg_price) * 100
-    
     currency = "₩" if is_kr else "$"
     
     return profit_pct, profit_amt, currency
 
 # ---------------------------------------------------------
-# 3. 고도화된 전략 분석 & 점수화 (Scoring)
+# 3. 정밀 알고리즘 (Scoring Logic V2)
 # ---------------------------------------------------------
 def analyze_advanced_strategy(df):
     if df is None or df.empty: return "분석 불가", "gray", "데이터 부족", 0
     
+    # 데이터 추출
     curr = df['Close'].iloc[-1]
     ma20 = df['MA20'].iloc[-1]
     ma60 = df['MA60'].iloc[-1]
     rsi = df['RSI'].iloc[-1]
     macd = df['MACD'].iloc[-1]
     sig = df['Signal_Line'].iloc[-1]
+    bb_upper = df['BB_Upper'].iloc[-1]
+    bb_lower = df['BB_Lower'].iloc[-1]
+    vol = df['Volume'].iloc[-1] if 'Volume' in df.columns else 0
+    vol_ma = df['VolMA20'].iloc[-1] if 'VolMA20' in df.columns else 0
+
     prev_macd = df['MACD'].iloc[-2]
     prev_sig = df['Signal_Line'].iloc[-2]
 
-    # 상태 변수
-    trend_up = curr > ma60
-    above_ma20 = curr > ma20
-    golden_cross = (macd > sig) and (prev_macd <= prev_sig)
-    dead_cross = (macd < sig) and (prev_macd >= prev_sig)
-    oversold = rsi < 35
-    overbought = rsi > 70
-    dip_buy = trend_up and (curr <= ma20 * 1.02) and (curr >= ma20 * 0.98) 
+    # --- [점수 산정 로직 시작] 기본 50점 ---
+    score = 50
+    reasons = []
 
-    # --- 점수 계산 로직 (0 ~ 100점) ---
-    score = 50 # 기본 점수
+    # 1. 추세 (Trend) - 안전의 기본 (Max +30, Min -30)
+    # 정배열(장기 상승 추세)일 때 가장 안전함
+    if curr > ma60:
+        score += 15
+        if curr > ma20: 
+            score += 10 # 단기/장기 모두 상승세
+        else:
+            # 주가가 60일선 위지만 20일선 아래 -> 단기 조정(눌림목 가능성)
+            score -= 5 
+    else:
+        score -= 20 # 역배열(하락 추세)은 위험
+        if curr < ma20:
+            score -= 10 # 단기/장기 모두 하락세
+
+    # 2. 지지선과 저점 매수 (Support) - 수익 극대화 (Max +30)
+    # 볼린저 밴드 하단이나 MA20 근처에서 사는 것이 가장 싸게 사는 법
+    dist_to_ma20 = (curr - ma20) / ma20
     
-    if trend_up: score += 20
-    else: score -= 20
+    # 눌림목 패턴: 상승 추세(>MA60)이면서 20일선에 근접(-2% ~ +2%)
+    if curr > ma60 and abs(dist_to_ma20) <= 0.02:
+        score += 25
+        reasons.append("💎 황금 눌림목 (상승장 속 조정)")
     
-    if above_ma20: score += 10
-    else: score -= 10
+    # 볼린저 밴드 하단 터치 (과매도 반등 기대)
+    if curr <= bb_lower * 1.02:
+        score += 15
+        reasons.append("📉 볼린저 밴드 하단 (저점 매수 기회)")
     
-    if golden_cross: score += 15
-    if dead_cross: score -= 15
-    
-    if dip_buy: score += 15 # 눌림목 가산점
-    
-    if oversold: score += 10 # 과매도 반등 기대
-    if overbought: score -= 10 # 과열 주의
-    
-    # 점수 보정 (0~100)
+    # 볼린저 밴드 상단 돌파 (과열 경고)
+    if curr >= bb_upper * 0.98:
+        score -= 10
+        reasons.append("⚠️ 볼린저 밴드 상단 (고점 부담)")
+
+    # 3. 모멘텀 (Momentum) - 타이밍 (Max +20)
+    # MACD 골든크로스
+    if macd > sig and prev_macd <= prev_sig:
+        score += 15
+        reasons.append("⚡ MACD 골든크로스 (상승 전환)")
+    elif macd > sig:
+        score += 5 # 상승 추세 유지
+    elif macd < sig and prev_macd >= prev_sig:
+        score -= 15
+        reasons.append("💧 MACD 데드크로스 (하락 전환)")
+
+    # 4. 거래량 (Volume) - 신뢰도 (Max +10)
+    # 거래량이 터지면서 상승하면 진짜 상승
+    if vol > vol_ma * 1.5 and curr > df['Open'].iloc[-1]:
+        score += 10
+        reasons.append("🔥 거래량 폭발 (매수세 유입)")
+
+    # 5. 과열/침체 (RSI) - 리스크 관리 (Max +10, Min -20)
+    if rsi < 30:
+        score += 15
+        reasons.append("zzZ 과매도 구간 (기술적 반등 기대)")
+    elif rsi > 75:
+        score -= 20
+        reasons.append("🔥 RSI 과열 (단기 고점 위험)")
+    elif 30 <= rsi <= 50:
+        score += 5 # 안정적인 구간
+
+    # 점수 보정 (0 ~ 100)
     score = max(0, min(100, score))
 
-    # --- 등급 및 코멘트 ---
-    reasons = []
-    category = "중립/관망 (Hold)"
-    color_name = "gray" # Streamlit color name
+    # --- 최종 등급 결정 ---
+    category = "관망 (Neutral)"
+    color_name = "gray"
 
-    # 점수 기반 등급 분류 (우선순위)
-    if score >= 85:
+    if score >= 80:
         category = "🚀 강력 매수 (Strong Buy)"
         color_name = "green"
-        if dip_buy: reasons.append("상승 추세 속 '눌림목' 완벽한 기회")
-        if golden_cross: reasons.append("MACD 골든크로스 발생")
-    elif score >= 65:
+    elif score >= 60:
         category = "📈 매수 (Buy)"
         color_name = "blue"
-        if trend_up: reasons.append("상승 추세 유지 중")
-        if oversold: reasons.append(f"과매도(RSI {rsi:.0f}) 저점 매수 기회")
     elif score <= 20:
         category = "💥 강력 매도 (Strong Sell)"
-        color_name = "red" # orange or red
-        reasons.append("하락 추세 가속화, 위험")
+        color_name = "red"
     elif score <= 40:
         category = "📉 매도 (Sell)"
         color_name = "red"
-        if dead_cross: reasons.append("데드크로스 발생 (하락 전환)")
-        if overbought: reasons.append("과열권 차익실현 권고")
     else:
         category = "👀 관망 (Neutral)"
         color_name = "gray"
-        if not trend_up and above_ma20: reasons.append("단기 반등 중이나 추세 불안")
-        else: reasons.append("뚜렷한 방향성 없음")
-
-    if not reasons:
-        if rsi > 50: reasons.append("추세 지속 여부 관찰")
-        else: reasons.append("모멘텀 부족")
+        if not reasons: reasons.append("뚜렷한 방향성 없음")
 
     return category, color_name, ", ".join(reasons), score
 
@@ -217,12 +279,12 @@ def analyze_advanced_strategy(df):
 # ---------------------------------------------------------
 st.title("📈 AI 주식 스캐너 & 포트폴리오 Pro")
 
-tab1, tab2 = st.tabs(["🚀 전체 종목 스캐너", "💼 내 포트폴리오 (서버 저장)"])
+tab1, tab2, tab3 = st.tabs(["🚀 전체 종목 스캐너", "💼 내 포트폴리오 (서버 저장)", "📘 알고리즘 설명서"])
 
 # === TAB 1: 스캐너 ===
 with tab1:
-    st.markdown("### 📋 시장 전체 스캔 및 AI 점수")
-    st.caption("AI 점수가 높은 순서대로 '구매 우선순위'를 보여줍니다.")
+    st.markdown("### 📋 AI 정밀 스캐너")
+    st.caption("안전성(저점 매수)과 수익성(추세/모멘텀)을 종합 평가하여 점수를 매깁니다.")
 
     col_btn, col_info = st.columns([1, 4])
     with col_btn:
@@ -232,22 +294,18 @@ with tab1:
 
     if st.session_state['scan_result_df'] is None:
         if st.button("🔍 전체 리스트 정밀 분석 시작"):
-            with st.spinner('AI가 전 종목을 채점 중입니다... (15~20초 소요)'):
-                raw_data = get_bulk_data(USER_WATCHLIST)
+            with st.spinner('AI가 5가지 지표(추세/눌림목/MACD/RSI/볼린저)를 분석 중입니다...'):
+                raw_data_dict = get_hybrid_data(USER_WATCHLIST)
                 scan_results = []
                 progress_bar = st.progress(0)
                 
                 for i, ticker_code in enumerate(USER_WATCHLIST):
+                    if ticker_code not in raw_data_dict: continue
                     try:
-                        if isinstance(raw_data.columns, pd.MultiIndex):
-                            try: df_ticker = raw_data.xs(ticker_code, axis=1, level=1)
-                            except: df_ticker = raw_data[ticker_code]
-                        else: df_ticker = raw_data
+                        df_tk = raw_data_dict[ticker_code].dropna(how='all')
+                        if df_tk.empty: continue
                         
-                        df_ticker = df_ticker.dropna(how='all')
-                        if df_ticker.empty: continue
-                        
-                        df_indi = calculate_indicators(df_ticker)
+                        df_indi = calculate_indicators(df_tk)
                         if df_indi is None: continue
 
                         cat, col_name, reasoning, score = analyze_advanced_strategy(df_indi)
@@ -255,21 +313,12 @@ with tab1:
                         rsi_val = df_indi['RSI'].iloc[-1]
                         name = TICKER_MAP.get(ticker_code, ticker_code)
                         
-                        # 화폐 단위 및 티커 표시 처리
                         is_kr = ticker_code.endswith(".KS") or ticker_code.endswith(".KQ")
-                        currency_symbol = "₩" if is_kr else "$"
-                        
-                        # 이름에 코드 추가 (예: 나스닥 3X(Bull) (TQQQ))
-                        display_name = f"{name} ({ticker_code})"
-                        
-                        # 가격 포맷팅 (문자열로 변환하여 단위 표시)
-                        if is_kr:
-                            fmt_price = f"{currency_symbol}{curr_price:,.0f}"
-                        else:
-                            fmt_price = f"{currency_symbol}{curr_price:,.2f}"
+                        sym = "₩" if is_kr else "$"
+                        fmt_price = f"{sym}{curr_price:,.0f}" if is_kr else f"{sym}{curr_price:,.2f}"
 
                         scan_results.append({
-                            "종목명": display_name,
+                            "종목명": f"{name} ({ticker_code})",
                             "점수": score,
                             "현재가": fmt_price,
                             "RSI": rsi_val,
@@ -281,13 +330,12 @@ with tab1:
                 
                 if scan_results:
                     df_res = pd.DataFrame(scan_results)
-                    # 점수 높은 순 정렬
                     df_res = df_res.sort_values('점수', ascending=False)
                     st.session_state['scan_result_df'] = df_res
                     st.success("분석 완료!")
                     st.rerun()
                 else:
-                    st.error("데이터를 가져오지 못했습니다.")
+                    st.error("데이터 수집 실패.")
     
     if st.session_state['scan_result_df'] is not None:
         st.dataframe(
@@ -296,10 +344,8 @@ with tab1:
             height=700,
             column_config={
                 "종목명": st.column_config.TextColumn("종목명 (코드)", width="medium"),
-                "점수": st.column_config.ProgressColumn(
-                    "AI 구매 매력도", format="%d점", min_value=0, max_value=100
-                ),
-                "현재가": st.column_config.TextColumn("현재가"), # TextColumn으로 변경하여 화폐 단위 표시
+                "점수": st.column_config.ProgressColumn("AI 점수", format="%d점", min_value=0, max_value=100),
+                "현재가": st.column_config.TextColumn("현재가"), 
                 "RSI": st.column_config.NumberColumn("RSI", format="%.1f"),
                 "AI 등급": st.column_config.TextColumn("AI 판단"),
                 "핵심 요약": st.column_config.TextColumn("분석 내용", width="large"),
@@ -310,6 +356,7 @@ with tab1:
 # === TAB 2: 포트폴리오 ===
 with tab2:
     st.markdown("### ☁️ 내 자산 포트폴리오")
+    st.caption("수수료/세금 적용: 국내(약 0.18%), 해외(약 0.2%)")
     
     db = get_db()
     if not db:
@@ -317,26 +364,18 @@ with tab2:
     else:
         col_u1, col_u2 = st.columns([1, 3])
         with col_u1:
-            # 닉네임 기본값 "장동진" 적용
             user_id = st.text_input("닉네임 입력", value="장동진")
-        
         doc_ref = db.collection('portfolios').document(user_id)
-        
         try:
             doc = doc_ref.get()
             pf_data = doc.to_dict().get('stocks', []) if doc.exists else []
         except: pf_data = []
 
-        # === 종목 추가 UI ===
         with st.container():
             st.markdown("#### ➕ 종목 추가")
             c1, c2, c3 = st.columns([2, 1, 1])
             with c1:
-                selected_item = st.selectbox(
-                    "종목 검색 (이름 또는 코드 입력)", 
-                    options=["선택하세요"] + SEARCH_LIST,
-                    index=0
-                )
+                selected_item = st.selectbox("종목 검색", ["선택하세요"] + SEARCH_LIST)
             with c2:
                 input_price = st.number_input("내 평단가", min_value=0.0, format="%.2f")
             with c3:
@@ -348,102 +387,97 @@ with tab2:
                         new_pf_data = [p for p in pf_data if p['ticker'] != target_code]
                         new_pf_data.append({"ticker": target_code, "price": input_price})
                         doc_ref.set({'stocks': new_pf_data})
-                        st.success(f"{selected_item} 추가 완료!")
+                        st.success("추가 완료!")
                         time.sleep(0.5)
                         st.rerun()
-                    else:
-                        st.warning("종목을 선택해주세요.")
 
         st.divider()
 
         if pf_data:
             st.subheader(f"{user_id}님의 보유 종목 진단")
-            st.caption("※ 가격은 실시간 업데이트되지만, 무료 데이터 특성상 15~20분 지연될 수 있습니다.")
-            
             my_tickers = [p['ticker'] for p in pf_data]
-            with st.spinner("최신 시세 조회 중..."):
-                # 캐시 TTL 적용된 함수 호출
-                my_raw = get_bulk_data(my_tickers)
+            with st.spinner("실시간 시세 조회 중..."):
+                raw_data_dict = get_hybrid_data(my_tickers)
             
-            # 보유 종목도 AI 점수 순으로 정렬해서 보여주기 위해 리스트 생성
             display_list = []
-
             for item in pf_data:
                 tk = item['ticker']
-                avg = item['price']
-                name = TICKER_MAP.get(tk, tk)
-                
+                if tk not in raw_data_dict: continue
                 try:
-                    if isinstance(my_raw.columns, pd.MultiIndex):
-                        try: df_tk = my_raw.xs(tk, axis=1, level=1)
-                        except: df_tk = my_raw[tk]
-                    else: df_tk = my_raw
-
-                    df_tk = df_tk.dropna(how='all')
+                    df_tk = raw_data_dict[tk].dropna(how='all')
                     df_indi = calculate_indicators(df_tk)
-                    
                     if df_indi is None: continue
 
                     cat, col_name, reasoning, score = analyze_advanced_strategy(df_indi)
                     curr = df_indi['Close'].iloc[-1]
-                    
+                    avg = item['price']
                     profit_pct, profit_amt, currency = calculate_net_profit(tk, avg, curr)
                     
                     display_list.append({
-                        "name": name, "tk": tk, "avg": avg, "curr": curr,
+                        "name": TICKER_MAP.get(tk, tk), "tk": tk, "avg": avg, "curr": curr,
                         "cat": cat, "col_name": col_name, "reasoning": reasoning,
                         "profit_pct": profit_pct, "profit_amt": profit_amt,
                         "currency": currency, "score": score
                     })
                 except: pass
             
-            # 점수 높은 순(혹은 다른 기준)으로 정렬 가능, 여기선 입력 순서 유지하되 카드형태 출력
-            # display_list.sort(key=lambda x: x['score'], reverse=True) # 점수순 정렬을 원하면 주석 해제
+            # 점수 높은 순 정렬 (보유 종목 중 좋은 것부터 보기)
+            display_list.sort(key=lambda x: x['score'], reverse=True)
 
             for item in display_list:
-                # 카드 UI
                 with st.container():
                     c1, c2, c3 = st.columns([1.5, 1.5, 4])
-                    
                     with c1:
                         st.markdown(f"### {item['name']}")
                         st.caption(f"{item['tk']}")
-                    
                     with c2:
-                        # 통화 기호 일치시키기 (미국 주식도 $ 표시)
-                        cur_sym = item['currency']
+                        sym = item['currency'].replace("$", "\$")
+                        fmt_curr = f"{item['curr']:,.0f}" if item['currency'] == "₩" else f"{item['curr']:,.2f}"
+                        fmt_avg = f"{item['avg']:,.0f}" if item['currency'] == "₩" else f"{item['avg']:,.2f}"
+                        fmt_diff = f"{item['profit_amt']:,.0f}" if item['currency'] == "₩" else f"{item['profit_amt']:,.2f}"
                         
-                        # 중요: 달러 기호($)가 Markdown LaTeX로 인식되어 폰트가 깨지는 문제 해결
-                        # 화면 표시용 기호에는 Escape 문자(\)를 추가하여 일반 텍스트로 렌더링되게 함
-                        display_sym = cur_sym.replace("$", "\$") 
-                        
-                        if cur_sym == "₩":
-                            fmt_curr = f"{item['curr']:,.0f}"
-                            fmt_avg = f"{item['avg']:,.0f}"
-                            fmt_diff = f"{item['profit_amt']:,.0f}"
-                        else:
-                            fmt_curr = f"{item['curr']:,.2f}"
-                            fmt_avg = f"{item['avg']:,.2f}"
-                            fmt_diff = f"{item['profit_amt']:,.2f}"
-                            
-                        st.metric(
-                            "순수익률 (수수료 제)", 
-                            f"{item['profit_pct']:.2f}%", 
-                            delta=f"{display_sym}{fmt_diff}"
-                        )
-                        # 평단/현재가 폰트 및 포맷 통일 (Escape된 심볼 사용)
-                        st.markdown(f"<small style='color: gray'>평단: {display_sym}{fmt_avg} / 현재: {display_sym}{fmt_curr}</small>", unsafe_allow_html=True)
-                        
+                        st.metric("순수익률", f"{item['profit_pct']:.2f}%", delta=f"{sym}{fmt_diff}")
+                        st.markdown(f"<small style='color: gray'>평단: {sym}{fmt_avg} / 현재: {sym}{fmt_curr}</small>", unsafe_allow_html=True)
                     with c3:
-                        # 글씨 깨짐 수정: Streamlit 공식 컬러 사용 (:green, :blue 등)
                         st.markdown(f"**AI 점수: {item['score']}점**")
                         st.markdown(f"**판단:** :{item['col_name']}[{item['cat']}]")
                         st.info(f"💡 {item['reasoning']}")
-                    
                     st.divider()
 
             if st.button("🗑️ 포트폴리오 전체 삭제"):
                 doc_ref.delete()
                 st.rerun()
-        else:
-            st.info("위 검색창에서 종목을 검색하여 추가해주세요.")
+
+# === TAB 3: 알고리즘 설명서 ===
+with tab3:
+    st.markdown("## 📘 AI 투자 전략 알고리즘 가이드 (V2.0)")
+    st.markdown("""
+    단순한 지표 합산이 아닌, **'수익은 길게, 손실은 짧게'** 가져가는 프로 트레이더의 로직을 구현했습니다.
+    """)
+
+    st.divider()
+    st.subheader("1. 💯 점수 산정 로직 (Total 100점)")
+    st.markdown("기본 50점에서 시작하여 아래 5가지 핵심 요소를 평가합니다.")
+
+    score_table = pd.DataFrame({
+        "평가 요소": ["추세 (Trend)", "지지 (Support)", "모멘텀 (Momentum)", "거래량 (Volume)", "리스크 (Risk)"],
+        "내용": ["60일선/20일선 위에 있는가?", "싸게 살 수 있는 자리인가? (눌림목/볼린저 하단)", "상승 에너지가 강한가? (MACD)", "세력이 들어왔는가?", "너무 비싸진 않은가? (과열)"],
+        "배점": ["±15~25점", "+15~25점 (가산점)", "±15점", "+10점", "±10~20점"]
+    })
+    st.table(score_table)
+
+    st.info("""
+    **💎 황금 눌림목이란?**
+    주가가 장기적으로는 상승 추세인데, 단기적으로 살짝 하락하여 **20일 이동평균선**에 닿은 상태입니다.
+    가장 안전하면서도 큰 수익을 낼 수 있는 '최적의 매수 타이밍'으로 분류되어 **가장 높은 가산점(+25점)**을 받습니다.
+    """)
+
+    st.divider()
+    st.subheader("2. 🚦 등급 분류 기준")
+    st.markdown("""
+    * **🚀 강력 매수 (80점 이상):** 상승 추세 + 눌림목 or 골든크로스 등 호재가 겹친 완벽한 타이밍
+    * **📈 매수 (60~79점):** 추세가 살아있거나, 과매도권에서 반등이 시작되는 구간
+    * **👀 관망 (41~59점):** 방향성이 없거나, 리스크와 기대수익이 반반인 구간
+    * **📉 매도 (21~40점):** 하락 추세 전환, 혹은 과열권 진입
+    * **💥 강력 매도 (20점 이하):** 역배열 하락 가속화, 즉시 리스크 관리 필요
+    """)
