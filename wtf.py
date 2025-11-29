@@ -407,7 +407,8 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
                     'name': info['name'],
                     'date': date,
                     'type': 'sell',
-                    'price': curr_price_raw,
+                    'price': curr_price_raw,     # 단위: 원 or 달러 (원래 쓰던 그대로)
+                    'shares': info['shares'],    # ★ 이번에 판 수량
                     'score': score,
                     'profit': profit_pct,
                     'reason': sell_reason,
@@ -549,7 +550,8 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
                             'name': target['name'],
                             'date': date,
                             'type': 'buy',
-                            'price': target['price_raw'],
+                            'price': target['price_raw'],   # 체결 단가
+                            'shares': shares,               # ★ 이번에 산 수량
                             'score': target['score'],
                             'profit': 0,
                             'reason': target['reason'],
@@ -835,8 +837,11 @@ with tab4:
             with st.expander("전체 거래 내역 (펼치기/접기)", expanded=True):
                 log_df = trade_df.copy()
                 log_df['date'] = log_df['date'].dt.date
-                log_df = log_df[['date', 'name', 'type', 'price', 'profit', 'score', 'reason']]
-                log_df.columns = ['날짜', '종목명', '구분', '가격', '수익률', 'AI점수', '매매사유']
+
+                # ★ shares 컬럼 포함
+                #    date, name, type, price, shares, profit, score, reason 순으로 정리
+                log_df = log_df[['date', 'name', 'type', 'price', 'shares', 'profit', 'score', 'reason']]
+                log_df.columns = ['날짜', '종목명', '구분', '가격', '수량', '수익률', 'AI점수', '매매사유']
 
                 st.dataframe(
                     log_df.sort_values('날짜', ascending=False),
@@ -845,7 +850,8 @@ with tab4:
                     height=500,
                     column_config={
                         "날짜": st.column_config.DateColumn("날짜", format="YYYY-MM-DD"),
-                        "가격": st.column_config.NumberColumn("체결가", format="%.0f"), # 원화 기준이므로 소수점 제거
+                        "가격": st.column_config.NumberColumn("체결가", format="%.0f"),  # 기존 체결가 포맷 유지
+                        "수량": st.column_config.NumberColumn("수량(주)", format="%d"),
                         "AI점수": st.column_config.ProgressColumn("AI Score", format="%.0f점", min_value=0, max_value=100),
                         "수익률": st.column_config.NumberColumn("수익률(%)", format="%.2f%%"),
                         "구분": st.column_config.TextColumn("Type", width="small")
