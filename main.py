@@ -55,7 +55,7 @@ def load_data(ticker, days):
 def add_indicators(df):
     # 1. 이동평균선 (MA)
     df['MA20'] = df['Close'].rolling(window=20).mean()
-    df['MA50'] = df['Close'].rolling(window=50).mean()
+    df['MA60'] = df['Close'].rolling(window=60).mean()  # 50일 -> 60일(수급선, 약 3달)로 변경
     df['MA200'] = df['Close'].rolling(window=200).mean()
 
     # 2. RSI (상대강도지수, 14일 기준)
@@ -78,50 +78,60 @@ def add_indicators(df):
     return df
 
 # ---------------------------------------------------------
-# 3. 매매 전략 로직 (AI 판단)
+# 3. 매매 전략 로직 (AI 판단) - 스윙 트레이딩(2주~1달) 전용
 # ---------------------------------------------------------
 def analyze_market_status(df):
-    """현재 차트 상태를 분석하여 신규 진입 여부를 판단"""
+    """현재 차트 상태를 분석하여 스윙 트레이딩(2주~1달) 관점의 진입 여부를 판단"""
     current_price = df['Close'].iloc[-1]
-    prev_price = df['Close'].iloc[-2]
+    ma20 = df['MA20'].iloc[-1]
+    ma60 = df['MA60'].iloc[-1]
     rsi = df['RSI'].iloc[-1]
     macd = df['MACD'].iloc[-1]
     macd_signal = df['Signal_Line'].iloc[-1]
-    bb_lower = df['BB_Lower'].iloc[-1]
     
     score = 0
     reasons = []
 
-    # 전략 1: 과매도 구간 (RSI < 30) -> 반등 가능성 높음
-    if rsi < 30:
-        score += 3
-        reasons.append("🟢 RSI가 30 미만(과매도)입니다. 기술적 반등 위치입니다.")
-    elif rsi < 40:
+    # 전략 1: 추세 판단 (2주 보유라면 상승 추세에 올라타야 함)
+    if current_price > ma20:
         score += 1
-        reasons.append("⚪ RSI가 낮아 가격 매력도가 있습니다.")
+        if current_price > ma60:
+            score += 1
+            reasons.append("🟢 주가가 20일/60일 이평선 위에 있어 단기 상승 추세가 살아있습니다.")
+        else:
+            reasons.append("⚪ 주가가 20일 생명선 위에 있습니다.")
+    else:
+        score -= 2
+        reasons.append("🔴 주가가 20일 이평선 아래에 있습니다. 단기 탄력이 약합니다.")
+
+    # 전략 2: 눌림목 매수 (상승 추세 중 일시적 하락)
+    # 20일선 근처(0~3% 이격)에서 지지받을 때가 스윙 매수의 최적기
+    if current_price > ma20 and current_price <= ma20 * 1.03:
+        score += 3
+        reasons.append("🟢 '눌림목' 구간입니다. 상승 추세 중 20일선 지지를 받고 있어 손익비가 매우 좋습니다.")
+
+    # 전략 3: RSI (스윙에서는 30까지 안 갈 수 있음, 40 부근 반등 노림)
+    if 30 <= rsi <= 45 and current_price > ma60:
+        score += 2
+        reasons.append("🟢 건전한 조정 구간입니다(RSI 30~45). 상승 추세 중 저점 매수 기회입니다.")
     elif rsi > 70:
         score -= 3
-        reasons.append("🔴 RSI가 70 초과(과매수)입니다. 조정 가능성이 있습니다.")
+        reasons.append("🔴 단기 과열(RSI 70↑)입니다. 2주 내 조정이 올 수 있어 진입 위험합니다.")
 
-    # 전략 2: 볼린저 밴드 하단 터치 -> 지지선 역할
-    if current_price <= bb_lower * 1.02: # 하단 밴드 근처 2% 이내
-        score += 2
-        reasons.append("🟢 주가가 볼린저 밴드 하단 근처에 있어 지지받을 확률이 높습니다.")
-
-    # 전략 3: MACD 골든크로스 (상승 추세 전환)
+    # 전략 4: MACD 골든크로스 초입
     if macd > macd_signal and df['MACD'].iloc[-2] <= df['Signal_Line'].iloc[-2]:
         score += 2
-        reasons.append("🟢 MACD가 시그널 선을 상향 돌파했습니다 (골든크로스). 추세 상승 신호입니다.")
+        reasons.append("🟢 MACD가 골든크로스를 발생시켰습니다. 단기 상승 모멘텀이 시작되었습니다.")
 
     # 종합 판단
     if score >= 4:
         decision = "강력 매수 (Strong Buy)"
         color = "green"
-    elif score >= 1:
+    elif score >= 2:
         decision = "매수 관점 (Buy)"
         color = "blue"
-    elif score <= -2:
-        decision = "매도 관점 (Sell)"
+    elif score <= -1:
+        decision = "매도/관망 (Sell/Wait)"
         color = "red"
     else:
         decision = "관망 (Hold/Wait)"
@@ -130,35 +140,37 @@ def analyze_market_status(df):
     return decision, color, reasons
 
 def analyze_my_position(df, my_price):
-    """내 평단가와 비교하여 대응 전략 제시"""
+    """내 평단가와 비교하여 스윙 트레이딩(2주) 대응 전략 제시"""
     current_price = df['Close'].iloc[-1]
-    rsi = df['RSI'].iloc[-1]
     ma20 = df['MA20'].iloc[-1]
+    rsi = df['RSI'].iloc[-1]
     
     profit_rate = ((current_price - my_price) / my_price) * 100
     
-    advice = ""
     status = ""
+    advice = ""
     
     # 수익 중일 때
     if profit_rate > 0:
         status = f"🎉 현재 **{profit_rate:.2f}% 수익** 중입니다."
         if rsi > 70:
-            advice = "현재 RSI가 과매수 구간입니다. **분할 매도**를 통해 수익을 실현하는 것을 추천합니다."
+            advice = "🛑 **익절 신호:** RSI가 과열권입니다. 스윙 트레이딩은 줄 때 먹어야 합니다. 분할 매도하세요."
         elif current_price < ma20:
-            advice = "수익 중이나 주가가 20일 이동평균선을 하회했습니다. 추세가 꺾일 수 있으니 주의하세요."
+            advice = "⚠️ **주의:** 주가가 20일선을 깼습니다. 수익을 반납하기 전에 매도하는 것을 고려하세요."
+        elif profit_rate >= 10:
+             advice = "💰 **목표 달성?** 2주 단기 매매에서 10% 이상 수익은 훌륭합니다. 욕심부리지 말고 일부 차익실현 하세요."
         else:
-            advice = "상승 추세가 유지되고 있습니다. **계속 보유(Hold)**하여 수익을 극대화하세요."
+            advice = "📈 추세가 좋습니다. 20일선을 깨지 않는 한 계속 보유(Hold)하여 수익을 늘리세요."
             
     # 손실 중일 때
     else:
         status = f"💧 현재 **{profit_rate:.2f}% 손실** 중입니다."
-        if rsi < 30:
-            advice = "현재 과매도 구간입니다. 지금 매도하기보다는 반등을 기다리거나, **물타기(추가 매수)**를 고려해볼 만한 시점입니다."
-        elif current_price < df['BB_Lower'].iloc[-1]:
-            advice = "주가가 바닥권(볼린저 하단)에 있습니다. 투매보다는 **반등 시 탈출**을 목표로 하세요."
+        if current_price < ma20 * 0.97: # 20일선 3% 이상 이탈 시
+            advice = "✂️ **손절 권고:** 2주 단기 매매에서 20일선 이탈은 치명적입니다. 기회비용을 위해 손절을 고려하세요."
+        elif rsi < 30:
+            advice = "반등이 임박했습니다(과매도). 지금 팔기보다 기술적 반등(Dead Cat Bounce) 시 빠져나오세요."
         else:
-            advice = "뚜렷한 반등 신호가 없습니다. 섣불리 추가 매수하기보다 바닥을 다지는지 확인하고 대응하세요 (관망)."
+            advice = "진입 타이밍이 좋지 않았습니다. 본전(약손실) 탈출을 1차 목표로 설정하고 반등을 기다리세요."
             
     return status, advice
 
