@@ -7,14 +7,18 @@ import plotly.graph_objects as go
 from concurrent.futures import ThreadPoolExecutor
 import time
 
+# =========================================================
+# 1. 데이터 로딩 함수 수정 (auto_adjust=False 적용)
+# =========================================================
+
 @st.cache_data(show_spinner=False)
 def load_price_data(code: str, start_date: str):
     """
     yfinance에서 개별 종목 데이터를 받아오는 함수 (캐시됨)
-    같은 code, start_date로 다시 호출하면 네트워크를 다시 안 타고
-    이전에 받아온 데이터를 그대로 사용해서 결과가 항상 같게 됨.
+    [수정] auto_adjust=False로 변경하여 '실제 체결가'를 가져옴
     """
-    df = yf.download(code, start=start_date, progress=False, auto_adjust=True)
+    # ★ 핵심 수정: auto_adjust=False (수정주가 대신 실제 가격 사용)
+    df = yf.download(code, start=start_date, progress=False, auto_adjust=False)
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     return df
@@ -23,10 +27,10 @@ def load_price_data(code: str, start_date: str):
 @st.cache_data(show_spinner=False)
 def load_fx_series(start_date: str):
     """
-    KRW=X 환율 시계열 다운로드 (캐시됨)
-    Dynamic 모드에서도 같은 start_date면 항상 같은 환율 시계열 사용.
+    KRW=X 환율 시계열 다운로드
     """
-    ex_df = yf.download("KRW=X", start=start_date, progress=False)
+    # 환율도 실제 가격 기준
+    ex_df = yf.download("KRW=X", start=start_date, progress=False, auto_adjust=False)
     if isinstance(ex_df.columns, pd.MultiIndex):
         ex_df.columns = ex_df.columns.get_level_values(0)
     return ex_df['Close']
@@ -57,16 +61,17 @@ TICKER_MAP = {
 }
 
 # =========================================================
-# 1. 백테스트용 로직 분리 (기존 로직을 Row 단위로 변환)
+# 2. 지표 계산 로직 수정 (Close_Calc 매핑 변경)
 # =========================================================
 
 def calculate_indicators_for_backtest(df):
     """지표 계산 최적화 (단기 스윙용 보조지표 추가)"""
     df = df.copy()
     
-    # 수정 종가 사용
-    col = 'Adj Close' if 'Adj Close' in df.columns else 'Close'
-    df['Close_Calc'] = df[col]
+    # [수정] 실제 차트와 맞추기 위해 무조건 'Close'(종가) 사용
+    # auto_adjust=False로 하면 'Adj Close'와 'Close'가 둘 다 들어오는데,
+    # 스윙 매매는 실제 거래된 가격인 'Close'를 봐야 함.
+    df['Close_Calc'] = df['Close']
     
     # 1. 이동평균
     df['MA5'] = df['Close_Calc'].rolling(5).mean()
@@ -187,7 +192,7 @@ def get_ai_score_row(row):
         return 0.0
 
 # =========================================================
-# 2. 개별 종목 백테스트 엔진 (정리된 최종 버전)
+# 3. 개별 종목 백테스트 엔진 (변동 없음, 단지 데이터가 정확해짐)
 # =========================================================
 
 def prepare_stock_data(ticker_info, start_date):
@@ -282,7 +287,6 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
                 continue
             
             # [1분봉 시뮬레이션을 위한 데이터 추출]
-            # yfinance auto_adjust=True이므로 O/H/L/C 모두 수정주가 기준임
             rate = 1.0 if ".KS" in ticker else current_rate
             
             raw_open = stock_row['Open']
@@ -320,7 +324,9 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
             if not should_sell:
                 if curr_open <= stop_loss_price:
                     should_sell = True
-                    sell_reason = "⚡ 갭락손절(시가)"
+                    # 갭락 비율 계산 (로그용)
+                    gap_pct = ((curr_open - avg_price) / avg_price) * 100
+                    sell_reason = f"⚡ 시가갭락({gap_pct:.1f}%)"
                     final_sell_price = curr_open # 시가에 체결 (어쩔 수 없음)
                     final_sell_price_raw = raw_open
 
@@ -333,7 +339,9 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
                     should_sell = True
                     sell_reason = "⚡ 장중손절(-3.5%)"
                     final_sell_price = stop_loss_price # 손절가에 정확히 체결 (지정가 감시 효과)
-                    final_sell_price_raw = raw_low # (근사치)
+                    
+                    # 환율 역산하여 원화 기록용 가격 추정
+                    final_sell_price_raw = stop_loss_price / rate
 
             # ---------------------------------------------------
             # [시나리오 3] 트레일링 스탑 & 익절 (Intraday Trailing)
@@ -353,14 +361,14 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
                         should_sell = True
                         sell_reason = "🛡️ 수익반납방어"
                         final_sell_price = protect_line
-                        final_sell_price_raw = raw_low # (근사치)
+                        final_sell_price_raw = protect_line / rate
                     
                     # (b) 고점 대비 -3% 하락 (트레일링)
                     elif curr_low < max_p * 0.97:
                         should_sell = True
                         sell_reason = "📉 트레일링(-3%)"
                         final_sell_price = max_p * 0.97
-                        final_sell_price_raw = raw_low
+                        final_sell_price_raw = final_sell_price / rate
 
             # ---------------------------------------------------
             # [시나리오 4] 종가 기준 판단 (기존 로직 유지)
@@ -503,7 +511,7 @@ def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
     return pd.DataFrame(trades_log), pd.DataFrame(equity_curve)
                                 
 # =========================================================
-# 3. UI 통합 (탭 추가)
+# 4. UI 통합 (탭 추가)
 # =========================================================
 
 tab4 = st.tabs(["📊 전체 백테스트 시뮬레이션"])[0] 
@@ -683,7 +691,8 @@ with tab4:
                     
                     my_trades = trade_df[trade_df['ticker'] == selected_ticker].sort_values('date')
                     with st.spinner("차트 로딩..."):
-                        chart_data = yf.download(selected_ticker, start=str(bt_start_date), progress=False, auto_adjust=True)
+                        # [차트 로딩 부분도 수정]
+                        chart_data = yf.download(selected_ticker, start=str(bt_start_date), progress=False, auto_adjust=False)
                         if isinstance(chart_data.columns, pd.MultiIndex):
                             chart_data.columns = chart_data.columns.get_level_values(0)
                         chart_data = chart_data.loc[:, ~chart_data.columns.duplicated()]
