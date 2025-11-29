@@ -245,67 +245,76 @@ def prepare_stock_data(ticker_info, start_date):
 def run_portfolio_backtest(targets, start_date, initial_capital, strategy_mode,
                            max_hold_days, exchange_data, use_compound, selection_mode):
     """
-    [수정됨] 현실성 + 재현성 강화:
-    - 데이터: 단일 스레드 + 캐시 사용 (항상 같은 유니버스)
-    - 매수 우선순위: 점수 내림차순, 동점 시 티커 사전순
+    [수정 완료] 2주 단기 스윙 최적화 백테스트 엔진
+    - 데이터 로딩 + 환율 처리 + 매매 로직(스윙) + 자산 평가 통합
     """
-
+    # ---------------------------------------------------------
     # 1. 전 종목 데이터 준비 (단일 스레드, 순서 고정)
+    # ---------------------------------------------------------
     all_dfs = []
-    # 정렬까지 해서 완전 고정하고 싶으면 아래처럼:
-    # for t in sorted(targets, key=lambda x: x[0]):
+    # targets는 (Ticker, Name) 튜플 리스트
     for t in targets:
         res = prepare_stock_data(t, start_date)
         if res is not None:
             all_dfs.append(res)
-
-    # st.write(f"Loaded Tickers: {len(all_dfs)} / {len(targets)}")
-
+            
     if not all_dfs:
         return pd.DataFrame(), pd.DataFrame()
 
+    # ---------------------------------------------------------
     # 2. Market Data 통합 (날짜별로 종목 리스트 모으기)
+    # ---------------------------------------------------------
     market_data = {}
     for df in all_dfs:
         for date, row in df.iterrows():
             if date not in market_data:
                 market_data[date] = []
             market_data[date].append(row)
-
+    
     sorted_dates = sorted(market_data.keys())
 
+    # ---------------------------------------------------------
     # 3. 환율 데이터 준비
+    # ---------------------------------------------------------
     if isinstance(exchange_data, (float, int)):
         get_rate = lambda d: float(exchange_data)
     else:
+        # 시리즈나 데이터프레임인 경우 딕셔너리로 변환해 접근 속도 향상
         rate_dict = exchange_data.to_dict()
-
         def get_rate(d):
             ts = pd.Timestamp(d)
-            # 해당 날짜가 없으면 1430.0으로 fallback (항상 동일)
+            # 해당 날짜 환율 없으면 기본값 1430.0 (fallback)
             return rate_dict.get(ts, 1430.0)
 
-balance = initial_capital
+    # ---------------------------------------------------------
+    # 4. 시뮬레이션 상태 변수 초기화
+    # ---------------------------------------------------------
+    balance = initial_capital
     portfolio = {}
     trades_log = []
     equity_curve = []
     
-    # "점수 1등만 매수" -> 1종목 몰빵 / "분산" -> 최대 5종목 (안정성 위해 10개는 너무 많고 5개 추천)
+    # "점수 1등만 매수" -> 1종목 몰빵 / "분산" -> 최대 5종목
     max_slots = 1 if selection_mode == 'TOP1' else 5 
 
-    # --- 날짜별 루프 ---
+    # ---------------------------------------------------------
+    # 5. 날짜별 루프 (백테스트 메인)
+    # ---------------------------------------------------------
     for date in sorted_dates:
         daily_stocks = market_data[date]
         current_rate = get_rate(date)
 
-        # -------------------------------------------------
+        # =================================================
         # A. 매도 로직 (Sell Check) - 2주 스윙 최적화
-        # -------------------------------------------------
+        # =================================================
         sell_list = []
         for ticker in sorted(portfolio.keys()):
             info = portfolio[ticker]
             stock_row = next((x for x in daily_stocks if x['Ticker'] == ticker), None)
-            if stock_row is None: continue
+            
+            # 상장폐지 등 데이터가 사라진 경우 건너뜀 (보유 유지 or 강제청산 로직 필요시 추가)
+            if stock_row is None: 
+                continue
             
             curr_price_raw = stock_row['Close_Calc']
             curr_price_krw = curr_price_raw * (1.0 if ".KS" in ticker else current_rate)
@@ -330,29 +339,28 @@ balance = initial_capital
             sell_reason = ""
 
             # 1) 절대적 타임 컷 (2주 = 14일, 거래일 기준 약 10일)
-            # 사용자가 입력한 max_hold_days를 우선하되, 기본적으로 짧게 가져감
             limit_days = max_hold_days if max_hold_days > 0 else 14 
             if held_days >= limit_days:
                 should_sell = True
                 sell_reason = f"⏱️ 만기청산({held_days}일)"
 
-            # 2) 시간 가속 청산 (Time Decay) - 중요!
-            # 1주일(7일) 지났는데 수익이 1%도 안 되면 지지부진한 것임 -> 교체 매매
+            # 2) 시간 가속 청산 (Time Decay)
+            # 1주일(7일) 지났는데 수익이 1%도 안 되면 교체 매매
             if not should_sell and held_days >= 7 and profit_pct < 1.0:
                 should_sell = True
                 sell_reason = "🐢 지지부진(7일↑)"
 
             # 3) 수익 및 손절 관리 (Dynamic Trailing Stop)
             if not should_sell:
-                # (a) 손절매 (Hard Stop): -3.5% (스윙은 손절이 짧아야 함)
+                # (a) 손절매 (Hard Stop): -3.5%
                 if profit_pct <= -3.5:
                     should_sell = True
                     sell_reason = "⚡ 손절(-3.5%)"
                 
                 # (b) 트레일링 스탑 (수익 보존)
-                # 수익 5% 이상 나면 -> 평단가 밑으로 내려오면 바로 매도 (원금 사수)
+                # 수익 5% 이상 나면 -> 평단가 + 1% 밑으로 내려오면 바로 매도 (원금 사수)
                 elif info['max_price'] > info['avg_price'] * 1.05:
-                    if curr_price_krw < info['avg_price'] * 1.01: # 1% 수익은 챙기고 나옴
+                    if curr_price_krw < info['avg_price'] * 1.01: 
                         should_sell = True
                         sell_reason = "🛡️ 수익반납방어"
                     # 고점에서 3% 빠지면 익절
@@ -361,8 +369,8 @@ balance = initial_capital
                         sell_reason = "📉 트레일링(-3%)"
 
                 # (c) 급등 시 차익 실현 (RSI 과열)
-                # 2주 안에 15% 이상 급등하고 RSI가 75 넘으면 일단 챙김
-                elif profit_pct >= 15.0 and score < 50: # 점수도 빠지기 시작하면
+                # 15% 이상 급등하고 점수가 50 미만으로 떨어지면 익절
+                elif profit_pct >= 15.0 and score < 50: 
                     should_sell = True
                     sell_reason = "💰 급등익절(+15%)"
 
@@ -376,74 +384,101 @@ balance = initial_capital
                 return_amt = info['shares'] * curr_price_krw * (1 - fee_sell)
                 balance += return_amt
                 trades_log.append({
-                    'ticker': ticker, 'name': info['name'], 'date': date, 'type': 'sell',
-                    'price': curr_price_raw, 'shares': info['shares'], 'score': score,
-                    'profit': profit_pct, 'reason': sell_reason, 'balance': balance
+                    'ticker': ticker,
+                    'name': info['name'],
+                    'date': date,
+                    'type': 'sell',
+                    'price': curr_price_raw,
+                    'shares': info['shares'],
+                    'score': score,
+                    'profit': profit_pct,
+                    'reason': sell_reason,
+                    'balance': balance
                 })
                 sell_list.append(ticker)
         
-        for t in sell_list: del portfolio[t]
+        # 포트폴리오에서 제거
+        for t in sell_list: 
+            del portfolio[t]
 
-        # -------------------------------------------------
+        # =================================================
         # B. 신규 매수 (Buy Logic)
-        # -------------------------------------------------
+        # =================================================
         if len(portfolio) < max_slots:
             candidates = []
             for row in daily_stocks:
                 ticker = row['Ticker']
-                if ticker in portfolio: continue
+                if ticker in portfolio: 
+                    continue
                 
                 score = row['AI_Score']
                 price_raw = row['Close_Calc']
                 price_krw = price_raw * (1.0 if ".KS" in ticker else current_rate)
                 
-                # [필터] 2주 스윙은 '정배열'이거나 '확실한 모멘텀'일 때만 진입
-                # 점수 70점 이상 (기존보다 기준 상향)
+                # [필터] 점수 70점 이상 (스윙 진입 타점)
                 if score >= 70:
-                    # 추가 필터: 이미 너무 많이 오른 종목(RSI 75이상)은 제외 (상투 잡기 방지)
-                    if row['RSI'] < 75:
+                    # 너무 과열된 종목(RSI 75 이상)은 제외
+                    rsi_val = row.get('RSI', 50)
+                    if rsi_val < 75:
                         vol_ratio = row.get('STD20', 0) / price_raw if price_raw > 0 else 0.03
                         candidates.append({
-                            'ticker': ticker, 'name': row['Name'],
-                            'price_raw': price_raw, 'price_krw': price_krw,
-                            'score': score, 'vol_ratio': vol_ratio,
+                            'ticker': ticker,
+                            'name': row['Name'],
+                            'price_raw': price_raw,
+                            'price_krw': price_krw,
+                            'score': score,
+                            'vol_ratio': vol_ratio,
                             'reason': "AI추천(70↑)"
                         })
 
-            # 점수순 정렬
+            # 점수순 내림차순 정렬
             candidates.sort(key=lambda x: x['score'], reverse=True)
             
-            # 매수 집행 (상위 종목)
-            buy_targets = candidates[:(max_slots - len(portfolio))]
+            # 매수할 종목 수 계산
+            open_slots = max_slots - len(portfolio)
+            buy_targets = candidates[:open_slots]
             
             for target in buy_targets:
-                if balance <= 0: break
+                if balance <= 0: 
+                    break
                 
                 # 자금 배분: (남은 현금 / 남은 슬롯) -> 균등 배분
-                # 스윙은 확신이 있을 때 들어가므로 '변동성 역가중'보다는 '균등 배분'이 관리하기 편함
-                slot_budget = balance / (max_slots - len(portfolio))
+                current_open_slots = max_slots - len(portfolio)
+                slot_budget = balance / current_open_slots
                 
                 fee_buy = 0.00015 if ".KS" in target['ticker'] else 0.001
+                
                 if target['price_krw'] > 0:
                     shares = int(slot_budget / (target['price_krw'] * (1 + fee_buy)))
                     
                     if shares > 0:
                         cost = shares * target['price_krw'] * (1 + fee_buy)
                         balance -= cost
+                        
                         portfolio[target['ticker']] = {
                             'name': target['name'],
                             'shares': shares,
                             'avg_price': target['price_krw'],
-                            'buy_date': date, # 매수일 기록
+                            'buy_date': date,
                             'max_price': target['price_krw'], # 고점 초기화
                         }
+                        
                         trades_log.append({
-                            'ticker': target['ticker'], 'name': target['name'], 'date': date, 'type': 'buy',
-                            'price': target['price_raw'], 'shares': shares, 'score': target['score'],
-                            'profit': 0, 'reason': target['reason'], 'balance': balance
+                            'ticker': target['ticker'],
+                            'name': target['name'],
+                            'date': date,
+                            'type': 'buy',
+                            'price': target['price_raw'],
+                            'shares': shares,
+                            'score': target['score'],
+                            'profit': 0,
+                            'reason': target['reason'],
+                            'balance': balance
                         })
 
-        # C. 자산 평가 (기존과 동일)
+        # =================================================
+        # C. 자산 평가
+        # =================================================
         current_equity = balance
         for ticker, info in portfolio.items():
             stock_row = next((x for x in daily_stocks if x['Ticker'] == ticker), None)
@@ -452,6 +487,7 @@ balance = initial_capital
                 current_equity += info['shares'] * p_krw
             else:
                 current_equity += info['shares'] * info['avg_price']
+        
         equity_curve.append({'date': date, 'equity': current_equity})
 
     return pd.DataFrame(trades_log), pd.DataFrame(equity_curve)
