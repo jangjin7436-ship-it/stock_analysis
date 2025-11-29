@@ -614,6 +614,56 @@ with tab2:
         st.divider()
 
         if pf_data:
+            # ✏️ 보유 종목 정보 수정 섹션
+            st.markdown("#### ✏️ 보유 종목 정보 수정")
+
+            edit_options = [
+                f"{TICKER_MAP.get(p['ticker'], p['ticker'])} ({p['ticker']})"
+                for p in pf_data
+            ]
+            selected_edit = st.selectbox(
+                "수정할 종목 선택",
+                options=["선택하세요"] + edit_options,
+                key="edit_select"
+            )
+
+            if selected_edit != "선택하세요":
+                # "삼성전자 (005930.KS)" -> "005930.KS"
+                edit_ticker = selected_edit.split("(")[-1].rstrip(")")
+
+                target = next((p for p in pf_data if p["ticker"] == edit_ticker), None)
+                if target:
+                    new_avg = st.number_input(
+                        "새 평단가",
+                        min_value=0.0,
+                        value=float(target["price"]),
+                        format="%.4f",
+                        key="edit_avg_price",
+                    )
+                    new_qty = st.number_input(
+                        "새 보유 수량(주)",
+                        min_value=0,
+                        value=int(target.get("qty", 1)),
+                        key="edit_qty",
+                    )
+
+                    if st.button("변경 내용 저장", type="primary", key="edit_save"):
+                        new_pf_data = []
+                        for p in pf_data:
+                            if p["ticker"] == edit_ticker:
+                                new_pf_data.append(
+                                    {"ticker": edit_ticker, "price": new_avg, "qty": new_qty}
+                                )
+                            else:
+                                new_pf_data.append(p)
+                        doc_ref.set({"stocks": new_pf_data})
+                        st.success("수정 완료!")
+                        time.sleep(0.5)
+                        st.rerun()
+
+            st.divider()
+        
+        if pf_data:
             st.subheader(f"{user_id}님의 보유 종목 진단")
             my_tickers = [p['ticker'] for p in pf_data]
             with st.spinner("초정밀 실시간 데이터 수집 중..."):
