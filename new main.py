@@ -8,7 +8,6 @@ import time
 import json
 import concurrent.futures
 import requests
-import re  # 국내 애프터마켓 가격 파싱용
 
 # ---------------------------------------------------------
 # 0. 파이어베이스(DB) 설정
@@ -102,7 +101,6 @@ def fetch_kr_polling(ticker):
 
         item = datas[0]
         
-        # 1. 가격 파싱
         over_info = item.get("overMarketPriceInfo") or {}
         over_price_str = str(over_info.get("overPrice", "")).replace(",", "").strip()
         close_price_str = str(item.get("closePrice", "")).replace(",", "").strip()
@@ -110,7 +108,6 @@ def fetch_kr_polling(ticker):
         over_price = float(over_price_str) if over_price_str not in ("", "0") else None
         close_price = float(close_price_str) if close_price_str not in ("", "0") else None
 
-        # 2. 시간 파싱
         def _parse_dt(s):
             try: return datetime.datetime.fromisoformat(s) if s else None
             except: return None
@@ -118,7 +115,6 @@ def fetch_kr_polling(ticker):
         base_time = _parse_dt(item.get("localTradedAt", ""))
         over_time = _parse_dt(over_info.get("localTradedAt", ""))
 
-        # 3. 최신 가격 선택
         chosen_price = None
         chosen_time = None
 
@@ -138,7 +134,6 @@ def fetch_kr_polling(ticker):
         raise ValueError("no usable price")
 
     except Exception:
-        # 실패 시 FDR 종가 폴백
         try:
             df = fdr.DataReader(code, "2023-01-01")
             if not df.empty:
@@ -158,7 +153,7 @@ def fetch_us_1m_candle(ticker):
         return (ticker, None)
 
 def fetch_history_data(ticker):
-    """지표 분석용 일봉 데이터 (정규장 종가 기준)"""
+    """지표 분석용 일봉 데이터"""
     try:
         if ticker.endswith('.KS') or ticker.endswith('.KQ'):
             df = fdr.DataReader(ticker.split('.')[0], '2023-01-01')
@@ -175,7 +170,7 @@ def fetch_history_data(ticker):
 
 @st.cache_data(ttl=0)
 def get_precise_data(tickers_list):
-    """실시간 가격과 일봉 히스토리를 병렬 수집"""
+    """실시간 가격과 일봉 히스토리 병렬 수집"""
     kr_tickers = [t for t in tickers_list if t.endswith('.KS') or t.endswith('.KQ')]
     us_tickers = [t for t in tickers_list if t not in kr_tickers]
 
@@ -195,7 +190,6 @@ def get_precise_data(tickers_list):
         for f in concurrent.futures.as_completed(fut_hist):
             tk, df = f.result()
             if df is not None and not df.empty:
-                # 데이터 전처리
                 if isinstance(df.columns, pd.MultiIndex):
                     df.columns = df.columns.get_level_values(0)
                 df = df.loc[:, ~df.columns.duplicated()]
@@ -204,18 +198,29 @@ def get_precise_data(tickers_list):
 
     return hist_map, realtime_prices
 
-def calculate_indicators(df):
-    """기술적 지표 계산 (MACD, RSI, Boll, MA 등)"""
+def calculate_indicators(df, realtime_price=None):
+    """
+    ❗ 핵심 수정: realtime_price가 있으면 지표 계산 전에 강제로 반영하여
+    이동평균선(MA), RSI 등이 실시간 가격 기준으로 재계산되도록 함.
+    """
     if len(df) < 60: return None
     df = df.copy()
 
     # Close 처리
     if 'Close' in df.columns:
         close = df['Close']
-        close_series = close.iloc[:, 0] if isinstance(close, pd.DataFrame) else close
+        if isinstance(close, pd.DataFrame): 
+            close = close.iloc[:, 0]
+        # Series 변환 보장
+        close_series = close.copy()
     else:
         return None
-    
+
+    # 🔑 [중요] 실시간 가격 반영 (마지막 캔들 업데이트)
+    if realtime_price is not None and realtime_price > 0:
+        # 마지막 인덱스의 값을 실시간 가격으로 덮어씀 (장중 데이터 보정 효과)
+        close_series.iloc[-1] = realtime_price
+
     close_series = close_series.ffill()
     df['Close_Calc'] = close_series
 
@@ -227,7 +232,6 @@ def calculate_indicators(df):
 
     # Volatility / Momentum
     df['STD20'] = df['Close_Calc'].rolling(window=20).std()
-    df['RET1'] = df['Close_Calc'].pct_change()
     df['MOM10'] = df['Close_Calc'] / df['Close_Calc'].shift(10) - 1
 
     # Volume
@@ -262,7 +266,7 @@ def calculate_indicators(df):
     return df.dropna()
 
 def calculate_total_profit(ticker, avg_price, current_price, quantity):
-    """순수익 계산 (토스증권 수수료 체계 반영)"""
+    """순수익 계산"""
     is_kr = ticker.endswith(".KS") or ticker.endswith(".KQ")
     qty = float(quantity)
     avg_price = float(avg_price)
@@ -294,22 +298,16 @@ def calculate_total_profit(ticker, avg_price, current_price, quantity):
         "currency": currency
     }
 
-def analyze_advanced_strategy(df, curr_override=None):
+def analyze_advanced_strategy(df):
     """
-    [핵심 AI 엔진] 2~4주 스윙 전략 스코어링
-    Scanner와 Portfolio 양쪽에서 동일하게 사용됨.
+    [핵심 AI 엔진] - 이제 curr_override 인자가 필요 없음.
+    이미 df['Close_Calc']가 실시간 가격으로 업데이트되어 있기 때문.
     """
     if df is None or df.empty:
         return "분석 불가", "gray", "데이터 부족", 0
 
     try:
-        # 기본값: 일봉 종가
         curr = float(df['Close_Calc'].iloc[-1])
-        
-        # 🔑 실시간 가격(curr_override)이 있으면 최우선 적용 (포트폴리오 로직)
-        if curr_override is not None and curr_override > 0:
-            curr = float(curr_override)
-
         ma5  = float(df['MA5'].iloc[-1])
         ma10 = float(df['MA10'].iloc[-1])
         ma20 = float(df['MA20'].iloc[-1])
@@ -333,7 +331,7 @@ def analyze_advanced_strategy(df, curr_override=None):
     score = 50
     reasons = []
 
-    # 1) 추세 필터
+    # 1) 추세
     if curr > ma60 and ma20 > ma60:
         score += 20
         reasons.append("📈 중기 상승 추세 (60일선 위)")
@@ -344,7 +342,7 @@ def analyze_advanced_strategy(df, curr_override=None):
         score -= 25
         reasons.append("⚠ 하락 추세 (60일선 아래)")
 
-    # 2) 위치 (눌림목)
+    # 2) 위치
     dist_ma20 = (curr - ma20) / ma20 if ma20 > 0 else 0
     
     if (curr >= ma20) and (curr >= ma60) and (-0.03 <= dist_ma20 <= 0.02):
@@ -357,10 +355,10 @@ def analyze_advanced_strategy(df, curr_override=None):
         score -= 15
         reasons.append("🔥 단기 과열 (20일선 이격 과다)")
 
-    # 3) RSI
+    # 3) RSI (물결표 제거)
     if 40 <= rsi <= 60:
         score += 15
-        reasons.append("⚖ RSI 균형 (스윙 적합)")
+        reasons.append(f"⚖ RSI {rsi:.0f} (균형 구간), 스윙 적합")
     elif 30 <= rsi < 40:
         score += 5
         reasons.append("반등 기대 (약한 과매도)")
@@ -371,13 +369,13 @@ def analyze_advanced_strategy(df, curr_override=None):
         score -= 20
         reasons.append("🚨 RSI 과열 (조정 주의)")
 
-    # 4) 모멘텀
+    # 4) 모멘텀 (숫자 표기 오류 수정)
     if 0.03 <= mom10 <= 0.15:
         score += 10
-        reasons.append("📊 건강한 상승 모멘텀")
+        reasons.append(f"📊 최근 2주간 {mom10*100:.1f}% 상승 (건강한 모멘텀)")
     elif mom10 > 0.25:
         score -= 15
-        reasons.append("급등 피로감 (차익 실현 주의)")
+        reasons.append(f"급등 피로감 (2주간 {mom10*100:.1f}% 폭등)")
     elif mom10 < -0.10:
         score -= 10
         reasons.append("낙폭 과대")
@@ -393,7 +391,7 @@ def analyze_advanced_strategy(df, curr_override=None):
         score -= 10
         reasons.append("💧 MACD 데드크로스")
 
-    # 6) 변동성 & 거래량
+    # 6) 변동성
     vol_ratio = std20 / curr if curr > 0 else 0
     if vol_ratio > 0.08:
         score -= 15
@@ -438,11 +436,11 @@ st.title("📈 AI 주식 스캐너 & 포트폴리오 Pro")
 tab1, tab2, tab3 = st.tabs(["🚀 전체 종목 스캐너", "💼 내 포트폴리오 (서버 저장)", "📘 알고리즘 설명서"])
 
 # =========================================================
-# TAB 1: 스캐너 (수정됨: 포트폴리오 로직 적용)
+# TAB 1: 스캐너
 # =========================================================
 with tab1:
     st.markdown("### 📋 AI 정밀 스캐너")
-    st.caption("포트폴리오와 동일한 정밀 알고리즘 적용 (실시간/AfterMarket)")
+    st.caption("실시간 가격을 모든 지표(MA, RSI 등)에 반영하여 분석")
 
     col_btn, col_info = st.columns([1, 4])
     with col_btn:
@@ -452,8 +450,7 @@ with tab1:
 
     if st.session_state['scan_result_df'] is None:
         if st.button("🔍 전체 리스트 정밀 분석 시작"):
-            with st.spinner('초정밀 데이터 수집 및 AI 분석 중... (15~20초 소요)'):
-                # 1. 데이터 수집 (포트폴리오와 동일 함수 사용)
+            with st.spinner('초정밀 데이터 수집 및 지표 재계산 중... (15~20초 소요)'):
                 raw_data_dict, realtime_map = get_precise_data(USER_WATCHLIST)
                 scan_results = []
                 progress_bar = st.progress(0)
@@ -464,30 +461,25 @@ with tab1:
                         df_tk = raw_data_dict[ticker_code].dropna(how='all')
                         if df_tk.empty: continue
                         
-                        df_indi = calculate_indicators(df_tk)
+                        # 1. 실시간 가격 확인
+                        curr_price = realtime_map.get(ticker_code)
+
+                        # 2. 지표 계산 시 실시간 가격 반영 (매우 중요)
+                        #    - 실시간 가격이 없으면 None 전달 -> 그냥 종가 사용
+                        df_indi = calculate_indicators(df_tk, realtime_price=curr_price)
+                        
                         if df_indi is None: continue
 
-                        # -------------------------------------------------
-                        # ⚡ 포트폴리오와 완벽히 동일한 가격 로직 적용 (수정됨)
-                        # -------------------------------------------------
-                        curr_price = 0
-                        
-                        # 1순위: 실시간/애프터마켓 데이터
-                        if ticker_code in realtime_map:
-                            curr_price = float(realtime_map[ticker_code])
-                        # 2순위: 실시간 실패 시 일봉 종가
-                        elif df_indi is not None and not df_indi.empty:
-                            curr_price = float(df_indi['Close_Calc'].iloc[-1])
+                        # 3. AI 분석 (이제 df 자체에 실시간 정보가 녹아있음)
+                        cat, col_name, reasoning, score = analyze_advanced_strategy(df_indi)
 
-                        # AI 엔진 호출 (포트폴리오와 동일 인자 전달)
-                        cat, col_name, reasoning, score = analyze_advanced_strategy(df_indi, curr_override=curr_price)
-
-                        # 결과 정리
+                        # 결과 표출용
+                        final_price = float(df_indi['Close_Calc'].iloc[-1])
                         rsi_val = float(df_indi['RSI'].iloc[-1])
                         name = TICKER_MAP.get(ticker_code, ticker_code)
                         is_kr = ticker_code.endswith(".KS") or ticker_code.endswith(".KQ")
                         sym = "₩" if is_kr else "$"
-                        fmt_price = f"{sym}{curr_price:,.0f}" if is_kr else f"{sym}{curr_price:,.2f}"
+                        fmt_price = f"{sym}{final_price:,.0f}" if is_kr else f"{sym}{final_price:,.2f}"
 
                         scan_results.append({
                             "종목명": f"{name} ({ticker_code})",
@@ -504,7 +496,7 @@ with tab1:
                     df_res = pd.DataFrame(scan_results)
                     df_res = df_res.sort_values('점수', ascending=False)
                     st.session_state['scan_result_df'] = df_res
-                    st.success("완료! 포트폴리오와 동일한 로직으로 분석되었습니다.")
+                    st.success("완료!")
                     st.rerun()
                 else:
                     st.error("데이터 수집 실패.")
@@ -526,7 +518,7 @@ with tab1:
         )
 
 # =========================================================
-# TAB 2: 포트폴리오 (기준 로직)
+# TAB 2: 포트폴리오
 # =========================================================
 with tab2:
     st.markdown("### ☁️ 내 자산 포트폴리오")
@@ -614,24 +606,28 @@ with tab2:
                 name = TICKER_MAP.get(tk, tk)
                 
                 df_indi = None
+                curr = 0
+
+                # 1. 실시간 가격 확인
+                if tk in realtime_map:
+                    curr = float(realtime_map[tk])
+                
+                # 2. 일봉 데이터 및 지표 계산 (실시간 가격 반영 필수!)
                 if tk in raw_data_dict:
                     df_tk = raw_data_dict[tk].dropna(how='all')
                     if not df_tk.empty:
-                        df_indi = calculate_indicators(df_tk)
-
-                # -------------------------------------------------
-                # ⚡ 포트폴리오 가격 로직 (Scanner와 동일)
-                # -------------------------------------------------
-                curr = 0
-                if tk in realtime_map:
-                    curr = float(realtime_map[tk])
-                elif df_indi is not None and not df_indi.empty:
+                        # ❗ 여기서 스캐너와 똑같이 실시간 가격을 넣어준다.
+                        real_p = curr if curr > 0 else None
+                        df_indi = calculate_indicators(df_tk, realtime_price=real_p)
+                
+                # 3. 현재가 확정 (지표 계산 후의 Close_Calc 값 사용이 가장 정확)
+                if df_indi is not None and not df_indi.empty:
                     curr = float(df_indi['Close_Calc'].iloc[-1])
-
+                
                 cat, col_name, reasoning, score = "데이터 로딩 중", "gray", "잠시 후 다시 시도", 0
 
                 if df_indi is not None:
-                    cat, col_name, reasoning, score = analyze_advanced_strategy(df_indi, curr_override=curr)
+                    cat, col_name, reasoning, score = analyze_advanced_strategy(df_indi)
                 
                 if curr > 0:
                     res = calculate_total_profit(tk, avg, curr, qty)
