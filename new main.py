@@ -212,81 +212,84 @@ def fetch_us_1m_candle(ticker):
         return (ticker, None)
 
 def fetch_history_data(ticker):
-    """지표 분석용 일봉 데이터 (2년치)"""
+    """지표 분석용 일봉 데이터 (2년치, 정규장 종가 기준)"""
     try:
         if ticker.endswith('.KS') or ticker.endswith('.KQ'):
+            # 국내는 FDR 일봉 그대로 사용 (정규장 종가)
             df = fdr.DataReader(ticker.split('.')[0], '2023-01-01')
         else:
-            # 미국 주식 일봉도 prepost=True로 받아야 마지막 날짜 데이터가 정확할 수 있음
-            df = yf.download(ticker, period="2y", progress=False, prepost=True)
-            
-            # 데이터 평탄화 (MultiIndex 제거)
+            # 해외: 2년 치 일봉, 정규장만
+            df = yf.download(
+                ticker,
+                period="2y",
+                interval="1d",
+                progress=False,
+                prepost=False  # 🔑 장외 제외 (일봉은 정규장만)
+            )
+
+            # 컬럼 정리
             if isinstance(df.columns, pd.MultiIndex):
-                try: df.columns = df.columns.droplevel(1)
-                except: pass
+                df.columns = df.columns.get_level_values(0)
             df = df.loc[:, ~df.columns.duplicated()]
-            if 'Close' not in df.columns and 'Adj Close' in df.columns:
+
+            # 많은 차트가 Adjusted Close 기준으로 이동평균/RSI 계산 → 있으면 사용
+            if 'Adj Close' in df.columns:
                 df['Close'] = df['Adj Close']
-                
+
         return (ticker, df)
-    except:
+    except Exception:
         return (ticker, None)
 
 @st.cache_data(ttl=0) # 캐시 0초 (항상 실행)
 def get_precise_data(tickers_list):
     """
-    [New Logic] 
-    1. 히스토리 데이터 수집 (지표 계산용)
-    2. 초정밀 실시간 데이터 수집 (가격 표시용)
-    3. 히스토리의 마지막 값을 실시간 값으로 강제 교체 (AI 분석용)
+    1) 지표 계산용 일봉 데이터 (정규장 종가 기준만 사용)
+    2) 실시간/애프터마켓 가격은 별도 딕셔너리로 관리
+       → 지표엔 절대 섞지 않음
     """
     kr_tickers = [t for t in tickers_list if t.endswith('.KS') or t.endswith('.KQ')]
     us_tickers = [t for t in tickers_list if t not in kr_tickers]
-    
-    final_dfs = {}
+
     realtime_prices = {}
+    hist_map = {}
 
     with concurrent.futures.ThreadPoolExecutor() as executor:
-        # A. 실시간 가격 (병렬)
+        # A. 실시간 가격 (국내: 네이버, 해외: 1분봉)
         fut_real = []
         for t in kr_tickers:
-            fut_real.append(executor.submit(fetch_kr_polling, t)) # 네이버 HTML 파싱(애프터마켓)
+            fut_real.append(executor.submit(fetch_kr_polling, t))
         for t in us_tickers:
-            fut_real.append(executor.submit(fetch_us_1m_candle, t)) # 1분봉
-            
-        # B. 히스토리 데이터 (병렬)
-        fut_hist = []
-        for t in tickers_list:
-            fut_hist.append(executor.submit(fetch_history_data, t))
-            
-        # 수집 - 실시간
+            fut_real.append(executor.submit(fetch_us_1m_candle, t))
+
+        # B. 히스토리 데이터 (일봉)
+        fut_hist = [executor.submit(fetch_history_data, t) for t in tickers_list]
+
+        # 실시간 수집
         for f in concurrent.futures.as_completed(fut_real):
             tk, p = f.result()
-            if p is not None: realtime_prices[tk] = p
-            
-        # 수집 - 히스토리
-        hist_map = {}
+            if p is not None:
+                realtime_prices[tk] = p
+
+        # 히스토리 수집
         for f in concurrent.futures.as_completed(fut_hist):
             tk, df = f.result()
-            if df is not None and not df.empty: hist_map[tk] = df
+            if df is not None and not df.empty:
+                hist_map[tk] = df
 
-    # C. 병합 및 오버라이딩
+    # C. 최종 일봉 데이터 정리 (지표용) - ❗ 실시간 가격 덮어쓰기 금지
+    final_dfs = {}
     for t in tickers_list:
         if t in hist_map:
             df = hist_map[t].copy()
-            # MultiIndex 안전 제거
+
+            # MultiIndex 방지 + 정렬
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
-            
-            # 실시간 가격이 있으면 덮어쓰기
-            if t in realtime_prices:
-                latest_p = realtime_prices[t]
-                if 'Close' in df.columns:
-                    # 마지막 행의 값을 최신 체결가로 변경 (지표가 현재가 기준이 됨)
-                    df.iloc[-1, df.columns.get_loc('Close')] = latest_p
-                    
+            df = df.loc[:, ~df.columns.duplicated()]
+            df = df.sort_index()
+
             final_dfs[t] = df
-            
+
     return final_dfs, realtime_prices
 
 def calculate_indicators(df):
@@ -343,9 +346,11 @@ def calculate_indicators(df):
 
     # 📌 RSI(14)
     delta = df['Close_Calc'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
+    gain = delta.clip(lower=0.0)
+    loss = -delta.clip(upper=0.0)
+    avg_gain = gain.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
+    rs = avg_gain / avg_loss
     df['RSI'] = 100 - (100 / (1 + rs))
 
     # 📌 MACD(12,26,9)
