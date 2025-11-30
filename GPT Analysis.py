@@ -160,120 +160,99 @@ USER_WATCHLIST = list(TICKER_MAP.keys())
 
 # ---------------------------------------------------------
 
-@st.cache_data(ttl=60)
-
+@st.cache_data(ttl=30)
 def get_bulk_us_data(us_tickers):
-
-    """미국 주식 데이터 수집"""
-
-    if not us_tickers:
-
-        return {}, {}
-
-
-
+    """
+    미국 주식 데이터 수집 (완전 새 버전)
+    - 2년치 일봉: 백테스트 / 지표 계산용
+    - 애프터마켓 포함 1분봉: '실제 현재가'로 사용
+    """
     hist_map = {}
-
     realtime_map = {}
 
+    if not us_tickers:
+        return hist_map, realtime_map
 
-
+    # -------------------------------------------------
+    # 1) 2년치 일봉 (백테스트/지표용, auto_adjust=False 유지)
+    # -------------------------------------------------
     try:
-
-        # auto_adjust=False로 설정하여 실제 체결가 기준 계산 (백테스트 로직과 일치)
-
         df_hist = yf.download(
-
             us_tickers,
-
             period="2y",
-
             interval="1d",
-
             progress=False,
-
             group_by="ticker",
-
-            auto_adjust=False, 
-
+            auto_adjust=False,
         )
-
-        df_real = yf.download(
-
-            us_tickers,
-
-            period="5d",
-
-            interval="1m",
-
-            progress=False,
-
-            group_by="ticker",
-
-            prepost=True,
-
-        )
-
-
 
         hist_is_multi = isinstance(df_hist.columns, pd.MultiIndex)
 
-        real_is_multi = isinstance(df_real.columns, pd.MultiIndex)
-
-
-
         for t in us_tickers:
-
             try:
-
                 sub_df = df_hist[t] if hist_is_multi else df_hist
-
                 if isinstance(sub_df, pd.DataFrame) and not sub_df.empty:
-
                     sub_df = sub_df.dropna(how="all")
-
                     if "Close" in sub_df.columns:
-
                         hist_map[t] = sub_df
-
             except Exception:
-
-                pass
-
-
-
-            try:
-
-                sub_real = df_real[t] if real_is_multi else df_real
-
-                if isinstance(sub_real, pd.DataFrame) and not sub_real.empty:
-
-                    sub_real = sub_real.dropna(how="all")
-
-                    price_series = sub_real["Close"]
-
-                    if price_series is not None:
-
-                        valid_closes = price_series.dropna()
-
-                        if not valid_closes.empty:
-
-                            realtime_map[t] = float(valid_closes.iloc[-1])
-
-            except Exception:
-
-                pass
-
-
-
+                continue
     except Exception:
-
+        # 일봉 전체 실패해도, 아래에서 리얼타임 가격만이라도 시도
         pass
 
+    # -------------------------------------------------
+    # 2) 애프터마켓 포함 1분봉으로 "현재가" 산출
+    #    - prepost=True 로 장전/장후까지 모두 포함
+    #    - 가장 마지막 캔들의 Close 를 현재가로 사용
+    # -------------------------------------------------
+    def fetch_us_realtime(ticker: str):
+        try:
+            df = yf.download(
+                ticker,
+                period="1d",     # 오늘 하루
+                interval="1m",   # 1분봉
+                prepost=True,    # 장전/장후 포함
+                progress=False,
+            )
 
+            if df is None or df.empty:
+                return ticker, None
+
+            close_series = df["Close"].dropna()
+            if close_series.empty:
+                return ticker, None
+
+            # 정규장 + 애프터마켓 통틀어 "마지막 체결가"
+            last_price = float(close_series.iloc[-1])
+            return ticker, last_price
+
+        except Exception:
+            return ticker, None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(fetch_us_realtime, t) for t in us_tickers]
+        for f in futures:
+            try:
+                tk, p = f.result(timeout=8)
+                if p is not None:
+                    realtime_map[tk] = p
+            except Exception:
+                continue
+
+    # -------------------------------------------------
+    # 3) 혹시 1분봉이 실패한 종목은 일봉 종가로 보정
+    # -------------------------------------------------
+    for t in us_tickers:
+        if t not in realtime_map and t in hist_map:
+            try:
+                closes = hist_map[t]["Close"].dropna()
+                if not closes.empty:
+                    realtime_map[t] = float(closes.iloc[-1])
+            except Exception:
+                continue
 
     return hist_map, realtime_map
-
 
 
 
